@@ -197,3 +197,63 @@ still logged server-side at a level that surfaces probing.
 
 **Cost.** Slightly less informative for a legitimate client that has genuinely gone
 looking in the wrong organization — an unusual case, and worth the tradeoff.
+
+---
+
+## ADR-010 — Premium agency visual language, calibrated by screen density
+
+**Status:** accepted · Phase C (applied from Phase S onward)
+
+**Context.** The spec requires the application to "look like a real SaaS product," not
+a tutorial (§39), and names the ticket detail screen as the strongest screen in the
+application (§40). The `high-end-visual-design` agent skill is installed and was
+chosen as the design direction.
+
+**Decision.** Adopt the skill's visual language — nested "double-bezel" container
+architecture, exaggerated squircle radii, custom cubic-bezier motion, diffused ambient
+shadows over hard drop shadows, premium typography, ultra-light icon strokes — across
+the application.
+
+Calibrate two of its rules by screen type rather than applying them uniformly:
+
+| Rule | Marketing / auth screens | Dense product screens |
+|---|---|---|
+| Section padding `py-24`–`py-40` | applied | reduced; density is the goal |
+| Scroll-driven entry animation | applied | mount transitions only, no scroll choreography |
+
+Everything else — bezels, radii, motion curves, shadow treatment, typography, icon
+weight, and every performance guardrail — applies everywhere without exception.
+
+**Why.** The skill's own framing is agency and landing-page work. Its craft
+vocabulary transfers cleanly to product UI; two of its *spatial* rules do not. An
+agent triaging a queue needs to compare many tickets in one viewport, so `py-40`
+between sections would push a 20-row list into three scroll-lengths and make the tool
+slower to use. Scroll-triggered reveals are worse still on a work surface: an agent
+scanning a list would watch rows fade in repeatedly, adding latency to every glance.
+
+Keeping the rest is not a compromise. Depth, concentric radii, spring-physics motion,
+and restrained iconography are what separate Linear from a Bootstrap dashboard, and
+they cost nothing in density. The skill names Linear explicitly as its reference
+point, and Linear is a dense product UI — evidence the vocabulary itself is
+compatible, and that only the marketing-page spacing needs adjusting.
+
+The skill's performance guardrails are adopted verbatim, since they are correct
+regardless of aesthetic: animate only `transform` and `opacity`, `backdrop-blur` on
+fixed and sticky elements only, `IntersectionObserver` rather than scroll listeners,
+noise overlays on fixed `pointer-events-none` layers, and systemic z-index tiers.
+
+**Verified available** (npm, at time of writing): `geist` 1.7.2 and
+`@fontsource-variable/plus-jakarta-sans` 5.3.0 for typography;
+`@phosphor-icons/react` 2.1.10 for light-stroke icons; `motion` 13.2.0 for
+`whileInView` and spring transitions. The skill bans Inter and thick-stroke Lucide,
+so the default choices are deliberately avoided.
+
+**Accessibility.** The skill is silent on `prefers-reduced-motion`; the spec requires
+accessible interfaces (§39). All motion must therefore respect the media query, and
+the low-contrast hairlines the aesthetic favours must still clear WCAG AA. Vercel's
+`web-design-guidelines` skill runs as an audit gate over each screen to enforce this.
+
+**Cost.** More implementation effort per screen than a component library would need,
+and two spacing scales to keep straight. The density calibration is a judgement call —
+if the dense screens end up feeling visually disconnected from the marketing surfaces,
+this decision is the thing to revisit.

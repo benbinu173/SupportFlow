@@ -25,6 +25,7 @@ count.
 | Layer | Choice |
 |---|---|
 | Frontend | React 19, TypeScript, Vite, Tailwind 4, TanStack Query, Zustand, React Router |
+| Design | Premium agency visual language — Geist / Plus Jakarta Sans, Phosphor light icons, Motion (ADR-010) |
 | Backend | Python 3.14, FastAPI, Pydantic v2, SQLAlchemy 2.x, Alembic |
 | Database | PostgreSQL 17 + pgvector |
 | Cache / messaging | Redis 8 |
