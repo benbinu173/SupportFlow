@@ -1,0 +1,2729 @@
+SUPPORTFLOW — AI-POWERED CUSTOMER SUPPORT & TICKETING PLATFORM
+MASTER BUILD SPECIFICATION FOR A CODING AGENT
+Version 1.0
+
+======================================================================
+0. PURPOSE OF THIS DOCUMENT
+======================================================================
+
+This document is the complete implementation brief for building SupportFlow,
+a production-style, portfolio-grade, multi-tenant AI customer-support SaaS.
+
+Treat this document as the source of truth for the project.
+
+The objective is NOT to build a simple ticket CRUD application.
+The objective is to build a serious full-stack system that demonstrates:
+
+- Python backend engineering
+- FastAPI
+- PostgreSQL
+- SQLAlchemy
+- Alembic migrations
+- Redis
+- Celery
+- WebSockets
+- JWT authentication
+- refresh-token security
+- RBAC
+- multi-tenant architecture
+- audit logging
+- search, filtering, sorting and pagination
+- background processing
+- AI-assisted support workflows
+- RAG (Retrieval-Augmented Generation)
+- semantic knowledge-base search
+- real-time updates
+- analytics
+- Docker
+- automated testing
+- production deployment
+- observability and security
+
+The final application must be polished enough to demonstrate in a technical
+interview and structured well enough that the repository itself communicates
+good engineering practices.
+
+Do not optimize for maximum number of features. Optimize for architectural
+quality, correctness, security, maintainability and demonstrable engineering
+depth.
+
+
+======================================================================
+1. PROJECT NAME
+======================================================================
+
+Product name:
+
+SupportFlow
+
+Suggested tagline:
+
+"AI-assisted customer support, built for modern support teams."
+
+The product is a multi-tenant customer support and helpdesk platform.
+
+Primary users:
+
+1. Organization Admin
+2. Support Manager
+3. Support Agent
+4. Customer
+
+
+======================================================================
+2. WHY THIS PROJECT EXISTS
+======================================================================
+
+The developer already has strong frontend and MERN experience.
+
+Existing experience includes:
+
+- React.js
+- TypeScript
+- Node.js
+- Express.js
+- MongoDB
+- REST APIs
+- JWT
+- RBAC
+- multi-tenant architecture
+- audit logging
+- dashboards
+- analytics
+- global search
+- pagination
+- filtering
+- enterprise CRM workflows
+- AI API integration
+
+Therefore, SupportFlow must NOT simply repeat the same project in a
+different language.
+
+The project should specifically expand the developer's backend profile into
+Python and demonstrate concepts that are useful for Python backend roles.
+
+The Python backend must be a first-class part of the project.
+
+The project should demonstrate that the developer understands why each
+technology exists and can explain its architectural tradeoffs.
+
+
+======================================================================
+3. WHAT MAKES SUPPORTFLOW DIFFERENT FROM THE EXISTING PROJECTS
+======================================================================
+
+Do NOT clone the existing CRM project.
+
+Existing CRM-style work already demonstrates:
+
+- customer management
+- leads
+- dashboards
+- CRUD
+- RBAC
+- tenant isolation
+- audit logs
+- search
+- analytics
+
+SupportFlow should differentiate itself through the following:
+
+A. Python-first backend
+
+The backend must be implemented using Python and FastAPI.
+
+Do NOT implement the backend using Node.js.
+
+B. Asynchronous architecture
+
+Use Celery and Redis for operations that should not block HTTP requests.
+
+Examples:
+
+- AI ticket analysis
+- email notifications
+- report generation
+- SLA checks
+- knowledge-base ingestion
+- embedding generation
+
+C. Real-time architecture
+
+Use WebSockets for live ticket and notification updates.
+
+Use Redis Pub/Sub where appropriate to distribute events.
+
+D. AI-assisted support workflow
+
+AI should assist human support agents rather than operate as an uncontrolled
+autonomous agent.
+
+AI functionality includes:
+
+- ticket classification
+- priority recommendation
+- sentiment analysis
+- conversation summarization
+- suggested replies
+- knowledge-base question answering
+
+E. RAG
+
+The organization can upload internal knowledge documents.
+
+The system retrieves relevant knowledge before generating an AI answer.
+
+AI answers must be grounded in organization-specific knowledge rather than
+inventing company policies.
+
+F. PostgreSQL
+
+Use PostgreSQL as the primary relational database.
+
+This demonstrates relational database design in addition to existing
+MongoDB experience.
+
+G. Production-oriented engineering
+
+Include:
+
+- Docker
+- migrations
+- tests
+- environment configuration
+- structured logging
+- health checks
+- rate limiting
+- error handling
+- API documentation
+- deployment documentation
+
+
+======================================================================
+4. NON-NEGOTIABLE ENGINEERING PRINCIPLES
+======================================================================
+
+1. Never put secrets in source code.
+2. Never commit .env files containing secrets.
+3. All tenant-scoped data must be isolated.
+4. Never trust organization_id supplied by the frontend.
+5. Derive organization identity from authenticated user context.
+6. Validate all API input using Pydantic schemas.
+7. Use parameterized ORM queries.
+8. Passwords must be securely hashed.
+9. Access tokens must expire.
+10. Refresh tokens must be handled securely.
+11. AI output must be treated as untrusted data.
+12. AI must not automatically send customer-facing responses.
+13. Long-running work must not unnecessarily block API requests.
+14. Every important business operation should be testable.
+15. Database changes must use Alembic migrations.
+16. Do not create unnecessary microservices.
+17. Keep the architecture modular but not over-engineered.
+18. Prefer clear service boundaries over huge files.
+19. Do not use technologies merely for resume keywords.
+20. Every major dependency must have an actual responsibility.
+
+
+======================================================================
+5. HIGH-LEVEL TECHNOLOGY STACK
+======================================================================
+
+FRONTEND
+
+- React
+- TypeScript
+- React Router
+- TanStack Query
+- Zustand where global client state is genuinely needed
+- Tailwind CSS
+- Axios or fetch
+- WebSocket client
+- charting library
+
+BACKEND
+
+- Python 3.x
+- FastAPI
+- Pydantic
+- SQLAlchemy 2.x
+- Alembic
+- Uvicorn
+
+DATABASE
+
+- PostgreSQL
+- pgvector extension for RAG/semantic search
+
+CACHE / MESSAGING
+
+- Redis
+
+BACKGROUND JOBS
+
+- Celery
+
+AI
+
+- LLM provider with structured output support
+- Embedding model/provider
+- Provider abstraction so AI vendor can be changed later
+
+STORAGE
+
+- S3-compatible object storage for attachments
+
+TESTING
+
+- pytest
+- FastAPI test client
+- database integration tests
+- mocked AI provider tests
+
+INFRASTRUCTURE
+
+- Docker
+- Docker Compose for local development
+- Nginx or cloud load balancer/reverse proxy where appropriate
+- AWS or another production cloud
+- GitHub Actions CI/CD
+
+DOCUMENTATION
+
+- OpenAPI/Swagger through FastAPI
+- README
+- architecture documentation
+- API documentation
+- setup instructions
+- deployment instructions
+
+
+======================================================================
+6. SYSTEM COMPONENTS
+======================================================================
+
+The system should conceptually contain these components:
+
+1. React frontend
+2. FastAPI API
+3. PostgreSQL
+4. Redis
+5. Celery workers
+6. AI service layer
+7. WebSocket manager
+8. Object storage
+9. Scheduled/background task system
+10. Logging/monitoring
+11. CI/CD pipeline
+
+
+======================================================================
+7. CORE DOMAIN MODEL
+======================================================================
+
+Create the following main entities.
+
+ORGANIZATION
+
+Fields:
+
+- id
+- name
+- slug
+- plan
+- status
+- created_at
+- updated_at
+
+USER
+
+Fields:
+
+- id
+- organization_id
+- name
+- email
+- password_hash
+- role
+- is_active
+- last_login_at
+- created_at
+- updated_at
+
+CUSTOMER
+
+Fields:
+
+- id
+- organization_id
+- name
+- email
+- phone
+- external_reference
+- metadata
+- created_at
+- updated_at
+
+TICKET
+
+Fields:
+
+- id
+- organization_id
+- customer_id
+- assigned_agent_id
+- subject
+- description
+- status
+- priority
+- category
+- subcategory
+- sentiment
+- sentiment_confidence
+- ai_priority_score
+- ai_classification_confidence
+- created_at
+- updated_at
+- resolved_at
+- closed_at
+
+MESSAGE
+
+Fields:
+
+- id
+- organization_id
+- ticket_id
+- sender_user_id where applicable
+- sender_type
+- content
+- is_internal_note
+- created_at
+
+ATTACHMENT
+
+Fields:
+
+- id
+- organization_id
+- ticket_id
+- uploaded_by
+- file_name
+- content_type
+- file_size
+- storage_key
+- created_at
+
+TICKET_EVENT
+
+Fields:
+
+- id
+- organization_id
+- ticket_id
+- event_type
+- actor_user_id
+- metadata
+- created_at
+
+AI_ANALYSIS
+
+Fields:
+
+- id
+- organization_id
+- ticket_id
+- category
+- subcategory
+- priority
+- sentiment
+- sentiment_confidence
+- summary
+- suggested_response
+- model_name
+- prompt_version
+- processing_status
+- created_at
+- updated_at
+
+KNOWLEDGE_DOCUMENT
+
+Fields:
+
+- id
+- organization_id
+- title
+- description
+- source_type
+- source_url where applicable
+- storage_key where applicable
+- processing_status
+- created_by
+- created_at
+- updated_at
+
+KNOWLEDGE_CHUNK
+
+Fields:
+
+- id
+- organization_id
+- document_id
+- chunk_index
+- content
+- embedding
+- metadata
+- created_at
+
+AUDIT_LOG
+
+Fields:
+
+- id
+- organization_id
+- actor_user_id
+- action
+- entity_type
+- entity_id
+- before_data where appropriate
+- after_data where appropriate
+- metadata
+- created_at
+
+SLA_POLICY
+
+Fields:
+
+- id
+- organization_id
+- name
+- priority
+- first_response_minutes
+- resolution_minutes
+- is_active
+
+NOTIFICATION
+
+Fields:
+
+- id
+- organization_id
+- user_id
+- type
+- title
+- message
+- entity_type
+- entity_id
+- is_read
+- created_at
+
+AI_USAGE
+
+Fields:
+
+- id
+- organization_id
+- user_id
+- ticket_id where applicable
+- operation
+- model
+- input_tokens
+- output_tokens
+- estimated_cost
+- created_at
+
+
+======================================================================
+8. DATABASE RELATIONSHIPS
+======================================================================
+
+Organization:
+
+1 -> many Users
+1 -> many Customers
+1 -> many Tickets
+1 -> many Knowledge Documents
+1 -> many Audit Logs
+1 -> many SLA Policies
+1 -> many Notifications
+1 -> many AI Usage records
+
+Customer:
+
+1 -> many Tickets
+
+Ticket:
+
+1 -> many Messages
+1 -> many Attachments
+1 -> many Ticket Events
+1 -> many AI Analyses
+
+Knowledge Document:
+
+1 -> many Knowledge Chunks
+
+Every organization-owned entity must contain organization_id either directly
+or through a safe relational ownership path.
+
+Tenant isolation must be enforced at the backend layer.
+
+
+======================================================================
+9. USER ROLES AND PERMISSIONS
+======================================================================
+
+ADMIN
+
+Can:
+
+- manage organization
+- create/update/deactivate users
+- assign roles
+- configure SLA
+- manage knowledge base
+- view all tickets
+- view analytics
+- view audit logs
+- manage AI settings
+
+MANAGER
+
+Can:
+
+- view all tickets
+- assign/reassign agents
+- change priority
+- manage ticket workflows
+- view analytics
+- view SLA status
+- view team performance
+- add internal notes
+
+AGENT
+
+Can:
+
+- view assigned tickets
+- reply to customers
+- create internal notes
+- update ticket status
+- request AI assistance
+- view relevant knowledge
+- update ticket details within permission limits
+
+CUSTOMER
+
+Can:
+
+- create tickets
+- view own tickets
+- reply to own tickets
+- upload attachments
+- view ticket status
+- never access another customer's tickets
+
+
+======================================================================
+10. AUTHENTICATION
+======================================================================
+
+Implement:
+
+- registration
+- login
+- access tokens
+- refresh tokens
+- logout
+- password hashing
+- protected routes
+- inactive-user rejection
+
+Recommended token strategy:
+
+Short-lived access token.
+
+Longer-lived refresh token.
+
+Refresh token should be revocable.
+
+Never store plaintext passwords.
+
+Never return password hashes through API responses.
+
+Use secure HTTP-only cookies for refresh tokens if the final architecture
+supports cookie-based refresh securely.
+
+Document the chosen authentication approach.
+
+Add tests for:
+
+- valid login
+- invalid password
+- expired access token
+- invalid refresh token
+- revoked refresh token
+- inactive user
+- unauthorized role
+
+
+======================================================================
+11. MULTI-TENANT SECURITY
+======================================================================
+
+This is one of the most important parts of the project.
+
+Example:
+
+Organization A must never retrieve Organization B's tickets.
+
+Bad:
+
+GET /tickets?organization_id=other-company
+
+The backend must ignore any organization identity supplied by an untrusted
+client and derive tenant context from the authenticated user.
+
+Expected flow:
+
+Request
+  ->
+JWT verification
+  ->
+Authenticated user
+  ->
+User.organization_id
+  ->
+Tenant-scoped service
+  ->
+PostgreSQL query
+
+All relevant queries must apply tenant isolation.
+
+Write automated security tests proving cross-tenant access is rejected.
+
+This should be explicitly documented in the README.
+
+
+======================================================================
+12. TICKET LIFECYCLE
+======================================================================
+
+Recommended states:
+
+OPEN
+ASSIGNED
+IN_PROGRESS
+WAITING_FOR_CUSTOMER
+RESOLVED
+CLOSED
+
+Recommended transitions:
+
+OPEN -> ASSIGNED
+ASSIGNED -> IN_PROGRESS
+IN_PROGRESS -> WAITING_FOR_CUSTOMER
+WAITING_FOR_CUSTOMER -> IN_PROGRESS
+IN_PROGRESS -> RESOLVED
+RESOLVED -> CLOSED
+CLOSED -> OPEN only through an explicit reopen action
+
+The backend must validate transitions.
+
+Do not allow arbitrary status mutation if it violates workflow rules.
+
+Every status transition should create a ticket event and audit record where
+appropriate.
+
+
+======================================================================
+13. TICKET PRIORITY
+======================================================================
+
+Values:
+
+LOW
+MEDIUM
+HIGH
+URGENT
+
+AI can recommend priority.
+
+Business rules must still be able to override AI recommendations.
+
+Example:
+
+AI recommendation:
+HIGH
+
+But if:
+
+- VIP customer
+- SLA almost breached
+- known outage
+
+the business rules may increase the effective priority.
+
+The final system should distinguish:
+
+- AI recommended priority
+- final business priority
+
+
+======================================================================
+14. SEARCH
+======================================================================
+
+Implement global support search.
+
+Search across appropriate fields including:
+
+- ticket ID
+- subject
+- ticket description
+- customer name
+- customer email
+- message content
+
+Support:
+
+- pagination
+- filtering
+- sorting
+- date ranges
+- status
+- priority
+- category
+- assigned agent
+
+Start with PostgreSQL search.
+
+If semantic search is added, keep it as a separate capability rather than
+replacing standard deterministic search.
+
+
+======================================================================
+15. REDIS RESPONSIBILITIES
+======================================================================
+
+Redis must have real architectural responsibilities.
+
+Use Redis for:
+
+1. Cache
+2. Rate limiting
+3. Pub/Sub
+4. short-lived task/state coordination where appropriate
+
+Example dashboard caching:
+
+FastAPI
+  ->
+Redis cache lookup
+
+Cache hit:
+return cached analytics
+
+Cache miss:
+query PostgreSQL
+calculate metrics
+store in Redis
+return result
+
+Invalidate relevant caches when major ticket data changes.
+
+Do not cache everything blindly.
+
+
+======================================================================
+16. CELERY RESPONSIBILITIES
+======================================================================
+
+Use Celery workers for long-running or asynchronous jobs.
+
+Initial task categories:
+
+1. AI ticket analysis
+2. AI summary generation
+3. AI suggested response
+4. email notification
+5. SLA monitoring
+6. report generation
+7. knowledge document processing
+8. embedding generation
+
+API behavior:
+
+POST /tickets
+
+should create the ticket quickly and queue AI analysis.
+
+The API should not wait unnecessarily for the LLM.
+
+Workers should update task status.
+
+Implement retry behavior for transient failures.
+
+Implement reasonable retry limits.
+
+Avoid duplicate processing where possible.
+
+
+======================================================================
+17. AI ARCHITECTURE
+======================================================================
+
+Do NOT tightly couple the application to one AI provider.
+
+Create an AI service abstraction.
+
+Example conceptual interface:
+
+AIProvider
+  - classify_ticket()
+  - analyze_sentiment()
+  - summarize_conversation()
+  - generate_response()
+  - generate_embedding()
+
+Provider implementation can call the chosen LLM/embedding provider.
+
+This makes the project easier to maintain and demonstrates good abstraction.
+
+
+======================================================================
+18. AI TICKET CLASSIFICATION
+======================================================================
+
+When a ticket is created:
+
+1. Store ticket.
+2. Queue AI analysis.
+3. Worker retrieves ticket.
+4. Send controlled prompt to AI.
+5. Request structured output.
+6. Validate AI output.
+7. Store analysis.
+8. Update ticket metadata.
+9. Publish real-time event.
+
+Example output:
+
+{
+  "category": "Billing",
+  "subcategory": "Duplicate Charge",
+  "confidence": 0.94
+}
+
+The backend must validate the returned structure.
+
+Never assume LLM output is automatically valid.
+
+
+======================================================================
+19. AI SENTIMENT ANALYSIS
+======================================================================
+
+Return:
+
+- positive
+- neutral
+- negative
+
+Include confidence where supported.
+
+Example:
+
+{
+  "sentiment": "negative",
+  "confidence": 0.96
+}
+
+Use sentiment as an operational signal, not as an unquestionable fact.
+
+The UI should make it clear that the result is AI-generated.
+
+
+======================================================================
+20. AI SUMMARIZATION
+======================================================================
+
+For long ticket conversations, generate a concise summary.
+
+Example:
+
+Customer has attempted to download their policy document three times.
+The issue occurs in multiple browsers and began recently.
+The customer has contacted support previously.
+
+Store the latest summary.
+
+Allow regeneration when the conversation changes significantly.
+
+Avoid regenerating the summary after every tiny message if unnecessary.
+
+
+======================================================================
+21. AI SUGGESTED RESPONSES
+======================================================================
+
+The AI should generate a draft reply for the support agent.
+
+Workflow:
+
+Customer message
+  ->
+Ticket context
+  ->
+Relevant knowledge
+  ->
+AI
+  ->
+Suggested response
+  ->
+Agent reviews/edits
+  ->
+Agent manually sends
+
+AI must NEVER automatically send a customer-facing response in the default
+implementation.
+
+Add an explicit UI distinction between:
+
+- AI generated draft
+- human-authored response
+
+
+======================================================================
+22. RAG KNOWLEDGE BASE
+======================================================================
+
+This is a flagship feature.
+
+Each organization gets its own knowledge base.
+
+Documents may include:
+
+- FAQs
+- product documentation
+- support policies
+- refund policies
+- troubleshooting guides
+- internal procedures
+
+Processing pipeline:
+
+Document upload
+  ->
+text extraction
+  ->
+cleaning
+  ->
+chunking
+  ->
+embedding generation
+  ->
+store chunks + vectors
+  ->
+document becomes searchable
+
+
+======================================================================
+23. RAG QUERY FLOW
+======================================================================
+
+Question:
+
+"Can a customer cancel within 30 days?"
+
+Flow:
+
+User question
+  ->
+embedding
+  ->
+vector similarity search
+  ->
+top relevant organization-owned chunks
+  ->
+construct grounded prompt
+  ->
+LLM
+  ->
+answer + source references
+
+Critical requirement:
+
+Only retrieve documents belonging to the current organization.
+
+Never allow cross-tenant retrieval.
+
+
+======================================================================
+24. RAG HALLUCINATION CONTROL
+======================================================================
+
+The AI system must be instructed to:
+
+- answer using retrieved knowledge
+- clearly state when information is unavailable
+- avoid inventing company policies
+- provide source references when possible
+
+If no relevant source is found, response should say that the knowledge base
+does not contain sufficient information.
+
+Do not fabricate citations.
+
+
+======================================================================
+25. WEBSOCKETS
+======================================================================
+
+Implement real-time updates for:
+
+- ticket status changes
+- ticket assignments
+- new messages
+- notifications
+- AI analysis completion
+
+Example:
+
+Agent A resolves ticket.
+
+FastAPI
+  ->
+database update
+  ->
+Redis Pub/Sub
+  ->
+WebSocket manager
+  ->
+connected clients
+  ->
+UI updates without refresh
+
+WebSocket authentication must be implemented securely.
+
+A client must not subscribe to another organization's events.
+
+
+======================================================================
+26. NOTIFICATIONS
+======================================================================
+
+In-app notifications for:
+
+- ticket assigned
+- ticket reassigned
+- new customer reply
+- manager mention
+- SLA warning
+- AI analysis completed
+- ticket resolved
+
+Notification records should be persisted.
+
+Users can mark notifications as read.
+
+
+======================================================================
+27. SLA SYSTEM
+======================================================================
+
+Implement a basic SLA system.
+
+Example:
+
+LOW:
+first response: 24 hours
+resolution: 72 hours
+
+MEDIUM:
+first response: 8 hours
+resolution: 24 hours
+
+HIGH:
+first response: 2 hours
+resolution: 8 hours
+
+URGENT:
+first response: 30 minutes
+resolution: 4 hours
+
+These values must be configurable per organization.
+
+Celery periodically checks tickets approaching SLA deadlines.
+
+Notify agents/managers when appropriate.
+
+Do not claim these values represent real industry standards; they are sample
+configuration for the application.
+
+
+======================================================================
+28. ANALYTICS
+======================================================================
+
+Create analytics endpoints and dashboard views.
+
+Metrics:
+
+- total tickets
+- open tickets
+- resolved tickets
+- closed tickets
+- average first response time
+- average resolution time
+- SLA compliance
+- tickets by category
+- tickets by priority
+- tickets by agent
+- sentiment distribution
+- ticket volume over time
+- AI usage
+- AI classification confidence distribution where useful
+
+Use PostgreSQL aggregation queries.
+
+Cache expensive dashboard results in Redis.
+
+Invalidate or expire caches appropriately.
+
+
+======================================================================
+29. ADMIN DASHBOARD
+======================================================================
+
+Include:
+
+- organization overview
+- agent management
+- role management
+- SLA configuration
+- knowledge-base management
+- audit logs
+- AI usage overview
+- system health indicators
+
+
+======================================================================
+30. MANAGER DASHBOARD
+======================================================================
+
+Include:
+
+- team ticket volume
+- agent workload
+- SLA risks
+- unresolved tickets
+- urgent tickets
+- sentiment trends
+- resolution metrics
+- ticket assignment
+
+
+======================================================================
+31. AGENT DASHBOARD
+======================================================================
+
+Include:
+
+- assigned tickets
+- priority queue
+- SLA countdown
+- ticket details
+- customer information
+- conversation history
+- AI summary
+- AI suggested response
+- knowledge-base search
+- internal notes
+
+
+======================================================================
+32. CUSTOMER EXPERIENCE
+======================================================================
+
+Customer portal should allow:
+
+- login
+- create ticket
+- view tickets
+- reply
+- upload attachments
+- see ticket status
+- see support responses
+- close/confirm resolution where appropriate
+
+Customers must only see their own tickets.
+
+
+======================================================================
+33. FILE ATTACHMENTS
+======================================================================
+
+Do not store large files directly in PostgreSQL.
+
+Use S3-compatible object storage.
+
+Flow:
+
+Frontend
+  ->
+FastAPI
+  ->
+validated upload
+  ->
+object storage
+  ->
+database metadata
+
+Validate:
+
+- file size
+- content type
+- file extension
+- authorization
+
+Never trust filename or MIME type alone.
+
+Prevent path traversal.
+
+Do not expose private files directly without authorization.
+
+
+======================================================================
+34. AUDIT LOGGING
+======================================================================
+
+Record important actions.
+
+Examples:
+
+USER_CREATED
+USER_ROLE_UPDATED
+USER_DEACTIVATED
+TICKET_CREATED
+TICKET_ASSIGNED
+TICKET_PRIORITY_CHANGED
+TICKET_STATUS_CHANGED
+TICKET_RESOLVED
+TICKET_REOPENED
+KNOWLEDGE_DOCUMENT_CREATED
+KNOWLEDGE_DOCUMENT_DELETED
+AI_ANALYSIS_REQUESTED
+AI_RESPONSE_ACCEPTED
+AI_RESPONSE_REGENERATED
+SLA_POLICY_UPDATED
+
+Audit logs should include:
+
+- actor
+- organization
+- action
+- entity
+- timestamp
+- useful metadata
+- before/after values where appropriate
+
+
+======================================================================
+35. API DESIGN
+======================================================================
+
+Suggested route structure:
+
+/api/v1/auth/*
+/api/v1/users/*
+/api/v1/customers/*
+/api/v1/tickets/*
+/api/v1/tickets/{ticket_id}/messages
+/api/v1/tickets/{ticket_id}/ai/*
+/api/v1/knowledge/*
+/api/v1/analytics/*
+/api/v1/notifications/*
+/api/v1/audit-logs/*
+/api/v1/sla/*
+
+Use consistent HTTP status codes.
+
+Use structured error responses.
+
+Do not expose internal stack traces in production.
+
+
+======================================================================
+36. API ENDPOINT EXAMPLES
+======================================================================
+
+AUTH
+
+POST /api/v1/auth/register
+POST /api/v1/auth/login
+POST /api/v1/auth/refresh
+POST /api/v1/auth/logout
+GET  /api/v1/auth/me
+
+TICKETS
+
+GET    /api/v1/tickets
+POST   /api/v1/tickets
+GET    /api/v1/tickets/{id}
+PATCH  /api/v1/tickets/{id}
+POST   /api/v1/tickets/{id}/assign
+POST   /api/v1/tickets/{id}/resolve
+POST   /api/v1/tickets/{id}/reopen
+
+MESSAGES
+
+GET  /api/v1/tickets/{id}/messages
+POST /api/v1/tickets/{id}/messages
+
+AI
+
+POST /api/v1/tickets/{id}/ai/analyze
+POST /api/v1/tickets/{id}/ai/summarize
+POST /api/v1/tickets/{id}/ai/suggest-response
+
+KNOWLEDGE
+
+POST   /api/v1/knowledge
+GET    /api/v1/knowledge
+GET    /api/v1/knowledge/{id}
+DELETE /api/v1/knowledge/{id}
+POST   /api/v1/knowledge/search
+
+ANALYTICS
+
+GET /api/v1/analytics/overview
+GET /api/v1/analytics/tickets
+GET /api/v1/analytics/agents
+GET /api/v1/analytics/sla
+GET /api/v1/analytics/sentiment
+
+NOTIFICATIONS
+
+GET   /api/v1/notifications
+PATCH /api/v1/notifications/{id}/read
+
+
+======================================================================
+37. BACKEND PROJECT STRUCTURE
+======================================================================
+
+Recommended structure:
+
+backend/
+    app/
+        main.py
+
+        core/
+            config.py
+            database.py
+            security.py
+            redis.py
+            logging.py
+
+        models/
+            organization.py
+            user.py
+            customer.py
+            ticket.py
+            message.py
+            attachment.py
+            ticket_event.py
+            ai_analysis.py
+            knowledge_document.py
+            knowledge_chunk.py
+            audit_log.py
+            sla_policy.py
+            notification.py
+            ai_usage.py
+
+        schemas/
+            auth.py
+            user.py
+            customer.py
+            ticket.py
+            message.py
+            knowledge.py
+            analytics.py
+            notification.py
+
+        api/
+            auth.py
+            users.py
+            customers.py
+            tickets.py
+            messages.py
+            ai.py
+            knowledge.py
+            analytics.py
+            notifications.py
+            audit_logs.py
+            sla.py
+
+        services/
+            auth_service.py
+            ticket_service.py
+            customer_service.py
+            search_service.py
+            ai_service.py
+            knowledge_service.py
+            notification_service.py
+            analytics_service.py
+            audit_service.py
+            sla_service.py
+
+        repositories/
+            ticket_repository.py
+            customer_repository.py
+            user_repository.py
+            knowledge_repository.py
+
+        workers/
+            celery_app.py
+            ai_tasks.py
+            email_tasks.py
+            sla_tasks.py
+            report_tasks.py
+            knowledge_tasks.py
+
+        websocket/
+            manager.py
+            events.py
+
+        middleware/
+            request_id.py
+            rate_limit.py
+
+        tests/
+            unit/
+            integration/
+            security/
+            api/
+
+    alembic/
+    Dockerfile
+    requirements.txt
+    pyproject.toml
+
+
+======================================================================
+38. FRONTEND STRUCTURE
+======================================================================
+
+frontend/
+    src/
+        app/
+        components/
+        layouts/
+        pages/
+            auth/
+            admin/
+            manager/
+            agent/
+            customer/
+        features/
+            tickets/
+            customers/
+            analytics/
+            knowledge/
+            notifications/
+        services/
+            api/
+        hooks/
+        store/
+        types/
+        utils/
+        websocket/
+        routes/
+
+
+======================================================================
+39. FRONTEND UX REQUIREMENTS
+======================================================================
+
+The application should look like a real SaaS product.
+
+Do not make it look like a tutorial project.
+
+Use:
+
+- responsive layout
+- sidebar navigation
+- role-specific navigation
+- dashboard cards
+- tables
+- filters
+- search
+- pagination
+- ticket timeline
+- status badges
+- priority indicators
+- loading states
+- skeleton states
+- empty states
+- error states
+- confirmation dialogs
+- toast notifications
+- accessible forms
+
+The ticket detail screen should be the strongest screen in the application.
+
+
+======================================================================
+40. TICKET DETAIL SCREEN
+======================================================================
+
+Recommended layout:
+
+LEFT / MAIN:
+
+- subject
+- status
+- priority
+- conversation
+- attachments
+- reply box
+
+RIGHT:
+
+- customer
+- assigned agent
+- category
+- SLA timer
+- AI sentiment
+- AI summary
+- AI suggested response
+- ticket metadata
+
+Actions:
+
+- assign
+- change priority
+- change status
+- add internal note
+- generate AI summary
+- generate suggested response
+- search knowledge base
+
+
+======================================================================
+41. AI UX RULES
+======================================================================
+
+AI output must be visually distinguished from human-authored information.
+
+Show:
+
+"AI-generated"
+
+where relevant.
+
+Show confidence where meaningful.
+
+Allow:
+
+- regenerate
+- edit
+- accept
+
+Never make the user believe an AI suggestion was written by a human.
+
+Never automatically send an AI-generated response unless a future explicit
+feature is added with appropriate safeguards.
+
+
+======================================================================
+42. ERROR HANDLING
+======================================================================
+
+Implement centralized exception handling.
+
+Return predictable errors.
+
+Example:
+
+{
+  "error": {
+    "code": "TICKET_NOT_FOUND",
+    "message": "Ticket not found."
+  }
+}
+
+Possible error codes:
+
+AUTHENTICATION_REQUIRED
+FORBIDDEN
+VALIDATION_ERROR
+TICKET_NOT_FOUND
+CUSTOMER_NOT_FOUND
+USER_NOT_FOUND
+INVALID_TICKET_TRANSITION
+TENANT_ACCESS_DENIED
+AI_SERVICE_ERROR
+RATE_LIMITED
+INTERNAL_SERVER_ERROR
+
+
+======================================================================
+43. OBSERVABILITY
+======================================================================
+
+Implement structured application logging.
+
+Include request IDs.
+
+Log:
+
+- request start/end
+- status code
+- duration
+- important background task events
+- AI failures
+- database failures
+- authentication failures
+
+Do not log:
+
+- passwords
+- access tokens
+- refresh tokens
+- sensitive customer content unnecessarily
+- API secrets
+
+
+======================================================================
+44. HEALTH CHECKS
+======================================================================
+
+Implement:
+
+GET /health
+
+and preferably:
+
+GET /health/ready
+
+Readiness should verify critical dependencies such as:
+
+- PostgreSQL
+- Redis
+
+Do not expose sensitive information in health responses.
+
+
+======================================================================
+45. RATE LIMITING
+======================================================================
+
+Rate-limit sensitive or expensive endpoints.
+
+Especially:
+
+- login
+- registration
+- AI endpoints
+- knowledge-base processing
+- file upload
+
+Use Redis-backed rate limiting where appropriate.
+
+Return HTTP 429 when limits are exceeded.
+
+
+======================================================================
+46. TESTING STRATEGY
+======================================================================
+
+Testing is mandatory.
+
+Do not consider the project complete because the UI works.
+
+Write tests for:
+
+AUTH
+
+- registration
+- login
+- invalid credentials
+- token expiry
+- refresh
+- logout
+
+RBAC
+
+- admin permissions
+- manager permissions
+- agent permissions
+- customer permissions
+
+MULTI-TENANCY
+
+- organization A cannot access B's tickets
+- organization A cannot access B's customers
+- organization A cannot access B's knowledge
+- organization A cannot access B's audit logs
+
+TICKETS
+
+- creation
+- assignment
+- status transitions
+- invalid transitions
+- priority updates
+- resolution
+
+MESSAGES
+
+- customer reply
+- agent reply
+- internal notes
+- permission validation
+
+AI
+
+- valid structured response
+- malformed AI response
+- provider failure
+- retry behavior
+
+RAG
+
+- organization-scoped retrieval
+- no result behavior
+- source attribution
+
+RATE LIMITING
+
+- limit enforced
+
+WEBSOCKETS
+
+- authentication
+- tenant isolation
+- event delivery
+
+Aim for meaningful coverage, not artificial 100% coverage.
+
+
+======================================================================
+47. DATABASE MIGRATIONS
+======================================================================
+
+Use Alembic.
+
+Never manually edit production schema without a migration.
+
+Migration flow:
+
+Model change
+  ->
+Alembic migration
+  ->
+review migration
+  ->
+apply migration
+  ->
+test
+
+Document migration commands in README.
+
+
+======================================================================
+48. DOCKER DEVELOPMENT ENVIRONMENT
+======================================================================
+
+Create docker-compose configuration for local development.
+
+Services:
+
+- frontend
+- backend
+- postgres
+- redis
+- celery worker
+- celery beat where needed
+
+Optionally:
+
+- object storage emulator
+- mail testing service
+
+All services should communicate using Docker networking.
+
+Use environment variables.
+
+
+======================================================================
+49. ENVIRONMENT CONFIGURATION
+======================================================================
+
+Create:
+
+.env.example
+
+Example values/placeholders:
+
+DATABASE_URL=
+REDIS_URL=
+JWT_SECRET=
+JWT_REFRESH_SECRET=
+AI_API_KEY=
+AI_MODEL=
+EMBEDDING_MODEL=
+S3_ENDPOINT=
+S3_ACCESS_KEY=
+S3_SECRET_KEY=
+S3_BUCKET=
+CORS_ORIGINS=
+
+Never commit actual secrets.
+
+
+======================================================================
+50. CI/CD
+======================================================================
+
+Create GitHub Actions workflow.
+
+On pull request:
+
+1. install dependencies
+2. run lint
+3. run type checks where applicable
+4. run backend tests
+5. run frontend tests
+6. build frontend
+7. build backend container
+
+On main branch:
+
+- build deployable images
+- deploy to configured production environment
+
+Do not deploy automatically until tests pass.
+
+
+======================================================================
+51. DEVELOPMENT PLAN — A TO Z
+======================================================================
+
+PHASE A — REQUIREMENTS
+
+Create:
+
+- product requirements
+- user roles
+- permission matrix
+- core workflows
+- non-functional requirements
+- success criteria
+
+Deliverable:
+
+docs/requirements.md
+
+
+PHASE B — ARCHITECTURE
+
+Create:
+
+- architecture diagram
+- component responsibilities
+- data flow
+- authentication flow
+- AI flow
+- RAG flow
+- WebSocket flow
+- background job flow
+
+Deliverable:
+
+docs/architecture.md
+
+
+PHASE C — REPOSITORY SETUP
+
+Create:
+
+- monorepo or clearly separated frontend/backend structure
+- Git configuration
+- README skeleton
+- environment example
+- Docker configuration
+- code formatting/linting
+
+Deliverable:
+
+clean initial repository
+
+
+PHASE D — DATABASE DESIGN
+
+Create:
+
+- ERD
+- SQLAlchemy models
+- relationships
+- indexes
+- constraints
+
+Important indexes should include:
+
+- organization_id
+- ticket status
+- ticket priority
+- assigned agent
+- customer
+- created_at
+
+Deliverable:
+
+database models + ERD
+
+
+PHASE E — MIGRATIONS
+
+Set up Alembic.
+
+Create initial migration.
+
+Verify:
+
+- clean database creation
+- migration upgrade
+- migration downgrade where practical
+
+
+PHASE F — AUTHENTICATION
+
+Implement:
+
+- registration
+- login
+- JWT
+- refresh
+- logout
+- password hashing
+- current-user dependency
+
+Add tests.
+
+
+PHASE G — RBAC
+
+Implement centralized permission checks.
+
+Do not scatter role strings randomly throughout the codebase.
+
+Create reusable authorization dependencies/services.
+
+Add tests.
+
+
+PHASE H — MULTI-TENANCY
+
+Implement tenant context.
+
+Verify every organization-owned resource is protected.
+
+Write explicit cross-tenant security tests.
+
+This phase is critical.
+
+
+PHASE I — CUSTOMER MANAGEMENT
+
+Implement:
+
+- create
+- read
+- update
+- search
+- pagination
+
+Enforce tenant isolation.
+
+
+PHASE J — TICKET CORE
+
+Implement:
+
+- create ticket
+- list tickets
+- ticket detail
+- update ticket
+- assignment
+- priority
+- status
+- ticket events
+
+
+PHASE K — MESSAGES
+
+Implement:
+
+- conversation
+- replies
+- internal notes
+- message history
+
+Add permissions.
+
+
+PHASE L — ATTACHMENTS
+
+Implement secure object storage integration.
+
+Add upload validation.
+
+Store metadata in PostgreSQL.
+
+
+PHASE M — AUDIT LOGGING
+
+Create reusable audit service.
+
+Record important business actions.
+
+Add audit viewer for admin.
+
+
+PHASE N — SEARCH / FILTER / PAGINATION
+
+Implement:
+
+- keyword search
+- filtering
+- sorting
+- pagination
+- date filters
+
+Optimize database queries.
+
+Add indexes.
+
+
+PHASE O — REDIS
+
+Introduce Redis for:
+
+- caching
+- rate limiting
+- Pub/Sub
+
+Do not add unnecessary caching.
+
+
+PHASE P — CELERY
+
+Set up:
+
+- Celery
+- workers
+- task routing
+- retries
+- failure handling
+
+Start with notification tasks.
+
+
+PHASE Q — SLA
+
+Implement:
+
+- SLA policies
+- response timers
+- resolution timers
+- warning states
+- background checks
+- notifications
+
+
+PHASE R — WEBSOCKETS
+
+Implement:
+
+- authenticated WebSocket connections
+- ticket events
+- notification events
+- Redis Pub/Sub integration
+- tenant isolation
+
+
+PHASE S — ANALYTICS
+
+Implement backend analytics.
+
+Create optimized aggregation queries.
+
+Add Redis caching.
+
+Build frontend dashboards.
+
+
+PHASE T — AI FOUNDATION
+
+Create AI provider abstraction.
+
+Implement:
+
+- configuration
+- provider client
+- structured output validation
+- timeout handling
+- retry strategy
+- usage tracking
+
+
+PHASE U — AI TICKET ANALYSIS
+
+Implement:
+
+- classification
+- category
+- subcategory
+- sentiment
+- priority recommendation
+- confidence
+
+
+PHASE V — AI SUMMARIZATION
+
+Implement conversation summarization.
+
+Store summaries.
+
+Allow regeneration.
+
+
+PHASE W — AI RESPONSE ASSISTANT
+
+Implement suggested replies.
+
+Require human approval.
+
+Track:
+
+- generated
+- edited
+- accepted
+- regenerated
+
+
+PHASE X — KNOWLEDGE BASE / RAG
+
+Implement:
+
+- document upload
+- extraction
+- chunking
+- embeddings
+- pgvector
+- semantic search
+- grounded generation
+- source references
+
+
+PHASE Y — TESTING / HARDENING
+
+Run:
+
+- unit tests
+- integration tests
+- security tests
+- tenant-isolation tests
+- AI failure tests
+- background task tests
+- frontend tests
+
+Fix:
+
+- N+1 queries
+- missing indexes
+- permission bugs
+- race conditions
+- retry problems
+- error handling
+
+
+PHASE Z — PRODUCTION DEPLOYMENT
+
+Production setup should include:
+
+1. PostgreSQL
+2. Redis
+3. backend
+4. Celery worker
+5. Celery scheduler if required
+6. frontend
+7. object storage
+8. HTTPS
+9. environment secrets
+10. CI/CD
+11. logging
+12. health checks
+
+Deployment steps:
+
+- build containers
+- push images
+- provision infrastructure
+- configure environment variables
+- run database migrations
+- deploy backend
+- deploy workers
+- deploy frontend
+- configure domain
+- configure HTTPS
+- verify health endpoints
+- run smoke tests
+- verify WebSockets
+- verify background workers
+- verify AI calls
+- verify tenant isolation
+
+
+======================================================================
+52. PRODUCTION DEPLOYMENT CHECKLIST
+======================================================================
+
+Before declaring the project complete:
+
+[ ] production environment created
+[ ] database configured
+[ ] Redis configured
+[ ] object storage configured
+[ ] secrets configured
+[ ] migrations applied
+[ ] backend deployed
+[ ] worker deployed
+[ ] frontend deployed
+[ ] HTTPS configured
+[ ] CORS configured
+[ ] health checks working
+[ ] logs accessible
+[ ] CI/CD working
+[ ] database backups configured where supported
+[ ] rate limiting enabled
+[ ] tenant security tested
+[ ] AI API limits configured
+[ ] error handling verified
+[ ] WebSocket connection verified
+[ ] RAG retrieval verified
+[ ] file upload verified
+[ ] email notifications verified
+
+
+======================================================================
+53. PERFORMANCE REQUIREMENTS
+======================================================================
+
+Do not prematurely optimize everything.
+
+But investigate:
+
+- N+1 queries
+- unnecessary database calls
+- slow analytics
+- large API payloads
+- unbounded ticket/message queries
+- repeated AI calls
+
+Use:
+
+- pagination
+- indexes
+- caching
+- async processing
+- background jobs
+
+where appropriate.
+
+
+======================================================================
+54. SECURITY CHECKLIST
+======================================================================
+
+Before production:
+
+[ ] passwords hashed
+[ ] JWT secrets externalized
+[ ] refresh token security implemented
+[ ] RBAC enforced server-side
+[ ] tenant isolation tested
+[ ] SQL injection protection
+[ ] input validation
+[ ] file upload validation
+[ ] rate limiting
+[ ] CORS restricted
+[ ] secure headers where appropriate
+[ ] no secrets in Git
+[ ] no tokens in logs
+[ ] AI output validated
+[ ] authorization on every protected resource
+[ ] WebSocket authorization
+[ ] private object storage access controlled
+
+
+======================================================================
+55. README REQUIREMENTS
+======================================================================
+
+README must explain:
+
+1. What SupportFlow is
+2. Why it exists
+3. Key features
+4. Architecture
+5. Technology choices
+6. Multi-tenancy
+7. Authentication
+8. Redis usage
+9. Celery usage
+10. WebSockets
+11. AI architecture
+12. RAG architecture
+13. Database schema overview
+14. Local setup
+15. Environment variables
+16. Running migrations
+17. Running tests
+18. Docker usage
+19. Deployment
+20. Security considerations
+21. Known limitations
+22. Future improvements
+
+Include architecture diagrams where possible.
+
+
+======================================================================
+56. DEMO SEED DATA
+======================================================================
+
+Create a seed script.
+
+Example organization:
+
+Acme Support
+
+Users:
+
+admin@acme.local
+manager@acme.local
+agent1@acme.local
+agent2@acme.local
+
+Customers:
+
+multiple realistic sample customers
+
+Tickets:
+
+at least 30 realistic tickets across:
+
+- Billing
+- Account
+- Technical
+- Subscription
+- Policy
+- General
+
+Include different:
+
+- statuses
+- priorities
+- agents
+- sentiments
+
+Knowledge base:
+
+at least 5 realistic documents.
+
+This allows the application to look populated during demonstrations.
+
+
+======================================================================
+57. DEMO SCENARIO
+======================================================================
+
+The final demo should be possible in approximately 5-10 minutes.
+
+Scenario:
+
+1. Log in as agent.
+2. Show dashboard.
+3. Open a customer ticket.
+4. Show conversation.
+5. Show AI classification.
+6. Show AI sentiment.
+7. Show AI summary.
+8. Generate suggested response.
+9. Edit response.
+10. Send response.
+11. Show real-time update.
+12. Change ticket status.
+13. Show audit event.
+14. Search knowledge base.
+15. Ask a knowledge question.
+16. Show RAG answer with source.
+17. Open manager dashboard.
+18. Show SLA analytics.
+19. Show ticket analytics.
+20. Explain architecture.
+
+
+======================================================================
+58. INTERVIEW TALKING POINTS
+======================================================================
+
+The project should allow the developer to confidently explain:
+
+Why FastAPI?
+
+Why PostgreSQL instead of MongoDB?
+
+Why Redis?
+
+Why Celery?
+
+Why WebSockets?
+
+How does multi-tenancy work?
+
+How is tenant isolation tested?
+
+How are AI tasks processed asynchronously?
+
+How do you prevent AI hallucinations?
+
+How does RAG work?
+
+How do you secure AI-generated responses?
+
+How do you handle failed background jobs?
+
+How do you prevent duplicate jobs?
+
+How do you handle rate limiting?
+
+How do you optimize analytics?
+
+How do you secure file uploads?
+
+How does JWT authentication work?
+
+How does RBAC work?
+
+How would you scale the application?
+
+What would you change at 10x traffic?
+
+
+======================================================================
+59. SCALING DISCUSSION
+======================================================================
+
+The system should be designed so that API instances can scale horizontally.
+
+Conceptually:
+
+                    Load Balancer
+                         |
+              +----------+----------+
+              |          |          |
+            API 1      API 2      API 3
+              |          |          |
+              +----------+----------+
+                         |
+                 PostgreSQL / Redis
+                         |
+                 +-------+-------+
+                 |       |       |
+              Worker1 Worker2 Worker3
+
+The application should avoid storing critical session state only in local
+process memory.
+
+WebSocket state must be designed with multi-instance deployment in mind.
+
+
+======================================================================
+60. WHAT NOT TO DO
+======================================================================
+
+Do NOT:
+
+- build everything in one Python file
+- use MongoDB just because it is familiar
+- add Redis without a real use case
+- add Celery without background work
+- make the AI autonomous
+- let AI directly modify critical business data without validation
+- expose organization_id as a trusted security mechanism
+- store secrets in Git
+- store passwords in plaintext
+- skip tests
+- skip migrations
+- skip error handling
+- skip tenant isolation tests
+- create unnecessary microservices
+- claim features are production-ready when they are not
+- use fake AI results in the final implementation
+- hardcode fake analytics as if they came from the database
+
+
+======================================================================
+61. QUALITY BAR
+======================================================================
+
+The project is complete only when:
+
+1. Backend works independently of frontend.
+2. APIs are documented.
+3. Database migrations work.
+4. Authentication works.
+5. RBAC works.
+6. Tenant isolation is proven through tests.
+7. Tickets work end-to-end.
+8. Messages work.
+9. Redis has real responsibilities.
+10. Celery jobs execute successfully.
+11. WebSockets provide real-time updates.
+12. AI processing works with a real provider.
+13. RAG works with real organization-scoped documents.
+14. Analytics use real database data.
+15. Attachments work securely.
+16. Audit logs work.
+17. Tests pass.
+18. Docker setup works.
+19. CI passes.
+20. Production deployment works.
+21. README explains the architecture.
+22. Demo data exists.
+23. No secrets are committed.
+
+
+======================================================================
+62. IMPLEMENTATION STYLE FOR THE CODING AGENT
+======================================================================
+
+Work incrementally.
+
+Do not generate the entire application in one giant change.
+
+For each phase:
+
+1. Explain what will be implemented.
+2. Inspect the current codebase.
+3. Implement the phase.
+4. Run relevant tests.
+5. Fix failures.
+6. Update documentation.
+7. Confirm completion.
+8. Move to the next phase.
+
+Do not silently skip requirements.
+
+When making an architectural decision that differs from this specification,
+document the reason in:
+
+docs/architecture-decisions.md
+
+Use small, reviewable commits where possible.
+
+Do not rewrite functioning code unnecessarily.
+
+Do not introduce dependencies without a reason.
+
+Prefer maintainable production-style code over clever code.
+
+
+======================================================================
+63. FINAL PROJECT OUTCOME
+======================================================================
+
+The final product should communicate this professional profile:
+
+"Frontend-focused full-stack engineer with professional React experience
+who can also design and implement production-style Python backend systems."
+
+SupportFlow should demonstrate practical knowledge of:
+
+Python
+FastAPI
+PostgreSQL
+SQLAlchemy
+Redis
+Celery
+WebSockets
+JWT
+RBAC
+Multi-tenancy
+REST API design
+Background processing
+AI integration
+RAG
+Vector search
+Analytics
+Testing
+Docker
+CI/CD
+Cloud deployment
+
+
+======================================================================
+64. FINAL INSTRUCTION TO THE CODING AGENT
+======================================================================
+
+Build SupportFlow according to this specification.
+
+Do not treat it as a simple CRUD tutorial.
+
+The highest priorities are:
+
+1. Correct architecture
+2. Security
+3. Multi-tenant isolation
+4. Python backend quality
+5. Reliable asynchronous processing
+6. Real-time functionality
+7. AI usefulness and safety
+8. RAG correctness
+9. Testing
+10. Production deployment
+
+If a feature conflicts with security, correctness or maintainability,
+prioritize security, correctness and maintainability.
+
+If a feature is too large for the current phase, implement a clean foundation
+and document the remaining work rather than creating a rushed implementation.
+
+At the end, provide:
+
+- working source code
+- database migrations
+- tests
+- Docker setup
+- CI/CD configuration
+- documentation
+- architecture diagram
+- API documentation
+- seed data
+- deployment instructions
+- production deployment
+- final demo instructions
+
+The final repository should be something that can be shown to a recruiter,
+technical interviewer or senior backend engineer without looking like a
+basic tutorial project.
+
+
+======================================================================
+END OF SUPPORTFLOW MASTER BUILD SPECIFICATION
+======================================================================

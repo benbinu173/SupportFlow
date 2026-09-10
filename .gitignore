@@ -1,0 +1,41 @@
+# ---------------------------------------------------------------------------
+# Secrets — never commit real environment files. Only .env.example is tracked.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# --- Node ------------------------------------------------------------------
+node_modules/
+dist/
+dist-ssr/
+.vite/
+*.local
+npm-debug.log*
+coverage/
+
+# --- Editors / OS ----------------------------------------------------------
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Local infra volumes ---------------------------------------------------
+docker/volumes/

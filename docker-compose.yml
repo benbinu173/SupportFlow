@@ -1,0 +1,131 @@
+# SupportFlow — local infrastructure.
+#
+# Default: infrastructure only. The API, Celery worker, and Vite dev server run
+# natively on the host for fast reloads. See ADR-007.
+#
+#   docker compose up -d
+#
+# Full-stack parity check (also what CI uses):
+#
+#   docker compose --profile full up --build
+#
+# On Windows the native Celery worker needs the solo pool:
+#   celery -A app.workers.celery_app worker --pool=solo --loglevel=info
+
+name: supportflow
+
+services:
+  postgres:
+    # Community image ships the pgvector extension; the official one does not.
+    # Verified: pgvector 0.8.6 on PostgreSQL 17.11. See ADR-006.
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-supportflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-supportflow}
+      POSTGRES_DB: ${POSTGRES_DB:-supportflow}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-supportflow} -d ${POSTGRES_DB:-supportflow}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:8-alpine
+    # Persistence keeps queued Celery jobs across restarts during development.
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    # S3-compatible storage for attachments and knowledge-base source documents.
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  mailpit:
+    # Captures outbound mail so notification flows are testable without a real
+    # SMTP provider. UI at http://localhost:8025
+    image: axllent/mailpit:latest
+    ports:
+      - "1025:1025"   # SMTP
+      - "8025:8025"   # web UI
+    environment:
+      MP_MAX_MESSAGES: 500
+
+  # --- Application tier: only started with `--profile full` ----------------
+  backend:
+    profiles: ["full"]
+    build:
+      context: ./backend
+      target: development
+    env_file: .env
+    environment:
+      # Service names replace localhost inside the compose network.
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-supportflow}:${POSTGRES_PASSWORD:-supportflow}@postgres:5432/${POSTGRES_DB:-supportflow}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/2
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      S3_ENDPOINT: http://minio:9000
+      SMTP_HOST: mailpit
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker:
+    profiles: ["full"]
+    build:
+      context: ./backend
+      target: development
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-supportflow}:${POSTGRES_PASSWORD:-supportflow}@postgres:5432/${POSTGRES_DB:-supportflow}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/2
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      S3_ENDPOINT: http://minio:9000
+      SMTP_HOST: mailpit
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Placeholder until Phase P introduces the Celery app.
+    command: python -c "print('worker placeholder — implemented in Phase P')"
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:

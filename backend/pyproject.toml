@@ -1,0 +1,102 @@
+[project]
+name = "supportflow-backend"
+version = "0.1.0"
+description = "SupportFlow — AI-assisted multi-tenant customer support platform (API)"
+requires-python = ">=3.12"
+
+# Pinned deliberately: local dev, Docker, and CI must resolve identically.
+# See docs/architecture-decisions.md ADR-005.
+dependencies = [
+    "fastapi==0.141.1",
+    "uvicorn[standard]==0.52.4",
+    "pydantic==2.13.5",
+    "pydantic-settings==2.15.0",
+    "sqlalchemy==2.0.52",
+    "alembic==1.19.2",
+    "psycopg[binary]==3.3.5",
+    "pgvector==0.5.0",
+    "redis==8.1.0",
+    "celery==5.6.3",
+    "pyjwt[crypto]==2.13.0",       # ADR-002
+    "pwdlib[argon2]==0.3.1",       # ADR-001
+    "python-multipart==0.0.20",
+    "structlog==25.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "pytest-cov==7.0.0",
+    "httpx==0.28.1",
+    "ruff==0.15.1",
+    "mypy==1.19.0",
+]
+
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+# ---------------------------------------------------------------------------
+# Ruff — linting and formatting
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["app", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # import sorting
+    "B",        # bugbear
+    "C4",       # comprehensions
+    "UP",       # pyupgrade
+    "ASYNC",    # async correctness
+    "S",        # bandit security
+    "T20",      # no print statements
+    "SIM",      # simplify
+    "RUF",
+]
+ignore = [
+    "B008",  # FastAPI's Depends() in defaults is the intended idiom
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests legitimately use asserts and hardcoded credentials.
+"tests/**" = ["S101", "S105", "S106"]
+# Alembic generates its own style.
+"alembic/**" = ["E501", "I001"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ---------------------------------------------------------------------------
+# mypy — type checking
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q --strict-markers"
+markers = [
+    "unit: isolated, no external services",
+    "integration: requires Postgres and/or Redis",
+    "security: authz, authn, and tenant-isolation guarantees",
+]

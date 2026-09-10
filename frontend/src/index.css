@@ -1,0 +1,37 @@
+@import 'tailwindcss';
+
+/* Design tokens. Kept as CSS variables so both light and dark surfaces read from
+   one source, and so charts can consume the same palette as the UI. */
+@theme {
+  --color-surface: oklch(100% 0 0);
+  --color-surface-subtle: oklch(98% 0.002 250);
+  --color-border-subtle: oklch(92% 0.004 250);
+
+  --color-ink: oklch(24% 0.012 260);
+  --color-ink-muted: oklch(52% 0.012 260);
+
+  --color-brand: oklch(58% 0.16 258);
+  --color-brand-hover: oklch(52% 0.17 258);
+
+  /* Ticket priority and status accents. */
+  --color-priority-low: oklch(64% 0.11 200);
+  --color-priority-medium: oklch(70% 0.13 90);
+  --color-priority-high: oklch(66% 0.17 45);
+  --color-priority-urgent: oklch(58% 0.19 22);
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    @apply bg-surface-subtle text-ink antialiased;
+    font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  }
+
+  /* Visible focus for keyboard users without adding a ring on mouse clicks. */
+  :focus-visible {
+    @apply outline-brand outline-2 outline-offset-2;
+  }
+}

@@ -1,0 +1,145 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push supersedes an in-flight run on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.14'
+  NODE_VERSION: '22'
+
+jobs:
+  backend:
+    name: Backend — lint, types, tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        # Must match docker-compose: the extension is not in the official image.
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: supportflow
+          POSTGRES_PASSWORD: supportflow
+          POSTGRES_DB: supportflow_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U supportflow"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:8-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql+psycopg://supportflow:supportflow@localhost:5432/supportflow_test
+      REDIS_URL: redis://localhost:6379/1
+      # CI-only value. Real secrets come from the environment, never the repo.
+      JWT_SECRET: ci-only-secret-value-at-least-32-chars-long
+      ENVIRONMENT: test
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Enable Postgres extensions
+        run: |
+          PGPASSWORD=supportflow psql -h localhost -U supportflow -d supportflow_test \
+            -c "CREATE EXTENSION IF NOT EXISTS vector;" \
+            -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+
+      - name: Ruff lint
+        run: ruff check --output-format=github .
+
+      - name: Ruff format
+        run: ruff format --check .
+
+      - name: mypy
+        run: mypy app
+
+      - name: pytest
+        run: pytest --cov=app --cov-report=term-missing
+
+  frontend:
+    name: Frontend — lint, types, tests, build
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npx tsc -b
+
+      - name: Tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  docker:
+    name: Docker — build images
+    runs-on: ubuntu-latest
+    # Image builds are slow; only run them once the code is known good.
+    needs: [backend, frontend]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build backend production image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          target: production
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Validate compose configuration
+        run: |
+          cp .env.example .env
+          # Satisfy the >=32 char minimum so config validation passes.
+          sed -i 's/^JWT_SECRET=$/JWT_SECRET=ci-only-secret-value-at-least-32-chars/' .env
+          docker compose config --quiet
