@@ -536,6 +536,37 @@ async def test_new_ticket_defaults_to_open_and_medium(db: AsyncSession) -> None:
     assert ticket.ai_recommended_priority is None
 
 
+async def test_every_tenant_table_is_indexed_on_organization_id(
+    db: AsyncSession,
+) -> None:
+    """The metadata invariant holds in PostgreSQL, not just in the model classes.
+
+    Queried against `pg_index` rather than trusting `Table.indexes`, because the
+    mixin's `__org_index__` opt-out is only meaningful if the emitted DDL agrees.
+    A `UNIQUE` constraint counts: PostgreSQL backs one with a real unique B-tree, so
+    the per-tenant email constraints serve an org-only predicate.
+    """
+    unindexed = await db.scalars(
+        text(
+            """
+            SELECT t.relname
+            FROM pg_class t
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            WHERE n.nspname = 'public' AND t.relkind = 'r'
+              AND t.relname <> 'organizations'
+              AND EXISTS (
+                SELECT 1 FROM pg_attribute a
+                WHERE a.attrelid = t.oid AND a.attname = 'organization_id' AND a.attnum > 0)
+              AND NOT EXISTS (
+                SELECT 1 FROM pg_index i
+                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
+                WHERE i.indrelid = t.oid AND a.attname = 'organization_id')
+            """
+        )
+    )
+    assert list(unindexed) == []
+
+
 async def test_message_defaults_to_customer_visible(db: AsyncSession) -> None:
     """`is_internal` defaults false, so the flag is always an explicit decision."""
     org = await make_org(db)

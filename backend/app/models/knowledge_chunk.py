@@ -31,6 +31,8 @@ class KnowledgeChunk(UUIDPrimaryKeyMixin, OrganizationScopedMixin, TimestampMixi
     """
 
     __tablename__ = "knowledge_chunks"
+    # ix_knowledge_chunks_org_document below leads with organization_id.
+    __org_index__ = False
     __table_args__ = (
         # Approximate nearest-neighbour search over cosine distance. HNSW rather
         # than IVFFlat: it needs no training step and stays accurate as rows are

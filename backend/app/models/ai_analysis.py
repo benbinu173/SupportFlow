@@ -44,6 +44,8 @@ class AIAnalysis(UUIDPrimaryKeyMixin, OrganizationScopedMixin, TimestampMixin, B
     """
 
     __tablename__ = "ai_analyses"
+    # Both indexes below lead with organization_id.
+    __org_index__ = False
     __table_args__ = (
         # Latest analysis for a ticket, per operation — the ticket detail screen
         # reads exactly this.

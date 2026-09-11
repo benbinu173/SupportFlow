@@ -41,6 +41,8 @@ class KnowledgeDocument(UUIDPrimaryKeyMixin, OrganizationScopedMixin, TimestampM
     """
 
     __tablename__ = "knowledge_documents"
+    # The published and pending indexes below both lead with organization_id.
+    __org_index__ = False
     __table_args__ = (
         # Retrieval reads published documents only, and a tenant's unpublished
         # drafts should not bloat the index.

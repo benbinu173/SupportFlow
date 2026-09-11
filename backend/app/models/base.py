@@ -10,7 +10,7 @@ from datetime import datetime
 
 from sqlalchemy import DateTime, ForeignKey, MetaData, func, text
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, declared_attr, mapped_column
 
 # Explicit naming conventions so Alembic autogenerate produces stable, readable
 # names instead of relying on database defaults. Without this, dropping an
@@ -67,17 +67,27 @@ class TimestampMixin:
 class OrganizationScopedMixin:
     """Tenant ownership.
 
-    Applied to every tenant-owned table. The column is non-nullable and indexed:
-    non-nullable because an unowned row could not be safely filtered, and indexed
-    because every query in the system filters on it.
+    Applied to every tenant-owned table. The column is non-nullable because an
+    unowned row could not be safely filtered, and ON DELETE CASCADE means removing
+    an organization removes its data rather than orphaning it.
 
-    ON DELETE CASCADE means removing an organization removes its data rather than
-    orphaning it.
+    Indexed by default, and skipped via `__org_index__ = False` on the tables where
+    another index already *leads* with `organization_id`. A B-tree on
+    `(organization_id, …)` serves a predicate on `organization_id` alone, so the
+    standalone index would be maintained on every insert for nothing. The default
+    stays "indexed" so a new tenant table cannot silently lose the index; opting out
+    is a deliberate, reviewed act.
     """
 
-    organization_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("organizations.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
+    # Class-level opt-out, read by the declared_attr below. No annotation, so
+    # SQLAlchemy does not mistake it for a mapped attribute.
+    __org_index__ = True
+
+    @declared_attr
+    def organization_id(cls) -> Mapped[uuid.UUID]:
+        return mapped_column(
+            UUID(as_uuid=True),
+            ForeignKey("organizations.id", ondelete="CASCADE"),
+            nullable=False,
+            index=getattr(cls, "__org_index__", True),
+        )

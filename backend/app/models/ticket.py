@@ -48,6 +48,9 @@ class Ticket(UUIDPrimaryKeyMixin, OrganizationScopedMixin, TimestampMixin, Base)
     """
 
     __tablename__ = "tickets"
+    # Every index below leads with organization_id, so the mixin's standalone index
+    # would duplicate work on each insert without serving any query these do not.
+    __org_index__ = False
     __table_args__ = (
         # --- Composite indexes -------------------------------------------------
         # Column order is deliberate: organization_id leads every index because

@@ -23,6 +23,9 @@ class Customer(UUIDPrimaryKeyMixin, OrganizationScopedMixin, TimestampMixin, Bas
     """
 
     __tablename__ = "customers"
+    # The per-tenant unique constraint below leads with organization_id, so it
+    # already serves org-only lookups.
+    __org_index__ = False
     __table_args__ = (
         # Per-tenant uniqueness, matching the reasoning on User.email. Unnamed so
         # the naming convention generates a schema-unique index name.

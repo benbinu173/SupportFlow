@@ -40,6 +40,8 @@ class AIUsage(UUIDPrimaryKeyMixin, OrganizationScopedMixin, Base):
     """
 
     __tablename__ = "ai_usage"
+    # All three indexes below lead with organization_id.
+    __org_index__ = False
     __table_args__ = (
         # Monthly spend rollup per tenant, and quota enforcement.
         Index("ix_ai_usage_org_created", "organization_id", "created_at"),

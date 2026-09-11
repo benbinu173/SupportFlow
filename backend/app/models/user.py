@@ -25,6 +25,9 @@ class User(UUIDPrimaryKeyMixin, OrganizationScopedMixin, TimestampMixin, Base):
     """
 
     __tablename__ = "users"
+    # The per-tenant unique constraint below leads with organization_id, so it
+    # already serves org-only lookups.
+    __org_index__ = False
     __table_args__ = (
         # Email is unique *per organization*, not globally: the same person may
         # legitimately hold accounts with two different support providers. Making

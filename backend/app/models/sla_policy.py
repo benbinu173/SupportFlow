@@ -25,6 +25,9 @@ class SLAPolicy(UUIDPrimaryKeyMixin, OrganizationScopedMixin, TimestampMixin, Ba
     """
 
     __tablename__ = "sla_policies"
+    # The per-tenant unique constraint below leads with organization_id, so it
+    # already serves org-only lookups.
+    __org_index__ = False
     __table_args__ = (
         # One policy per priority per tenant. This is what lets the SLA calculator
         # look up a single row rather than resolving between competing policies.

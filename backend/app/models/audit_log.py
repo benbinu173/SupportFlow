@@ -29,6 +29,8 @@ class AuditLog(UUIDPrimaryKeyMixin, OrganizationScopedMixin, Base):
     """
 
     __tablename__ = "audit_logs"
+    # All four indexes below lead with organization_id.
+    __org_index__ = False
     __table_args__ = (
         # Primary review query: an organization's recent activity.
         Index("ix_audit_logs_org_created", "organization_id", "created_at"),
