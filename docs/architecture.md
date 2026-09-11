@@ -129,6 +129,10 @@ Cross-tenant reads return `404`, not `403` — a `403` would confirm that the re
 exists in another organization. Tests assert this for tickets, customers, knowledge,
 audit logs, and WebSocket subscriptions.
 
+The schema half of this is specified in [data-model.md](data-model.md): the ERD, the
+per-table column reference, and the constraints that make tenant isolation and the
+AI-review rules structural rather than conventional.
+
 ## 6. AI flow
 
 ```

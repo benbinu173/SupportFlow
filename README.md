@@ -45,6 +45,7 @@ python-jose, opaque refresh tokens over JWTs — are justified in
 |---|---|
 | [docs/requirements.md](docs/requirements.md) | Actors, full permission matrix, workflows, lifecycle, success criteria |
 | [docs/architecture.md](docs/architecture.md) | Component diagram, layering, auth / tenancy / AI / RAG / real-time / job flows |
+| [docs/data-model.md](docs/data-model.md) | ERD, table reference, index strategy, schema-level business rules |
 | [docs/architecture-decisions.md](docs/architecture-decisions.md) | Every deviation from the specification, with reasoning and cost |
 
 ## Local setup
