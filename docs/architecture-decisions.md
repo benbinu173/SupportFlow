@@ -257,3 +257,44 @@ the low-contrast hairlines the aesthetic favours must still clear WCAG AA. Verce
 and two spacing scales to keep straight. The density calibration is a judgement call —
 if the dense screens end up feeling visually disconnected from the marketing surfaces,
 this decision is the thing to revisit.
+
+---
+
+## ADR-011 — An explicit event loop factory, shared by the app and the tests
+
+**Status:** accepted · Phase D
+
+**Context.** The stack uses psycopg 3 in async mode under FastAPI. On Windows,
+`uvicorn app.main:app` raises on the first query:
+
+```
+psycopg.InterfaceError: Psycopg cannot use the 'ProactorEventLoop' to run in async mode.
+```
+
+psycopg's async mode drives sockets through `add_reader`/`add_writer`, which the
+Proactor loop does not implement for sockets. Verified on this machine: uvicorn selects
+`ProactorEventLoop` when it is *not* spawning a subprocess, so `--reload` and
+`--workers N` silently work while plain `uvicorn` fails. The failure appears at first
+query, not at startup, so it presents as a broken endpoint rather than a boot error.
+
+**Decision.** Define `app/core/event_loop.py` exposing a zero-argument `loop_factory`,
+and pass it to uvicorn via `--loop app.core.event_loop:loop_factory`. The same factory
+is supplied to pytest (through `pytest_asyncio_loop_factories`) and to Starlette's
+`TestClient` (through `backend_options`).
+
+**Why.** The conventional fix, `asyncio.set_event_loop_policy(WindowsSelectorEventLoopPolicy())`,
+is deprecated in Python 3.14 and slated for removal in 3.16 — and ADR-005 pins the
+project to 3.14. A loop factory is the documented replacement and is accepted by both
+`asyncio.Runner` and uvicorn, so one function serves every entrypoint.
+
+Sharing it with the tests is the part that matters most. `TestClient` runs the app on
+its own loop in a worker thread; left alone that loop is a Proactor loop, so routing
+tests passed while every endpoint touching Postgres reported itself unavailable. A
+green suite that cannot reach the database is worse than a red one, and the readiness
+tests are what caught it.
+
+**Cost.** Windows-only code path. It is a no-op on Linux, where the default selector
+loop already supports the required calls, and the container is Linux — so this must
+never become load-bearing. The `--loop` flag is required in the local run target and in
+any Windows script that starts the API; omitting it reintroduces the failure with no
+warning at startup. `make api` carries a comment for that reason.

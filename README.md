@@ -153,7 +153,8 @@ another organization and allow ID enumeration (ADR-009).
 | A | Requirements, permission matrix | ✅ |
 | B | Architecture and flows | ✅ |
 | C | Repository, tooling, Docker, CI | ✅ |
-| D–E | Domain models, indexes, Alembic migrations | next |
+| D | Domain models, relationships, indexes | ✅ |
+| E | Alembic migrations | next |
 | F–H | Auth, RBAC, multi-tenancy + security tests | |
 | I–K | Customers, tickets, messages | |
 | L–N | Attachments, audit logging, search | |
@@ -165,9 +166,11 @@ another organization and allow ID enumeration (ADR-009).
 
 ## Known limitations
 
-- Readiness returns placeholder checks; real Postgres and Redis probes land in
-  Phase D.
-- No database schema yet — `backend/alembic/` is a placeholder until Phase E.
+- The schema is defined as SQLAlchemy models but no migration exists yet —
+  `backend/alembic/` is a placeholder until Phase E, so the database is created from
+  metadata rather than by versioned migration.
 - The embedding provider is deliberately undecided until Phase X (ADR-008).
 - The deployment target is undecided; nothing in the architecture depends on a
   specific cloud.
+- On Windows, the API must be started with
+  `--loop app.core.event_loop:loop_factory` (`make api` includes it). See ADR-011.

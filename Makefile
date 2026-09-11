@@ -44,9 +44,11 @@ reset:
 	docker compose down -v
 
 # --- run -------------------------------------------------------------------
+# --loop: psycopg's async mode cannot drive Windows' ProactorEventLoop, which is
+# what uvicorn picks by default. See app/core/event_loop.py.
 .PHONY: api
 api:
-	cd backend && .venv/Scripts/python.exe -m uvicorn app.main:app --reload
+	cd backend && .venv/Scripts/python.exe -m uvicorn app.main:app --reload --loop app.core.event_loop:loop_factory
 
 .PHONY: web
 web:

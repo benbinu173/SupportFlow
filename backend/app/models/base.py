@@ -1,0 +1,83 @@
+"""Declarative base and shared column mixins.
+
+Every model inherits `Base`. Most inherit `UUIDPrimaryKeyMixin` and
+`TimestampMixin`; tenant-owned models also inherit `OrganizationScopedMixin`,
+which is what makes the isolation guarantee structural rather than conventional.
+"""
+
+import uuid
+from datetime import datetime
+
+from sqlalchemy import DateTime, ForeignKey, MetaData, func, text
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+# Explicit naming conventions so Alembic autogenerate produces stable, readable
+# names instead of relying on database defaults. Without this, dropping an
+# unnamed constraint in a downgrade requires knowing what Postgres chose.
+NAMING_CONVENTION = {
+    "ix": "ix_%(table_name)s_%(column_0_N_name)s",
+    "uq": "uq_%(table_name)s_%(column_0_N_name)s",
+    "ck": "ck_%(table_name)s_%(constraint_name)s",
+    "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+    "pk": "pk_%(table_name)s",
+}
+
+
+class Base(DeclarativeBase):
+    metadata = MetaData(naming_convention=NAMING_CONVENTION)
+
+
+class UUIDPrimaryKeyMixin:
+    """UUID primary keys.
+
+    Chosen over sequential integers so identifiers are not guessable: a
+    multi-tenant system should not let a client enumerate records by
+    incrementing an ID. Generated database-side via gen_random_uuid().
+    """
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+
+
+class TimestampMixin:
+    """Creation and update timestamps.
+
+    Both are timezone-aware and set by the database, so values stay correct
+    regardless of the application server's clock or timezone. `onupdate` fires on
+    ORM flush; `server_default` covers rows written outside the ORM.
+    """
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class OrganizationScopedMixin:
+    """Tenant ownership.
+
+    Applied to every tenant-owned table. The column is non-nullable and indexed:
+    non-nullable because an unowned row could not be safely filtered, and indexed
+    because every query in the system filters on it.
+
+    ON DELETE CASCADE means removing an organization removes its data rather than
+    orphaning it.
+    """
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
