@@ -6,6 +6,7 @@ allowed transitions cannot pass silently.
 """
 
 import pytest
+
 from app.models.enums import TICKET_TRANSITIONS, TicketStatus, can_transition
 
 pytestmark = pytest.mark.unit

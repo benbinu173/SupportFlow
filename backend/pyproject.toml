@@ -19,6 +19,7 @@ dependencies = [
     "celery==5.6.3",
     "pyjwt[crypto]==2.13.0",       # ADR-002
     "pwdlib[argon2]==0.3.1",       # ADR-001
+    "email-validator==2.3.0",      # required by pydantic.EmailStr
     "python-multipart==0.0.20",
     "structlog==25.5.0",
 ]
@@ -65,6 +66,14 @@ select = [
 ignore = [
     "B008",  # FastAPI's Depends() in defaults is the intended idiom
 ]
+
+[tool.ruff.lint.isort]
+# Stated explicitly rather than inferred from `src`. Without this, `app.*` is read as
+# a third-party package and sorted in among `fastapi` and `pytest`, while `tests.*`
+# lands in its own block — so the same file had two different answers for "is this our
+# code?". An import block that cannot be scanned for third-party dependencies at a
+# glance is the whole reason the rule exists.
+known-first-party = ["app", "tests"]
 
 [tool.ruff.lint.per-file-ignores]
 # Tests legitimately use asserts and hardcoded credentials.

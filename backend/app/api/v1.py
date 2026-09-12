@@ -1,0 +1,17 @@
+"""Version 1 of the API, aggregated under `settings.API_V1_PREFIX`.
+
+Prefixes live here rather than on each router so the version boundary is visible in
+one place: adding `/api/v2` is a new module beside this one, not a change to every
+route. `main.py` mounts this router and applies the configured prefix, so the
+environment can move it without touching the routes.
+"""
+
+from fastapi import APIRouter
+
+from app.api.auth import router as auth_router
+from app.api.users import router as users_router
+
+router = APIRouter()
+
+router.include_router(auth_router, prefix="/auth", tags=["auth"])
+router.include_router(users_router, prefix="/users", tags=["users"])

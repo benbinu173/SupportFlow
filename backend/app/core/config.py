@@ -43,6 +43,27 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
+    # Length only. Modern guidance (NIST SP 800-63B) is to prefer length over
+    # character-class rules, which push users toward predictable substitutions
+    # without meaningfully raising entropy.
+    PASSWORD_MIN_LENGTH: int = 12
+
+    # Refuse anything longer than the hash function can take in one pass. Argon2 has
+    # no 72-byte truncation trap the way bcrypt does, so this is purely a
+    # denial-of-service ceiling on hashing an absurd payload.
+    PASSWORD_MAX_LENGTH: int = 128
+
+    # The refresh cookie is the only credential the browser stores, so its scope is
+    # kept as narrow as possible. See `refresh_cookie_path` for the path default.
+    REFRESH_COOKIE_NAME: str = "sf_refresh"
+
+    # --- Rate limiting ----------------------------------------------------
+    # Per client IP. Login is generous enough for a typo-prone human and tight enough
+    # to make credential stuffing expensive; registration is tighter because an
+    # account-creation endpoint has no legitimate high-frequency use.
+    RATE_LIMIT_LOGIN_PER_MINUTE: int = 10
+    RATE_LIMIT_REGISTER_PER_HOUR: int = 5
+
     # --- CORS -------------------------------------------------------------
     # Explicit allowlist. Required because the refresh cookie is sent with
     # credentials, which forbids a wildcard origin.
@@ -80,6 +101,26 @@ class Settings(BaseSettings):
         if len(v) < 32:
             raise ValueError("JWT_SECRET must be at least 32 characters")
         return v
+
+    @property
+    def refresh_cookie_path(self) -> str:
+        """Scope the refresh cookie to the auth routes.
+
+        Narrower than `/`, so the browser does not attach a long-lived credential to
+        every request the API serves — only the endpoints that can actually use it.
+        """
+        return f"{self.API_V1_PREFIX}/auth"
+
+    @property
+    def refresh_cookie_secure(self) -> bool:
+        """`Secure` outside development.
+
+        Development is served over plain HTTP on localhost, where a `Secure` cookie
+        is silently dropped by the browser — the failure would look like "refresh
+        randomly does not work" rather than a configuration error. Enabled the moment
+        the environment is not development.
+        """
+        return self.ENVIRONMENT != "development"
 
     @property
     def is_production(self) -> bool:

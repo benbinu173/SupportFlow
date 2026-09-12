@@ -161,6 +161,131 @@ Notes:
   Native enum types are the usual trap: they outlive the tables that used them, so a
   downgrade has to drop them explicitly.
 
+## Authentication
+
+Email and password, with Argon2id hashing (ADR-001) and short-lived JWT access tokens
+(ADR-002). Five endpoints, all under `/api/v1/auth`:
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `POST /register` | public | Creates an organization **and** its first administrator |
+| `POST /login` | public | Returns an access token; sets the refresh cookie |
+| `POST /refresh` | cookie | Rotates the refresh token; returns a new access token |
+| `POST /logout` | access token + cookie | Revokes the presented refresh token and clears the cookie |
+| `GET /me` | access token | The caller's own profile |
+
+**Access tokens** are HS256 JWTs carrying `sub`, `org`, `role`, and `exp`, valid for
+`ACCESS_TOKEN_EXPIRE_MINUTES` (default 15) and returned in the response body for the
+client to hold in memory.
+
+**Refresh tokens are opaque random strings, not JWTs** (ADR-003). Only a SHA-256 hash
+is stored, so a database dump yields no usable session. They are set as an `HttpOnly`,
+`SameSite=Lax`, `Secure` cookie scoped to `Path=/api/v1/auth` and are **never**
+returned in a response body. That cookie attribute is also the CSRF control — a
+cross-site POST does not carry it (ADR-014).
+
+Refreshing **rotates**: the presented token is revoked and a new one issued. Presenting
+an already-used token is treated as theft and **revokes every live session for that
+user** — not merely the token's own chain. A replayed token proves the theft but not
+which holder is the thief, so the safe reading is "one of this user's sessions is
+compromised, and we do not know which". Every other device has to sign in again, which
+is a small cost against an attacker keeping a working session.
+
+### The token is an identifier, not an authority
+
+On every request the dependency verifies the signature, loads the user, refuses if the
+user is inactive, and then **uses the role from the database row** — not the claim in
+the token. A token whose `org` disagrees with the user's current `organization_id` is
+refused with `TENANT_ACCESS_DENIED`.
+
+The practical effect: a demotion, a promotion, or a deactivation takes effect on the
+**next request** rather than up to 15 minutes later. ADR-013 records the trade-off.
+
+```bash
+# A complete session, against a running server
+curl -sX POST localhost:8000/api/v1/auth/register -H 'content-type: application/json' \
+  -d '{"organization_name":"Acme","name":"Ada","email":"ada@acme.com","password":"correct-horse-battery-staple"}'
+# → 201 {"access_token":"eyJ...","token_type":"bearer","expires_in":900}  + Set-Cookie: sf_refresh=...
+
+curl -s localhost:8000/api/v1/auth/me -H "Authorization: Bearer $TOKEN"
+curl -sX POST localhost:8000/api/v1/auth/refresh -b "sf_refresh=$REFRESH"
+```
+
+## Authorization
+
+Permissions are **capabilities**, declared per route:
+
+```python
+dependencies=[Depends(require_permission(Permission.USER_CREATE))]
+```
+
+`ROLE_PERMISSIONS` in [app/core/permissions.py](backend/app/core/permissions.py) is the
+single source of truth, transcribed row by row from
+[docs/requirements.md](docs/requirements.md) §3. Four roles:
+
+| Role | Scope of what it can reach |
+|---|---|
+| `admin` | Everything in the organization, including users and settings |
+| `manager` | Assigns and reprioritises tickets; cannot administer users |
+| `agent` | Works tickets assigned to them |
+| `customer` | Sees only their own tickets |
+
+`own` and `assigned` are **row scopes, not permissions** — a separate central mapping
+applied where the query is built, because a route-level check has no row to examine
+yet. ADR-013 explains why the two concepts are kept apart.
+
+No route anywhere contains a role comparison. That is enforced mechanically, not by
+review: `tests/unit/test_permissions.py` scans every module outside
+`app/core/permissions.py` for `UserRole.ADMIN`-style references and `role == "admin"`
+string comparisons, against a short justified allowlist. `tests/security/` walks the
+routing table and fails if any route is neither authenticated nor explicitly public,
+and if any protected route declares no capability.
+
+A guard the caller fails returns `403 FORBIDDEN`.
+
+## Multi-tenancy
+
+**Every tenant-scoped table carries `organization_id`, and the only source of that
+value is the authenticated user's database row.** `TenantContext` is constructed in
+[app/api/deps.py](backend/app/api/deps.py) and nowhere else; it is never read from a
+header, body field, query parameter, or path segment. There is no request a client can
+make that influences which organization it is served as — a test asserts that posting
+`organization_id` (and `organizationId`) to the user-creation endpoint changes nothing.
+
+Isolation is enforced at the three layers [docs/architecture.md](docs/architecture.md) §5
+specifies, plus one cross-check:
+
+1. **Context** — the request's organization comes only from the authenticated
+   principal. `TenantContext` is built in one place, from the user's database row.
+2. **Repository** — `TenantScopedRepository` takes a `TenantContext` at construction
+   and injects the `organization_id` predicate into every query. A route cannot
+   accidentally query across tenants, because it never holds an unfiltered session;
+   writing a tenant-scoped query without the filter requires bypassing the repository.
+3. **Schema** — every tenant-owned table carries `organization_id` with a foreign key
+   and an index, and uniqueness is scoped per organization (so the same email may exist
+   in two of them). The constraints are in [docs/data-model.md](docs/data-model.md).
+4. **Cross-check** — a token naming a different organization than the user's row is
+   refused outright with `TENANT_ACCESS_DENIED`, rather than trusted. A `403` here,
+   against a `404` for cross-tenant reads, because a token that should not exist is a
+   different condition from a record that is out of reach.
+
+### Cross-tenant reads return 404, not 403
+
+A `403` would confirm that the record exists and is merely out of reach, turning the
+API into an enumeration oracle (ADR-009). A `404` is byte-for-byte identical to the
+response for an id that never existed, which is asserted directly — status, error code,
+message, and full body are compared — so nothing about the other tenant's data leaks.
+
+The same reasoning applies to a refused write: the tests follow every cross-tenant
+`404` with proof that nothing happened, by re-reading the row from the owning
+organization and, for a deactivation, by the victim logging in again.
+
+### What is not yet tenant-scoped
+
+Users are the only tenant-owned resource built so far. Tickets, customers, messages,
+knowledge articles, attachments, and audit logs arrive in Phases I–N and follow the
+identical repository pattern. See [docs/data-model.md](docs/data-model.md).
+
 ## Security posture
 
 Implemented in Phase C:
@@ -176,15 +301,38 @@ Implemented in Phase C:
   artifacts.
 - Ruff runs `bandit` security rules across the codebase.
 
-Designed and documented, enforced in later phases: tenant isolation at three layers
-(context, repository, schema), Argon2id password hashing, revocable rotating refresh
-tokens, centralized RBAC, Redis-backed rate limiting, upload validation, and treating
-AI output as untrusted until schema-validated. See
-[docs/architecture.md](docs/architecture.md) §5 and
+Implemented in Phases F–H:
+
+- **Passwords** hashed with Argon2id, per-hash salt, constant-time verification, and a
+  dummy verify on the unknown-email path so response timing does not disclose whether
+  an account exists.
+- **Access tokens** algorithm-pinned on decode, so the `alg: none` forgery is refused.
+  Expiry, wrong-signature, tampering, and missing-claim cases are each tested.
+- **Refresh tokens** stored only as SHA-256 hashes, rotated on every use, with reuse
+  detection revoking every live session for the affected user.
+- **Authorization** centralized in one mapping, with mechanical tests that fail on a
+  scattered role comparison or an unprotected route.
+- **Tenant isolation** enforced at three layers plus a token/row cross-check, with a
+  dedicated `pytest -m security` suite.
+- **Rate limiting** on login and registration, returning `429 RATE_LIMITED` with
+  `Retry-After`.
+- **No tokens or passwords in logs.** Every log statement passes identifiers — user
+  and organization ids — and never a credential. This is enforced rather than
+  reviewed: [tests/security/test_log_hygiene.py](backend/tests/security/test_log_hygiene.py)
+  records everything the application logs across a full session and asserts no
+  password, access token, refresh token, authorization header, or password hash
+  appears anywhere in it. It carries a positive control, so a recorder that captured
+  nothing fails rather than passing vacuously.
+
+Designed and documented, enforced in later phases: upload validation, and treating AI
+output as untrusted until schema-validated. See
 [docs/requirements.md](docs/requirements.md) §7.
 
-Cross-tenant reads return `404`, not `403` — a `403` would confirm a record exists in
-another organization and allow ID enumeration (ADR-009).
+Two trade-offs are deliberate and recorded in ADR-014: the rate limiter **fails open**
+when Redis is unreachable (it is an abuse control, not an authentication control, and
+failing closed would turn a Redis blip into a total login outage), and it is keyed on
+the **client address rather than the account** — verified against a running server, a
+legitimate login from the same address is throttled alongside an attacker's.
 
 ## Roadmap
 
@@ -195,8 +343,8 @@ another organization and allow ID enumeration (ADR-009).
 | C | Repository, tooling, Docker, CI | ✅ |
 | D | Domain models, relationships, indexes | ✅ |
 | E | Alembic migrations | ✅ |
-| F–H | Auth, RBAC, multi-tenancy + security tests | next |
-| I–K | Customers, tickets, messages | |
+| F–H | Auth, RBAC, multi-tenancy + security tests | ✅ |
+| I–K | Customers, tickets, messages | next |
 | L–N | Attachments, audit logging, search | |
 | O–Q | Redis, Celery, SLA | |
 | R–S | WebSockets, analytics | |
@@ -217,3 +365,19 @@ another organization and allow ID enumeration (ADR-009).
   specific cloud.
 - On Windows, the API must be started with
   `--loop app.core.event_loop:loop_factory` (`make api` includes it). See ADR-011.
+- **Login cannot disambiguate two accounts that share an email *and* a password.**
+  Email is unique per organization, so the credential is resolved without a tenant in
+  the request. Distinct passwords resolve unambiguously; identical ones return one of
+  the two, deterministically. The fix is to take the tenant from the request host (a
+  subdomain per organization), which a JSON API alone cannot express. Asserted rather
+  than hidden — see
+  [tests/security/test_tenant_isolation.py](backend/tests/security/test_tenant_isolation.py).
+- **Rate limiting is per client address, not per account**, so users behind a shared
+  NAT share one bucket. Fixing it needs a trusted-proxy list and a hybrid key, which
+  needs a deployment target. See ADR-014.
+- **No "log out everywhere" endpoint.** `/auth/logout` revokes one session; whole-family
+  revocation exists for reuse detection. ADR-003 anticipates an all-sessions endpoint
+  if it is wanted.
+- **No email verification or password reset** yet — both need the outbound mail path
+  (Mailpit is already in the stack for it).
+

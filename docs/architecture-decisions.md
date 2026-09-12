@@ -365,3 +365,148 @@ and would have emitted a drop-and-recreate in every future migration. The model 
 rewritten to the stored form. The drift check now asserts an empty diff, and was
 verified to fail by reintroducing the old expression — a test that cannot fail is not
 a test.
+
+---
+
+## ADR-013 — A capability is a permission; "own" and "assigned" are scopes
+
+**Status:** accepted · Phase G
+
+**Context.** `docs/requirements.md` §3 has 38 rows, and several carry a qualifier:
+ticket detail is `assigned` for an agent and `own` for a customer; message edit is
+`own`. The spec's §51 requirement is "centralized RBAC — no scattered role
+comparisons", and §54 requires authorization on every protected resource.
+
+The obvious transcription is one permission per row *including* the qualifier —
+`TICKET_VIEW_ASSIGNED`, `TICKET_VIEW_OWN`, `TICKET_VIEW_ORGANIZATION`. That reads
+faithfully but it conflates two different questions: *may this role do this at all*,
+and *which rows may they do it to*.
+
+**Decision.** `Permission` (a `StrEnum`) has one member per matrix row with the
+qualifier dropped. `ROLE_PERMISSIONS: Mapping[UserRole, frozenset[Permission]]` is the
+single source of truth, transcribed row by row from §3. Row visibility is a separate,
+centrally-defined mapping from role to `RowScope`:
+
+```python
+TICKET_SCOPE_BY_ROLE     = {ADMIN: ORGANIZATION, MANAGER: ORGANIZATION, AGENT: ASSIGNED, CUSTOMER: OWN}
+MESSAGE_SCOPE_BY_ROLE    = {ADMIN: ORGANIZATION, MANAGER: ORGANIZATION, AGENT: ASSIGNED, CUSTOMER: OWN}
+ATTACHMENT_SCOPE_BY_ROLE = {ADMIN: ORGANIZATION, MANAGER: ORGANIZATION, AGENT: ASSIGNED, CUSTOMER: OWN}
+```
+
+They are separate names rather than one map because they will diverge — an attachment
+on an internal note is not visible to the customer who owns the ticket — and a test
+asserts the three currently agree, so a deliberate divergence has to be made
+deliberately.
+
+Routes declare capabilities, never scopes:
+`dependencies=[Depends(require_permission(Permission.TICKET_ASSIGN))]`. Repositories
+take a `TenantContext` at construction and apply the scope to the query they build.
+
+**Why.** The two questions are answerable in different places. "May an agent edit
+tickets" is a property of the route and can be decided before the request body is
+parsed. "Which ticket" is a property of the query and cannot be decided anywhere except
+where the `WHERE` clause is written — a route-level check has no row to examine yet.
+
+Collapsing them would also break the testability of the matrix. Keeping
+`ROLE_PERMISSIONS` 1:1 with the documented table means
+[tests/unit/test_permissions.py](backend/tests/unit/test_permissions.py) can transcribe
+§3 *independently* and assert the two agree role by role. A permission list that
+multiplied qualified rows could not be compared against the document at all, only
+against itself.
+
+The centralization requirement is enforced mechanically rather than by review:
+`test_permissions.py` scans every module outside `app/core/permissions.py` for
+`UserRole.ADMIN`-style references and for `role == "admin"`-style string comparisons,
+with a short, justified allowlist (the last-admin invariant in two places, and the
+registration path that assigns `ADMIN` to a new organization). A new scattered role
+check fails the suite rather than passing review.
+
+**Cost.** Two concepts to learn instead of one, and a repository author has to
+remember to apply the scope — forgetting it fails *open* (the caller sees the whole
+organization) rather than closed. That is the main risk this design carries, and the
+mitigation is that `TenantScopedRepository` applies the organization filter in its
+constructor, so the only thing a subclass can get wrong is narrowing further than the
+scope requires.
+
+**Related decision, in the same phase: the database is authoritative, not the token.**
+The JWT carries `sub`, `org`, and `role`, and all three are *checked against the row*
+on every request — the row wins. A stateless token that carried authority would keep
+asserting a revoked role until it expired, so a demotion or deactivation would take up
+to `ACCESS_TOKEN_EXPIRE_MINUTES` to bite. Reading the role from the database makes both
+immediate. The claims are retained for cross-checking (a token whose `org` does not
+match the user's current `organization_id` is refused with `TENANT_ACCESS_DENIED`, not
+silently honoured) and for self-description.
+
+The cost of that choice is one database round trip per request, which the joined load
+of the organization's status already required. The test that pins it end to end is
+`test_a_promotion_takes_effect_on_the_promoted_user_s_next_request` — the promoted
+user's *existing* access token immediately grants more, which is only possible because
+the token is not the authority.
+
+---
+
+## ADR-014 — The refresh cookie is the CSRF control; the rate limiter fails open
+
+**Status:** accepted · Phase F
+
+**Context.** Two decisions in this phase are security trade-offs where both directions
+are defensible, and the reasoning is worth more than the outcome.
+
+**The refresh token's storage.** It must survive a page reload, so it cannot live only
+in memory. `localStorage` is readable by any script on the origin, so a single XSS
+exfiltration is a long-lived session theft. A cookie is not readable by script if it is
+`HttpOnly`, but cookies are sent automatically, which is what makes CSRF possible.
+
+**The rate limiter's failure mode.** Login and registration are limited by Redis
+fixed-window counters. Redis is a separate process and can be down while the API is up.
+The limiter can either refuse the request (fail closed) or allow it (fail open).
+
+**Decision.**
+
+- The refresh token is set as a cookie: `HttpOnly`, `SameSite=Lax`, `Secure` outside
+  development, and `Path=/api/v1/auth` so it is sent to the auth endpoints and nowhere
+  else. The access token is returned in the response body and held in memory by the
+  client. **No refresh token ever appears in a response body.**
+- The rate limiter logs a warning and **allows** the request when Redis is unreachable.
+
+**Why.** `SameSite=Lax` is what makes the cookie safe without a token-pair dance: a
+cross-site POST does not carry it, so the refresh and logout endpoints cannot be driven
+by a page the user did not intend to visit. This is what architecture §4 means by "the
+refresh endpoint carries CSRF protection" — it is a property of the cookie attribute,
+and the ADR records it so it is a decision rather than an accident. It also keeps local
+development working: `localhost:5173 → localhost:8000` is same-*site* (the port is not
+part of a site), so Lax cookies are sent.
+
+`Path=/api/v1/auth` is defence in depth rather than a CSRF control: it means a bug in
+an unrelated endpoint cannot receive the refresh token, and the cookie does not travel
+with every API call.
+
+Failing open is a judgement about which outage is worse. Rate limiting is an abuse
+control, not an authentication control. Failing closed converts a Redis blip into a
+total login outage for every user of every tenant — an availability failure caused by a
+dependency that was only ever meant to slow an attacker down. Failing open means a few
+minutes of unthrottled attempts during a Redis outage, against Argon2id verification
+that is itself deliberately expensive.
+
+**Fail-open is only defensible while it is audible**, so the limiter logs
+`rate_limit_unavailable` at warning level with the key and the error, and
+`test_the_open_failure_is_logged` asserts it. A limiter that silently stopped
+protecting the login endpoint would be worse than no limiter, because the metrics would
+still look healthy.
+
+**Cost.** Three, all accepted knowingly:
+
+1. **Lax is not Strict.** `SameSite=Strict` would break the case where a user follows a
+   link into the app from elsewhere and arrives without their session. Lax is the
+   standard compromise, and it still blocks the cross-site POST that CSRF needs.
+2. **The limiter is keyed on the client address, not the account** (`request.client.host`,
+   deliberately not `X-Forwarded-For` — see the docstring on `client_ip`). This was
+   verified against the running server: after the limit is reached, a *legitimate* login
+   from the same address is refused too, because the counter is per-address rather than
+   per-credential. That is the correct trade-off for credential stuffing, and it is
+   wrong for a shared NAT — a whole office would share one bucket. The real fix is a
+   trusted-proxy list plus a hybrid key, which needs a deployment target this project
+   does not have yet.
+3. **Fail-open is a real hole during an outage**, bounded by the outage's length and
+   visible in the logs.
+

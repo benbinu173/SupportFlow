@@ -13,6 +13,10 @@ customer.
 import uuid
 
 import pytest
+from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.models import (
     AIAnalysis,
     Customer,
@@ -33,9 +37,6 @@ from app.models.enums import (
     TicketStatus,
     UserRole,
 )
-from sqlalchemy import select, text
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 

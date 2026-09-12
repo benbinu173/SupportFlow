@@ -5,8 +5,9 @@ comma-separated CORS origins, and secrets silently defaulting.
 """
 
 import pytest
-from app.core.config import Settings
 from pydantic import ValidationError
+
+from app.core.config import Settings
 
 BASE_ENV = {
     "DATABASE_URL": "postgresql+psycopg://u:p@localhost:5432/db",

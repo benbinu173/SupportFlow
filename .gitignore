@@ -37,5 +37,13 @@ coverage/
 .DS_Store
 Thumbs.db
 
+# --- Local downloads -------------------------------------------------------
+# Nothing this project builds is a native installer, and a stray 40 MB binary in
+# the working directory is a `git add -A` away from being committed. If a real
+# one is ever needed, force-add it.
+*.exe
+*.msi
+*.dmg
+
 # --- Local infra volumes ---------------------------------------------------
 docker/volumes/

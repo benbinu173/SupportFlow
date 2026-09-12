@@ -10,8 +10,9 @@ for one PostgreSQL actually implements.
 """
 
 import pytest
-from app.models import Base
 from sqlalchemy import Table, UniqueConstraint
+
+from app.models import Base
 
 pytestmark = pytest.mark.unit
 
