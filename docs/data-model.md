@@ -490,9 +490,19 @@ service layer, so two concurrent inserts can pick the same value; the unique ind
 duplicate. A global sequence was rejected because it would leak total ticket volume
 across tenants and skip numbers per tenant.
 
-**No migration exists yet.** The schema is currently created from model metadata.
-Phase E adds Alembic and must prove that a migration produces this schema — see the
-roadmap in the [README](../README.md).
+**The schema is produced by a migration.** `backend/alembic/versions/` holds a single
+baseline revision that creates every table, enum type, index, and constraint described
+above. The test suite builds its schema from metadata instead, for speed; the drift
+check in `tests/integration/test_migrations.py` asserts that metadata autogenerates to
+an empty diff against a migrated database, which is what keeps the two honest. See
+ADR-012 and the migration commands in the [README](../README.md).
+
+**One model declaration is written in PostgreSQL's own words.** `ix_tickets_fts` is an
+expression index, and the catalog normalises its expression — the config literal
+becomes a `regconfig` cast and the operands gain `::text`. Autogenerate compares index
+expressions as text, so the model matches the stored form verbatim. Left in its
+natural spelling, every later `alembic revision --autogenerate` would emit a
+drop-and-recreate of this index.
 
 **Ticket transitions** are defined alongside the enums (`TICKET_TRANSITIONS`,
 `can_transition`) so the rule has one source of truth shared by the service layer and

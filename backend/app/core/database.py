@@ -18,22 +18,8 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
-
-def _async_dsn(dsn: str) -> str:
-    """Force the psycopg3 async driver.
-
-    DATABASE_URL is written as `postgresql://` because that is what psql, Alembic
-    and docker compose all understand. SQLAlchemy would map that to the default
-    sync DBAPI, so the scheme is made explicit here rather than duplicating the
-    credentials in a second environment variable.
-    """
-    if dsn.startswith("postgresql+"):
-        return dsn
-    return dsn.replace("postgresql://", "postgresql+psycopg://", 1)
-
-
 engine: AsyncEngine = create_async_engine(
-    _async_dsn(str(settings.DATABASE_URL)),
+    settings.sqlalchemy_dsn,
     # Echo SQL only when explicitly debugging: statement logs contain query
     # parameters, which include customer data.
     echo=settings.DEBUG,

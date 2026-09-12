@@ -58,6 +58,21 @@ class Settings(BaseSettings):
         """CORS_ORIGINS split into a list, empty entries dropped."""
         return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
 
+    @property
+    def sqlalchemy_dsn(self) -> str:
+        """DATABASE_URL with the driver made explicit.
+
+        Written as `postgresql://` in .env because that is what psql, pg_dump, and
+        docker compose all understand. SQLAlchemy would map that bare scheme to the
+        default DBAPI — psycopg2, which is not installed — so psycopg 3 is named
+        here instead. Shared by the app engine and by Alembic so the two cannot
+        disagree about which driver they are using.
+        """
+        dsn = str(self.DATABASE_URL)
+        if dsn.startswith("postgresql+"):
+            return dsn
+        return dsn.replace("postgresql://", "postgresql+psycopg://", 1)
+
     @field_validator("JWT_SECRET")
     @classmethod
     def _secret_is_strong_enough(cls, v: str) -> str:

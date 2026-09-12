@@ -298,3 +298,70 @@ loop already supports the required calls, and the container is Linux — so this
 never become load-bearing. The `--loop` flag is required in the local run target and in
 any Windows script that starts the API; omitting it reintroduces the failure with no
 warning at startup. `make api` carries a comment for that reason.
+
+---
+
+## ADR-012 — Migrations run on a synchronous engine, and the baseline owns its extensions
+
+**Status:** accepted · Phase E
+
+**Context.** Three questions came up setting up Alembic that the specification does not
+answer, and each had a defensible answer in both directions.
+
+The application is async throughout, so the obvious move is an async Alembic engine
+using `AsyncConnection.run_sync`. But ADR-011 exists because psycopg's async mode
+cannot drive Windows' ProactorEventLoop — an async migration engine would drag that
+workaround into every `alembic` invocation, for a batch job where latency is
+irrelevant.
+
+Second, the schema depends on two extensions (`vector` for the embedding column,
+`pg_trgm` for the customer search indexes), and the docker entrypoint already installs
+them. Whether the migration should also create them is a question of who owns the
+database's initial state.
+
+Third, `alembic.ini` is committed, and the database URL contains a password.
+
+**Decision.**
+
+- Alembic uses a **sync** engine. `alembic/env.py` calls `create_engine` on
+  `settings.sqlalchemy_dsn`, which names the `psycopg` dialect explicitly so the app
+  and its migrations cannot diverge onto different drivers.
+- The baseline migration issues `CREATE EXTENSION IF NOT EXISTS vector` and
+  `pg_trgm` itself, before any DDL that needs them. `uuid-ossp` is deliberately not
+  created: `gen_random_uuid()` has been core since PostgreSQL 13.
+- `alembic.ini` contains no URL. `env.py` reads configuration from
+  `app.core.config`; a programmatic caller can override it through
+  `config.attributes["db_url"]`, which is Alembic's supported channel for that and is
+  what the migration tests use.
+- The environment also passes `disable_existing_loggers=False` to `fileConfig`, so an
+  in-process run does not switch off pytest's loggers mid-session.
+
+**Why.** The sync engine confines ADR-011's Windows workaround to the app, where it is
+already tested, rather than spreading it to a second entrypoint. Verified by running
+migrations against a database created without either extension: both were installed by
+the migration, and the vector column and trigram indexes were created successfully.
+That test is now permanent —
+`test_upgrade_installs_the_extensions_the_schema_needs` runs against a scratch database
+the fixture deliberately creates extension-free, so a database that already had them
+cannot hide a regression.
+
+Keeping the DSN out of `alembic.ini` is a §54 requirement rather than a preference. It
+also removes a real failure mode: a URL duplicated in two files drifts, and the copy in
+`alembic.ini` is the one that would be forgotten.
+
+**Cost.** Two engines now exist in the codebase, sync and async, which is one more
+thing to explain. The extension decision makes the migration non-portable to a
+database where the extensions cannot be installed — acceptable, since neither the
+schema nor pgvector's operator classes work without them. `config.attributes` is an
+attribute of an Alembic object rather than a typed API, so the override is
+convention rather than something the type checker enforces.
+
+**A defect this phase surfaced.** `alembic check` — added here as a drift gate — failed
+on the first run. The model declared `ix_tickets_fts` as
+`to_tsvector('english', subject || ' ' || description)`; PostgreSQL stores
+`to_tsvector('english'::regconfig, (subject::text || ' '::text) || description)`.
+Autogenerate compares index expressions as text, so it reported the index as changed
+and would have emitted a drop-and-recreate in every future migration. The model was
+rewritten to the stored form. The drift check now asserts an empty diff, and was
+verified to fail by reintroducing the old expression — a test that cannot fail is not
+a test.

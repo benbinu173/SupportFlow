@@ -88,11 +88,19 @@ class Ticket(UUIDPrimaryKeyMixin, OrganizationScopedMixin, TimestampMixin, Base)
             "created_at",
             postgresql_where=text("status NOT IN ('resolved', 'closed')"),
         ),
-        # Full-text search across subject and description. The expression must
-        # match the query exactly for the index to be used.
+        # Full-text search across subject and description. An expression index, so
+        # the query must use this same expression for the planner to match it.
+        #
+        # Written in the form PostgreSQL stores, not the prettier form a human would
+        # write. `to_tsvector('english', subject || ' ' || description)` is what the
+        # query looks like; the catalog records it with the config cast to regconfig
+        # and the operands cast to text. Autogenerate compares index expressions as
+        # text, so a model that disagrees with the catalog produces a spurious
+        # drop-and-recreate of this index in every future migration. `alembic check`
+        # caught exactly that — see the drift check in the test suite.
         Index(
             "ix_tickets_fts",
-            text("to_tsvector('english', subject || ' ' || description)"),
+            text("to_tsvector('english'::regconfig, (subject::text || ' '::text) || description)"),
             postgresql_using="gin",
         ),
         # --- Invariants --------------------------------------------------------

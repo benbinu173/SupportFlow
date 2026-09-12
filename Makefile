@@ -17,6 +17,13 @@ help:
 	@echo "  make web            Run the Vite dev server"
 	@echo "  make worker         Run the Celery worker (solo pool, Windows)"
 	@echo ""
+	@echo "Database"
+	@echo "  make migrate        Apply all pending migrations"
+	@echo "  make migration m=\"...\"  Autogenerate a migration from model changes"
+	@echo "  make downgrade      Revert the most recent migration"
+	@echo "  make migration-sql  Print the pending DDL without running it"
+	@echo "  make migration-check  Fail if models and migrations have drifted"
+	@echo ""
 	@echo "Verify"
 	@echo "  make test           All tests"
 	@echo "  make check          Lint, format, and type checks"
@@ -58,6 +65,44 @@ web:
 worker:
 	cd backend && .venv/Scripts/python.exe -m celery -A app.workers.celery_app worker --pool=solo --loglevel=info
 
+# --- database --------------------------------------------------------------
+# Alembic reads DATABASE_URL from .env via app.core.config, so there is no URL in
+# alembic.ini. To target another database, set DATABASE_URL in the environment.
+ALEMBIC := cd backend && .venv/Scripts/alembic.exe
+
+.PHONY: migrate
+migrate:
+	$(ALEMBIC) upgrade head
+
+# `m` is required: an unnamed migration is unreviewable in a listing.
+#
+# The formatter runs on the generated file so that `make check` passes straight away.
+# Alembic ships an unformatted file, and a migrations directory that is exempt from
+# the project's formatting rules is one nobody reads comfortably.
+.PHONY: migration
+migration:
+ifndef m
+	$(error usage: make migration m="add ticket tags")
+endif
+	$(ALEMBIC) revision --autogenerate -m "$(m)"
+	cd backend && .venv/Scripts/python.exe -m ruff format alembic/versions
+	cd backend && .venv/Scripts/python.exe -m ruff check --fix alembic/versions
+	@echo "Review the generated migration before committing it."
+
+.PHONY: downgrade
+downgrade:
+	$(ALEMBIC) downgrade -1
+
+# Review DDL before it runs, or hand it to a DBA.
+.PHONY: migration-sql
+migration-sql:
+	$(ALEMBIC) upgrade head --sql
+
+# Exits non-zero when a model change has no matching migration.
+.PHONY: migration-check
+migration-check:
+	$(ALEMBIC) check
+
 # --- verify ----------------------------------------------------------------
 .PHONY: test
 test:
@@ -68,7 +113,7 @@ test:
 check:
 	cd backend && .venv/Scripts/python.exe -m ruff check .
 	cd backend && .venv/Scripts/python.exe -m ruff format --check .
-	cd backend && .venv/Scripts/python.exe -m mypy app
+	cd backend && .venv/Scripts/python.exe -m mypy app alembic
 	cd frontend && npx tsc -b && npm run lint
 
 .PHONY: security
@@ -79,3 +124,8 @@ security:
 ci: check test
 	cd frontend && npm run build
 	docker build --target production -t supportflow-backend:ci ./backend
+
+# `migration-check` is deliberately not a ci prerequisite. `make test` already
+# asserts the same thing, via tests/integration/test_migrations.py, against a scratch
+# database it migrates itself. Running `alembic check` here as well would need the
+# developer's own database to be at head, which is a different and weaker guarantee.
