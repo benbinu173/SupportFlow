@@ -282,9 +282,122 @@ organization and, for a deactivation, by the victim logging in again.
 
 ### What is not yet tenant-scoped
 
-Users are the only tenant-owned resource built so far. Tickets, customers, messages,
-knowledge articles, attachments, and audit logs arrive in Phases I–N and follow the
-identical repository pattern. See [docs/data-model.md](docs/data-model.md).
+Everything the API exposes now is tenant-owned. `organizations` is the tenant itself,
+and `refresh_tokens` is read by token hash before a tenant is known — neither is a
+resource a client can list. Knowledge articles, attachments, and audit logs arrive in
+Phases L–N and follow the identical repository pattern. See
+[docs/data-model.md](docs/data-model.md).
+
+## Customers, tickets, and messages
+
+The product itself. Phases I–K mount three routers, 16 routes, all of them
+authenticated and all of them capability-guarded.
+
+| Route | Capability |
+|---|---|
+| `POST /api/v1/customers` | `CUSTOMER_CREATE` |
+| `GET /api/v1/customers?q=&limit=&offset=` | `CUSTOMER_LIST` |
+| `GET`/`PATCH /api/v1/customers/{id}` | `CUSTOMER_LIST` / `CUSTOMER_UPDATE` |
+| `POST /api/v1/tickets` | `TICKET_CREATE` |
+| `GET /api/v1/tickets?status=&priority=&assigned_agent_id=&customer_id=` | `TICKET_LIST` |
+| `GET /api/v1/tickets/{id}` and `/events` | `TICKET_VIEW` |
+| `POST /api/v1/tickets/{id}/assign` | `TICKET_ASSIGN` |
+| `POST /api/v1/tickets/{id}/priority` | `TICKET_CHANGE_PRIORITY` |
+| `POST /api/v1/tickets/{id}/status` | `TICKET_CHANGE_STATUS` |
+| `POST /api/v1/tickets/{id}/close` | `TICKET_CLOSE` |
+| `POST /api/v1/tickets/{id}/reopen` | `TICKET_REOPEN` |
+| `GET /api/v1/tickets/{id}/messages` | `MESSAGE_READ_PUBLIC` |
+| `POST /api/v1/tickets/{id}/messages` | `MESSAGE_POST_REPLY` |
+| `POST /api/v1/tickets/{id}/notes` | `MESSAGE_POST_INTERNAL` |
+
+`GET /customers/{id}` requires `CUSTOMER_LIST` rather than a separate view capability,
+mirroring `/users/{id}` → `USER_LIST`: the matrix has no `CUSTOMER_VIEW` row, and
+inventing one would put the route table out of step with it.
+
+### Row scope is applied where the query is built
+
+`own` and `assigned` cannot be checked at the route, because at the route there is no
+row yet. So `TICKET_SCOPE_BY_ROLE` is applied by the repository that builds the query —
+`organization_id = :org AND assigned_agent_id = :me` for an agent, `… AND customer_id
+= :me` for a customer. The result is a **404, not a 403**, for a ticket outside the
+caller's scope, the same as for another tenant's: an agent should not be able to map a
+colleague's workload by watching which ids are refused.
+
+The filter parameters are **narrowing only** and compose with the scope rather than
+replacing it. An agent asking for `?assigned_agent_id=<someone else>` gets an empty
+page, not that agent's queue — asserted both at the repository and over HTTP in
+[tests/security/test_row_scopes.py](backend/tests/security/test_row_scopes.py), because
+"a query parameter that widens access" is the classic version of this bug.
+
+A portal account with **no linked customer** reaches nothing. That state cannot be
+created through the API — `POST /users` refuses a portal role without a `customer_id` —
+so the test constructs the context directly and asserts the empty page. The predicate is
+written out as an explicit `false()` rather than left to `customer_id = NULL`, which is
+*unknown* rather than false and happens to match nothing by accident. ADR-015 has the
+reasoning.
+
+Messages are resolved **through their ticket**, not by a second copy of the scope.
+Every message route first loads the ticket via `TicketRepository`, which already applies
+the caller's scope; only then are messages read. `MESSAGE_SCOPE_BY_ROLE` stays as the
+declaration of intent, and the repository that enforces it is the ticket's.
+
+### Status is an action, never a field update
+
+There is no `PATCH /tickets/{id}` for status. Three routes, one capability each, each
+validating an edge of `TICKET_TRANSITIONS`:
+
+```
+OPEN ──assign──▶ ASSIGNED ──status──▶ IN_PROGRESS ⇄ WAITING_FOR_CUSTOMER
+  ▲                                        │
+  │                                        └──status──▶ RESOLVED ──close──▶ CLOSED
+  └────────────────────────── reopen ─────────────────────────────────────────────┘
+```
+
+`/status` is the general write and accepts any single edge the table allows; `/close`
+accepts `RESOLVED → CLOSED` and `/reopen` accepts `CLOSED → OPEN`, and nothing else.
+Splitting them is what keeps the route→capability map 1:1 with
+[docs/requirements.md](docs/requirements.md) §3 — a route that picked its required
+capability at request time could declare none, which the route-protection test would
+correctly reject.
+
+`/close` accepting only `RESOLVED → CLOSED` is deliberate: that matrix row is "confirm
+resolution", and a customer confirming is not the same act as an agent resolving. So
+`ASSIGNED → RESOLVED` is refused with `409 INVALID_TICKET_TRANSITION` and a `hint`
+naming the legal target — a ticket has to be worked before it can be resolved.
+
+Every transition writes a `TicketEvent` in the same transaction, and closing or
+resolving sets `resolved_at`/`closed_at` in the same statement — a `CheckConstraint`
+makes forgetting an integrity error rather than a silent inconsistency. **Reopening
+clears the assignment and both timestamps**: a ticket in `OPEN` with an agent set is a
+state the rest of the model has no reading for, and leaving `resolved_at` populated
+would make every duration query wrong.
+
+### Internal notes are hidden twice, on purpose
+
+`GET /tickets/{id}/messages` returns the thread oldest-first, and includes internal
+notes only for a caller holding `MESSAGE_READ_INTERNAL` — an agent or above. The
+database backs this with a `CheckConstraint` on `is_internal`, and the repository
+excludes internal rows by default, so a missing filter hides rather than leaks.
+
+The timeline hides them too. A customer who can see that a note was written at 14:02,
+and not what it said, has still learned something the thread filter exists to hide — so
+`INTERNAL_NOTE_ADDED` events are filtered out of `GET /tickets/{id}/events` for a caller
+who cannot read notes, under the same capability. Without that, the two views of one
+ticket contradict each other.
+
+### Ticket numbers are per organization, under an advisory lock
+
+`tickets.number` starts at 1 in each organization and there is no sequence behind it.
+Allocating it as `MAX(number) + 1` would collide under concurrency, and a retry loop
+around the resulting integrity error needs a `SAVEPOINT`, a bounded attempt count, and a
+test for the exhaustion path. Instead the allocation takes
+`pg_advisory_xact_lock` keyed on the organization, then reads the maximum. The lock is
+transaction-scoped, released on commit or rollback, and per-tenant, so one busy tenant
+never blocks another. ADR-016 records the trade.
+
+The unique index on `(organization_id, number)` stays: the lock is the mechanism, the
+index is the invariant. Verified by creating eight tickets from eight threads against one
+organization and asserting the numbers are exactly 1–8.
 
 ## Security posture
 
@@ -328,6 +441,29 @@ Designed and documented, enforced in later phases: upload validation, and treati
 output as untrusted until schema-validated. See
 [docs/requirements.md](docs/requirements.md) §7.
 
+Implemented in Phases I–K:
+
+- **Row scope** applied where the query is built, never at the route, and an
+  unresolvable scope fails closed rather than open (ADR-015). Asserted directly in
+  [tests/security/test_row_scopes.py](backend/tests/security/test_row_scopes.py),
+  including the case that cannot be reached over HTTP.
+- **Cross-tenant access to customers, tickets, and messages** returns `404`, with the
+  body compared against a genuinely absent record's — and every refused write followed
+  by proof that the target was untouched.
+- **Every mutating ticket route** is swept one by one for cross-tenant reach, because
+  the guard that gets missed is never the one somebody thought to test.
+- **A client cannot name the tenant, the customer, or the actor.** `organization_id` is
+  not a field on any create schema, and a portal caller's `customer_id` comes from their
+  user row — naming someone else's is a `422`, and a test forges it.
+- **Customer search escapes `LIKE` wildcards.** The value is parameterized, so there is
+  no injection, but `%` and `_` in a search term are still wildcards: a customer
+  searching for `50%` would otherwise match every record.
+- **Ticket creation is serialized per tenant** by a transaction-scoped advisory lock, so
+  a duplicate number is impossible rather than merely retried (ADR-016).
+- **The log-hygiene test now covers the new services.** It drives a customer, a ticket
+  through the whole lifecycle, a reply, and an internal note, and asserts no password,
+  token, or hash appears in any of it — with the same positive control.
+
 Two trade-offs are deliberate and recorded in ADR-014: the rate limiter **fails open**
 when Redis is unreachable (it is an abuse control, not an authentication control, and
 failing closed would turn a Redis blip into a total login outage), and it is keyed on
@@ -344,8 +480,8 @@ legitimate login from the same address is throttled alongside an attacker's.
 | D | Domain models, relationships, indexes | ✅ |
 | E | Alembic migrations | ✅ |
 | F–H | Auth, RBAC, multi-tenancy + security tests | ✅ |
-| I–K | Customers, tickets, messages | next |
-| L–N | Attachments, audit logging, search | |
+| I–K | Customers, tickets, messages | ✅ |
+| L–N | Attachments, audit logging, search | next |
 | O–Q | Redis, Celery, SLA | |
 | R–S | WebSockets, analytics | |
 | T–W | AI foundation, analysis, summaries, drafts | |
@@ -380,4 +516,22 @@ legitimate login from the same address is throttled alongside an attacker's.
   if it is wanted.
 - **No email verification or password reset** yet — both need the outbound mail path
   (Mailpit is already in the stack for it).
+- **Ticket lists return every matching row for an admin.** Pagination caps the page, not
+  the total, and `GET /tickets` has no `count()`. This matches `/users` and is the
+  documented behaviour rather than an oversight — a total can be added later as a
+  compatible change.
+- **`GET /tickets` filters; it does not search.** Status, priority, assignee, and
+  customer only. Keyword search over `ix_tickets_fts` is Phase N and is deliberately not
+  half-wired early, so the index goes unused for one more phase.
+- **No assignment notifications, no SLA, no attachments.** Phases L–N follow.
+- **Ticket creation serializes within a tenant.** One advisory lock per organization, so
+  a support desk's write path holds the lock only for the length of one short
+  transaction. The alternative — a retry loop on a unique-violation — was worse; see
+  ADR-016.
+- **A reopen discards the assignment**, so the ticket goes back on the queue rather than
+  to whoever had it. That is a deliberate reading of `OPEN` as "nobody owns this", and
+  the history is not lost: it is in `ticket_events`.
+- **The frontend has no screens for any of this.** Phases I–K were backend-only, like
+  F–H; the routes are exercised by 562 tests, and the SPA still shows the Phase C
+  scaffolding.
 

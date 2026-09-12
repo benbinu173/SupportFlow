@@ -20,7 +20,7 @@ from httpx import Response
 
 from app.core.security import create_access_token
 from app.models.enums import UserRole
-from tests.conftest import AUTH, PASSWORD, USERS, OrgSession, login
+from tests.conftest import AUTH, CUSTOMERS, PASSWORD, TICKETS, USERS, OrgSession, login
 
 pytestmark = pytest.mark.security
 
@@ -446,3 +446,365 @@ def test_each_of_two_accounts_sharing_an_address_sees_only_its_own_tenant(
         shared,
         "agent@southwind.com",
     }
+
+
+# ---------------------------------------------------------------------------
+# Customers, tickets, and messages
+# ---------------------------------------------------------------------------
+# Phases I-K added a whole second and third tier of tenant-owned resources: a customer
+# is owned by an organization, a ticket is owned by a customer *and* an organization,
+# and a message is owned by a ticket. Each is a new opportunity for the tenant filter to
+# be forgotten on one query, so each is walked through the same three claims the users
+# tests make — the refusal, its indistinguishability from a missing record, and the fact
+# that nothing happened.
+
+
+@pytest.fixture
+def tenant_records(two_orgs: tuple[OrgSession, OrgSession]) -> dict[str, object]:
+    """One customer, ticket, and thread in Northwind, and nothing in Southwind.
+
+    Built once and shared, because every test below needs the same shape. The message
+    is posted by the Northwind agent on a ticket assigned to them, so the thread is real
+    rather than an empty list that any refusal would also produce.
+    """
+    northwind, southwind = two_orgs
+    customer = northwind.add_customer(name="Ada Lovelace", email="ada@northwind.com")
+    ticket = northwind.add_ticket(customer["id"], subject="Northwind's private problem")
+    agent = northwind.add_user("agent", email="agent@northwind.com")
+    assigned = northwind.post(
+        f"{TICKETS}/{ticket['id']}/assign", json={"assigned_agent_id": agent.user_id}
+    )
+    assert assigned.status_code == 200, assigned.text
+    replied = agent.post(f"{TICKETS}/{ticket['id']}/messages", json={"body": "Looking into it."})
+    assert replied.status_code == 201, replied.text
+
+    return {
+        "customer": customer,
+        "ticket": ticket,
+        "agent": agent,
+        "northwind": northwind,
+        "southwind": southwind,
+    }
+
+
+def test_an_organization_cannot_read_another_s_customer(
+    tenant_records: dict[str, object],
+) -> None:
+    northwind = tenant_records["northwind"]
+    southwind = tenant_records["southwind"]
+    customer = tenant_records["customer"]
+    assert isinstance(northwind, OrgSession)
+    assert isinstance(southwind, OrgSession)
+    assert isinstance(customer, dict)
+
+    cross_tenant = southwind.get(f"{CUSTOMERS}/{customer['id']}")
+    never_existed = southwind.get(f"{CUSTOMERS}/{uuid.uuid4()}")
+
+    assert cross_tenant.status_code == 404
+    assert cross_tenant.json()["error"]["code"] == "CUSTOMER_NOT_FOUND"
+    assert_indistinguishable_from_a_missing_record(cross_tenant, never_existed)
+    assert customer["email"] not in cross_tenant.text
+
+
+def test_an_organization_cannot_update_another_s_customer(
+    tenant_records: dict[str, object],
+) -> None:
+    """The write path applies the same filter as the read, which is the half that
+    matters — a scope that only narrows reads is a filter, not a boundary."""
+    southwind = tenant_records["southwind"]
+    northwind = tenant_records["northwind"]
+    customer = tenant_records["customer"]
+    assert isinstance(southwind, OrgSession)
+    assert isinstance(northwind, OrgSession)
+    assert isinstance(customer, dict)
+
+    response = southwind.patch(f"{CUSTOMERS}/{customer['id']}", json={"name": "Renamed"})
+
+    assert response.status_code == 404
+    # And nothing happened: the owner still sees the original name.
+    assert northwind.get(f"{CUSTOMERS}/{customer['id']}").json()["name"] == "Ada Lovelace"
+
+
+def test_a_listing_contains_only_the_caller_s_own_customers(
+    tenant_records: dict[str, object],
+) -> None:
+    """Both sides are given customers, so this is about a non-empty intersection being
+    absent rather than about an empty list."""
+    northwind = tenant_records["northwind"]
+    southwind = tenant_records["southwind"]
+    assert isinstance(northwind, OrgSession)
+    assert isinstance(southwind, OrgSession)
+    southwind.add_customer(name="Grace Hopper", email="grace@southwind.com")
+
+    northwind_emails = {customer["email"] for customer in northwind.get(CUSTOMERS).json()}
+    southwind_emails = {customer["email"] for customer in southwind.get(CUSTOMERS).json()}
+
+    assert northwind_emails == {"ada@northwind.com"}
+    assert southwind_emails == {"grace@southwind.com"}
+
+
+def test_the_same_customer_email_may_exist_in_two_organizations(
+    register_org: Callable[..., OrgSession],
+) -> None:
+    """Uniqueness is per tenant, so the constraint cannot be used to probe whether an
+    address is a customer of some other support provider."""
+    northwind = register_org(organization_name="Northwind")
+    southwind = register_org(organization_name="Southwind")
+
+    first = northwind.post(CUSTOMERS, json={"name": "Shared", "email": "shared@example.com"})
+    second = southwind.post(CUSTOMERS, json={"name": "Shared", "email": "shared@example.com"})
+
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
+    assert first.json()["id"] != second.json()["id"]
+
+
+def test_an_organization_cannot_read_another_s_ticket(
+    tenant_records: dict[str, object],
+) -> None:
+    southwind = tenant_records["southwind"]
+    ticket = tenant_records["ticket"]
+    assert isinstance(southwind, OrgSession)
+    assert isinstance(ticket, dict)
+
+    cross_tenant = southwind.get(f"{TICKETS}/{ticket['id']}")
+    never_existed = southwind.get(f"{TICKETS}/{uuid.uuid4()}")
+
+    assert cross_tenant.status_code == 404
+    assert cross_tenant.json()["error"]["code"] == "TICKET_NOT_FOUND"
+    assert_indistinguishable_from_a_missing_record(cross_tenant, never_existed)
+    assert "Northwind's private problem" not in cross_tenant.text
+
+
+def test_an_organization_cannot_list_another_s_tickets(
+    tenant_records: dict[str, object],
+) -> None:
+    """An admin sees every ticket in their own organization, which makes this the
+    strongest form of the listing check: Southwind's admin is an admin, and the list is
+    still empty."""
+    southwind = tenant_records["southwind"]
+    assert isinstance(southwind, OrgSession)
+
+    assert southwind.get(TICKETS).json() == []
+
+
+def test_an_organization_cannot_see_another_s_ticket_in_its_timeline(
+    tenant_records: dict[str, object],
+) -> None:
+    """The timeline is a second route to the same row, and it needs the same filter.
+
+    A resource reached by two paths is where isolation most often breaks: the detail
+    route was checked in review and the timeline route was added later.
+    """
+    southwind = tenant_records["southwind"]
+    ticket = tenant_records["ticket"]
+    assert isinstance(southwind, OrgSession)
+    assert isinstance(ticket, dict)
+
+    response = southwind.get(f"{TICKETS}/{ticket['id']}/events")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "TICKET_NOT_FOUND"
+
+
+@pytest.mark.parametrize(
+    ("method", "suffix", "body"),
+    [
+        ("post", "/assign", {"assigned_agent_id": None}),
+        ("post", "/priority", {"priority": "urgent"}),
+        ("post", "/status", {"status": "resolved"}),
+        ("post", "/close", None),
+        ("post", "/reopen", None),
+        ("post", "/messages", {"body": "Injected."}),
+        ("post", "/notes", {"body": "Injected."}),
+    ],
+)
+def test_no_ticket_action_reaches_across_a_tenant(
+    tenant_records: dict[str, object],
+    method: str,
+    suffix: str,
+    body: dict[str, str] | None,
+) -> None:
+    """Every mutating route, walked one by one.
+
+    A parametrised sweep rather than a hand-picked example, because the failure mode is
+    a single route whose guard was written from a different template — and the route
+    that was missed is never the one somebody thought to test.
+    """
+    southwind = tenant_records["southwind"]
+    ticket = tenant_records["ticket"]
+    assert isinstance(southwind, OrgSession)
+    assert isinstance(ticket, dict)
+
+    response = getattr(southwind, method)(f"{TICKETS}/{ticket['id']}{suffix}", json=body)
+
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "TICKET_NOT_FOUND"
+
+
+def test_the_target_of_a_refused_ticket_action_is_actually_unchanged(
+    tenant_records: dict[str, object],
+) -> None:
+    """The 404 must mean "nothing happened".
+
+    Verified by asking the owning organization as well as by re-reading the ticket, so a
+    refusal that still wrote an event — or moved the status without committing the
+    response — would be caught.
+    """
+    southwind = tenant_records["southwind"]
+    northwind = tenant_records["northwind"]
+    ticket = tenant_records["ticket"]
+    assert isinstance(southwind, OrgSession)
+    assert isinstance(northwind, OrgSession)
+    assert isinstance(ticket, dict)
+
+    southwind.post(f"{TICKETS}/{ticket['id']}/status", json={"status": "resolved"})
+    southwind.post(f"{TICKETS}/{ticket['id']}/priority", json={"priority": "urgent"})
+    southwind.post(f"{TICKETS}/{ticket['id']}/messages", json={"body": "Injected."})
+
+    untouched = northwind.get(f"{TICKETS}/{ticket['id']}").json()
+    assert untouched["status"] == "assigned"
+    assert untouched["priority"] == "medium"
+    assert untouched["resolved_at"] is None
+
+    # And no message or event was written: the timeline is exactly what Northwind did —
+    # one creation, one assignment, one reply — and the reply is still the only message.
+    thread = northwind.get(f"{TICKETS}/{ticket['id']}/messages").json()
+    timeline = northwind.get(f"{TICKETS}/{ticket['id']}/events").json()
+    assert [message["body"] for message in thread] == ["Looking into it."]
+    assert sorted(event["event_type"] for event in timeline) == [
+        "assigned",
+        "created",
+        "message_added",
+    ]
+
+
+def test_an_organization_cannot_read_another_s_messages(
+    tenant_records: dict[str, object],
+) -> None:
+    """A message is reachable exactly when its ticket is (ADR-015), so the refusal comes
+    from the ticket and carries the ticket's error code."""
+    southwind = tenant_records["southwind"]
+    ticket = tenant_records["ticket"]
+    assert isinstance(southwind, OrgSession)
+    assert isinstance(ticket, dict)
+
+    response = southwind.get(f"{TICKETS}/{ticket['id']}/messages")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "TICKET_NOT_FOUND"
+    assert "Looking into it." not in response.text
+
+
+def test_a_customer_from_one_tenant_cannot_be_attached_to_another_s_ticket(
+    tenant_records: dict[str, object],
+) -> None:
+    """The cross-tenant reference is refused at the *foreign key*, not merely at the
+    read.
+
+    Raising a ticket names a customer, so this is the one route where one tenant's id
+    could be written into another's row. A 404 rather than a 403, so it does not confirm
+    that the customer exists elsewhere.
+    """
+    northwind = tenant_records["northwind"]
+    southwind = tenant_records["southwind"]
+    customer = tenant_records["customer"]
+    assert isinstance(northwind, OrgSession)
+    assert isinstance(southwind, OrgSession)
+    assert isinstance(customer, dict)
+
+    response = southwind.post(
+        TICKETS,
+        json={
+            "subject": "Planted",
+            "description": "Belongs to the other tenant.",
+            "customer_id": customer["id"],
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "CUSTOMER_NOT_FOUND"
+    # And nothing was created in either tenant.
+    assert southwind.get(TICKETS).json() == []
+    assert len(northwind.get(TICKETS).json()) == 1
+
+
+def test_a_ticket_cannot_be_assigned_to_an_agent_in_another_organization(
+    tenant_records: dict[str, object],
+) -> None:
+    """The other cross-tenant reference: a ticket names an agent."""
+    southwind = tenant_records["southwind"]
+    northwind = tenant_records["northwind"]
+    ticket = tenant_records["ticket"]
+    agent = tenant_records["agent"]
+    assert isinstance(southwind, OrgSession)
+    assert isinstance(northwind, OrgSession)
+    assert isinstance(ticket, dict)
+    assert isinstance(agent, OrgSession)
+
+    # Southwind raises its own ticket and tries to staff it with Northwind's agent.
+    their_customer = southwind.add_customer(email="theirs@southwind.com")
+    their_ticket = southwind.add_ticket(their_customer["id"])
+
+    response = southwind.post(
+        f"{TICKETS}/{their_ticket['id']}/assign", json={"assigned_agent_id": agent.user_id}
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "USER_NOT_FOUND"
+    assert southwind.get(f"{TICKETS}/{their_ticket['id']}").json()["assigned_agent_id"] is None
+
+
+def test_a_client_cannot_place_a_customer_in_another_organization(
+    two_orgs: tuple[OrgSession, OrgSession],
+) -> None:
+    """`organization_id` is not part of `CustomerCreate`, so an attempt to set it is
+    discarded by validation rather than honoured — the same check the users suite makes,
+    repeated here because it is a new schema."""
+    northwind, southwind = two_orgs
+
+    created = southwind.post(
+        CUSTOMERS,
+        json={
+            "name": "Planted",
+            "email": "planted@southwind.com",
+            "organization_id": northwind.user_id,
+            "organizationId": northwind.user_id,
+        },
+    )
+
+    assert created.status_code == 201, created.text
+    planted_id = created.json()["id"]
+
+    assert planted_id in {customer["id"] for customer in southwind.get(CUSTOMERS).json()}
+    assert northwind.get(f"{CUSTOMERS}/{planted_id}").status_code == 404
+
+
+def test_a_token_naming_another_organization_cannot_reach_the_new_routes(
+    tenant_records: dict[str, object],
+) -> None:
+    """The confused-deputy check, repeated for the phase's surface.
+
+    The forged token is genuinely signed and unexpired, and its `org` claim names a real
+    tenant — it is refused because the claim disagrees with the user's own row. Every
+    new route reaches the same dependency, so this asserts the dependency is still on the
+    path of a router that was mounted after the original test was written.
+    """
+    northwind = tenant_records["northwind"]
+    southwind = tenant_records["southwind"]
+    ticket = tenant_records["ticket"]
+    assert isinstance(northwind, OrgSession)
+    assert isinstance(southwind, OrgSession)
+    assert isinstance(ticket, dict)
+
+    forged = create_access_token(
+        uuid.UUID(northwind.user_id),
+        uuid.UUID(southwind.user_id),  # a tenant this user does not belong to
+        UserRole.ADMIN,
+    )
+    headers = {"Authorization": f"Bearer {forged}"}
+
+    for path in (CUSTOMERS, TICKETS, f"{TICKETS}/{ticket['id']}/messages"):
+        response = northwind.client.get(path, headers=headers)
+        assert response.status_code == 403, f"{path} was reachable: {response.text}"
+        assert response.json()["error"]["code"] == "TENANT_ACCESS_DENIED"

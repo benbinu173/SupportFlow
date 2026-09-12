@@ -25,7 +25,8 @@ from starlette import status
 class ErrorCode(StrEnum):
     """Every code the API can return.
 
-    The specification lists eleven (§42); all eleven are here verbatim. Two are added:
+    The specification lists eleven (§42); all eleven are here verbatim. Three are
+    added:
 
     `INVALID_CREDENTIALS` — a failed login is not the same condition as a missing
     token, and a client needs to tell them apart to know whether to retry the request
@@ -35,9 +36,14 @@ class ErrorCode(StrEnum):
     `USER_ALREADY_EXISTS` — the spec's list has no code for a unique-constraint
     violation, which an admin creating a user can genuinely trigger.
 
-    Codes for phases not yet built (`TICKET_NOT_FOUND`, `AI_SERVICE_ERROR`, and the
-    rest) are defined now so the vocabulary is complete in one place and the frontend
-    can map against it without chasing additions.
+    `CUSTOMER_ALREADY_EXISTS` — the same gap on the customers table, whose unique
+    constraint is `(organization_id, email)`. Reported distinctly from the user case
+    because the two are different forms in a UI and a client should not have to guess
+    which record it collided with.
+
+    Codes for phases not yet built (`AI_SERVICE_ERROR` and the rest) are defined now so
+    the vocabulary is complete in one place and the frontend can map against it without
+    chasing additions.
     """
 
     # --- Authentication and authorization ---------------------------------
@@ -49,6 +55,7 @@ class ErrorCode(StrEnum):
     # --- Validation and conflict -------------------------------------------
     VALIDATION_ERROR = "VALIDATION_ERROR"
     USER_ALREADY_EXISTS = "USER_ALREADY_EXISTS"
+    CUSTOMER_ALREADY_EXISTS = "CUSTOMER_ALREADY_EXISTS"
 
     # --- Not found ---------------------------------------------------------
     USER_NOT_FOUND = "USER_NOT_FOUND"
@@ -215,6 +222,30 @@ class ConflictError(AppError):
 class UserAlreadyExistsError(ConflictError):
     code = ErrorCode.USER_ALREADY_EXISTS
     message = "A user with that email already exists."
+
+
+class CustomerAlreadyExistsError(ConflictError):
+    code = ErrorCode.CUSTOMER_ALREADY_EXISTS
+    message = "A customer with that email already exists."
+
+
+class InvalidTicketTransitionError(ConflictError):
+    """A status change that `TICKET_TRANSITIONS` does not permit.
+
+    409 rather than 422: the request is well-formed and the target status is a real
+    status — what is wrong is the ticket's current state, which is exactly the kind of
+    conflict a retry after the right transition would resolve. Spec §5 names this error
+    code; the message names both ends of the refused edge, because "invalid transition"
+    alone leaves a client guessing which of its two states was the surprise.
+    """
+
+    code = ErrorCode.INVALID_TICKET_TRANSITION
+
+    def __init__(self, current: str, target: str, hint: str | None = None) -> None:
+        message = f"A ticket cannot move from {current} to {target}."
+        if hint:
+            message = f"{message} {hint}"
+        super().__init__(message)
 
 
 class ValidationError(AppError):

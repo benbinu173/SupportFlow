@@ -27,7 +27,7 @@ directly — which `tests/unit/test_permissions.py` does, role by role.
 from collections.abc import Mapping
 from enum import StrEnum
 
-from app.models.enums import UserRole
+from app.models.enums import SenderType, UserRole
 
 
 class Permission(StrEnum):
@@ -237,6 +237,35 @@ TICKET_SCOPE_BY_ROLE: Mapping[UserRole, RowScope] = {
 MESSAGE_SCOPE_BY_ROLE: Mapping[UserRole, RowScope] = dict(TICKET_SCOPE_BY_ROLE)
 
 ATTACHMENT_SCOPE_BY_ROLE: Mapping[UserRole, RowScope] = dict(TICKET_SCOPE_BY_ROLE)
+
+
+# ---------------------------------------------------------------------------
+# Role-derived attributes
+# ---------------------------------------------------------------------------
+# Two facts about a user follow from their role without being authorization
+# decisions: whether they are an external party, and what kind of author a message
+# they write is. Both are structural, and both would otherwise be a `UserRole.X`
+# reference outside this module — which `tests/unit/test_permissions.py` rejects, for
+# the same reason it rejects scattered role checks: two copies of a rule are two
+# copies that can disagree.
+
+# Roles that authenticate as an external party rather than as a member of the support
+# team. A user in one of these roles is linked to a `Customer` row, and that link is
+# what makes `RowScope.OWN` resolvable — which is why this set and the roles whose
+# ticket scope is `OWN` must be the same set, asserted in the unit tests.
+PORTAL_ROLES: frozenset[UserRole] = frozenset({UserRole.CUSTOMER})
+
+# The `sender_type` a message gets from its author's role. A customer's message is a
+# customer message whatever else they may do, and staff messages are agent messages —
+# including from an admin or a manager, who are both acting as support agents when
+# they reply. `SYSTEM` and `AI_DRAFT` have no role and are set explicitly by the code
+# that writes them.
+SENDER_TYPE_BY_ROLE: Mapping[UserRole, SenderType] = {
+    UserRole.ADMIN: SenderType.AGENT,
+    UserRole.MANAGER: SenderType.AGENT,
+    UserRole.AGENT: SenderType.AGENT,
+    UserRole.CUSTOMER: SenderType.CUSTOMER,
+}
 
 
 # ---------------------------------------------------------------------------

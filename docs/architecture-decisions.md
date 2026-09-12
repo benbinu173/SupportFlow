@@ -510,3 +510,183 @@ still look healthy.
 3. **Fail-open is a real hole during an outage**, bounded by the outage's length and
    visible in the logs.
 
+---
+
+## ADR-015 — Row scope is applied in the repository, and an unresolvable scope fails closed
+
+**Status:** accepted · Phase I–K
+
+**Context.** ADR-013 split authorization into a capability (decided at the route) and a
+row scope (not decidable there, because there is no row yet) and left the scope
+mechanism built but unconsumed. Phases I–K are the first phase with rows to narrow, and
+they are where a scope that fails *open* leaks one customer's support conversation to
+another.
+
+Three questions had to be answered, and each has a plausible wrong answer that looks
+right.
+
+**1. Where does the scope predicate live?** In the repository, at the point the `WHERE`
+clause is written — `TicketRepository._scope()`, via `row_scope_predicate`. It cannot
+live at the route: `TICKET_VIEW` is one capability held by four roles, and what differs
+between them is how many rows it reaches. It also cannot be a post-filter in the
+service: filtering a page after the database has already chosen it gives short pages
+that look like the end of the data.
+
+**2. What does an unresolvable scope mean?** `RowScope.OWN` resolves through
+`TenantContext.customer_id`, which is `None` for a portal account with no linked
+`Customer` row. The tempting predicate is `Ticket.customer_id == context.customer_id`.
+In SQL that is `customer_id = NULL`, which is *unknown* rather than false — so it
+matches nothing, which is the correct answer, by accident. That accident survives until
+someone composes the predicate differently (an `or_`, a `NOT`, a wrapper that turns it
+into an existence check) and it silently starts matching everything.
+
+So `row_scope_predicate` writes the case out explicitly:
+
+```python
+if context.customer_id is None:
+    return false()
+```
+
+A scope that cannot be resolved is *denied*, not *ignored*. This is asserted, not
+assumed: `tests/security/test_row_scopes.py` builds the unlinked context directly —
+the API refuses to create one, which is why the test has to go below the API — and
+asserts an empty page while the tickets it *could* have claimed sit in the same
+organization. Verified by temporarily changing that `false()` to `true()`: the test
+fails, reporting all four tickets visible to an account that owns none of them. A
+`true()` there is the whole vulnerability in one character.
+
+**3. Where is message visibility decided?** `MESSAGE_SCOPE_BY_ROLE` exists and is
+`dict(TICKET_SCOPE_BY_ROLE)` by construction. Rather than implementing `OWN` and
+`ASSIGNED` a second time against a join, every message route **first resolves the
+ticket** through `TicketRepository`, which already applies the caller's scope and
+returns `None` for a ticket out of reach. Only then are messages read, filtered by
+`ticket_id`.
+
+A message is reachable exactly when its ticket is, and that is the point: it is one
+implementation and one 404. The alternative is two copies of the scope on two different
+queries, which is precisely the drift the central mapping exists to prevent. The map
+stays as the declaration of intent; this ADR records that it is applied at the ticket.
+
+**Related, in the same phase: internal notes are hidden from two views, not one.**
+`GET /tickets/{id}/messages` withholds internal notes from a caller without
+`MESSAGE_READ_INTERNAL`, and `GET /tickets/{id}/events` withholds `INTERNAL_NOTE_ADDED`
+events under the same capability. Both matter, and the second is easy to miss: a
+customer who can see *that* a note was written at 14:02, and not what it said, has
+learned something the thread filter exists to prevent — through the side door. Two views
+of one ticket contradicting each other is a bug, not a limitation.
+
+**Cost.** Row scope is applied by hand in each repository that needs it. There is no
+convention that makes forgetting it a type error, and forgetting fails open. The
+mitigation is that the organization filter *is* structural
+(`TenantScopedRepository._select` applies it and cannot be bypassed), so the worst a
+forgetful subclass can do is over-expose *within* one tenant rather than across tenants
+— and `tests/security/test_row_scopes.py` asserts the per-role answer for all four roles
+and an unlinked account, so a regression is caught rather than reviewed.
+
+---
+
+## ADR-016 — Ticket numbers are allocated under a per-tenant advisory lock
+
+**Status:** accepted · Phase I–K
+
+**Context.** `tickets.number` is a per-organization sequence starting at 1 — the number
+a customer quotes on the phone — and there is no PostgreSQL sequence behind it, because
+a sequence cannot be per-tenant without one sequence per tenant. `app/models/ticket.py`
+anticipated the consequence: the unique index on `(organization_id, number)` makes a
+collision "a retryable integrity error".
+
+Two concurrent transactions both reading `MAX(number) + 1` do collide. The obvious
+answer is the one the model's comment suggests: catch the integrity error and retry.
+
+**Decision.** Take `pg_advisory_xact_lock` on a key derived from the organization id,
+then read `MAX(number) + 1` in the same transaction.
+
+```python
+await session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _lock_key(org)})
+return int(await session.scalar(select(func.coalesce(func.max(Ticket.number), 0) + 1)) or 1)
+```
+
+**Why not the retry loop.** A failed statement in PostgreSQL aborts the *transaction*,
+not just the statement. So a retry is not `except IntegrityError: try again` — it needs
+a `SAVEPOINT` around the insert, a bounded attempt count, an answer for what happens
+when the attempts run out, and a test that forces the exhaustion path. That is a lot of
+machinery to make a collision *survivable* when a one-line lock makes it *impossible*.
+
+The lock is transaction-scoped, so it is released on commit or rollback with no cleanup
+path to forget. It is keyed per organization, so two tenants never contend. And the key
+is derived, not allocated, because there is nothing to allocate: a collision between two
+organizations would merely serialize two creations that did not need serializing, which
+cannot produce a wrong answer.
+
+**Cost.** Ticket creation within a single tenant serializes. For a support desk that is
+one short transaction on a low-frequency write, and the alternative is a retry loop
+that has to be tested. The unique index stays as the invariant backstop; the lock is the
+mechanism.
+
+**How it is verified.** Not by reasoning — a single-threaded HTTP test cannot prove
+this. `test_numbers_are_distinct_under_concurrent_creation` raises eight tickets from
+eight threads against one organization and asserts the numbers are exactly 1–8.
+Confirmed meaningful by temporarily replacing the lock call with `pass`: all eight
+threads then fail with `UniqueViolation` on `uq_tickets_org_number`, which proves both
+that the lock is load-bearing and that the threads are genuinely concurrent rather than
+serialized by the test client.
+
+---
+
+## ADR-017 — Status is an action, not a field, and each action is its own route
+
+**Status:** accepted · Phase I–K
+
+**Context.** The spec is explicit that "status is never mutated by a blind field update;
+transitions go through an action that validates the edge". The matrix in
+`docs/requirements.md` §3 makes the same point structurally: `change status`, `close`,
+and `reopen` are three separate rows, and the fourth column qualifies each with a
+different scope.
+
+The obvious design is one route with a target status in the body, branching on which
+capability the target requires: `PATCH /tickets/{id}/status {"status": "closed"}`.
+
+**Decision.** Three routes, one capability each, declared statically:
+
+| Route | Capability | Edge accepted |
+|---|---|---|
+| `POST /tickets/{id}/status` | `TICKET_CHANGE_STATUS` | any single edge in `TICKET_TRANSITIONS` |
+| `POST /tickets/{id}/close` | `TICKET_CLOSE` | `RESOLVED → CLOSED` only |
+| `POST /tickets/{id}/reopen` | `TICKET_REOPEN` | `CLOSED → OPEN` only |
+
+**Why.** A route that chose its required capability at request time would declare *no*
+capability, and `tests/security/test_route_protection.py` fails any authenticated route
+that declares none — correctly, because "this route requires permission X" has to be
+answerable by reading the route. Beyond the test: a static guard is visible in the
+OpenAPI schema, in code review, and in a stack trace. A runtime branch is none of those.
+
+It also keeps the route table 1:1 with the documented matrix, so the matrix can be
+transcribed independently and asserted — the same property ADR-013 relies on for
+`ROLE_PERMISSIONS`.
+
+**`/close` is narrower than `/status` on purpose.** The `close` row's scope in the
+matrix is "confirm resolution": an agent resolving work and a customer agreeing that it
+is resolved are different acts, and only the second is `close`. So `/close` accepts
+`RESOLVED → CLOSED` and nothing else, and a caller attempting it on an `IN_PROGRESS`
+ticket gets `409 INVALID_TICKET_TRANSITION` with a hint naming the legal target.
+
+**Every transition writes a `TicketEvent` in the same transaction**, and resolving or
+closing sets `resolved_at`/`closed_at` in the same statement — a `CheckConstraint`
+enforces it, so forgetting is an integrity error rather than a ticket whose status and
+timestamps disagree.
+
+**Reopening clears the assignment and both timestamps.** `OPEN` and `ASSIGNED` are the
+lifecycle's two ways of saying "nobody owns this" and "somebody does"; a ticket in
+`OPEN` with an agent set is a state the rest of the model has no reading for. It would
+also break assignment outright — assigning it back to that same agent is a no-op, so the
+ticket could never reach `ASSIGNED` again and would sit in `OPEN` forever. That was a
+real bug, found while writing the tests, and
+`test_a_reopened_ticket_can_be_assigned_to_the_same_agent_again` is its regression test.
+`resolved_at` and `closed_at` are cleared for the same kind of reason: they describe the
+ticket's *current* state, and leaving them set would make every SLA and duration query
+wrong. Nothing is lost — the history is in `ticket_events`.
+
+**Cost.** Three routes where one would do, and a client has to know which to call. That
+is the price of the guard being readable at the route, and it is the same price ADR-013
+already paid for capabilities.
+

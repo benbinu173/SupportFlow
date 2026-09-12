@@ -7,6 +7,7 @@ which is what makes the isolation guarantee structural rather than conventional.
 
 import uuid
 from datetime import datetime
+from typing import Any, ClassVar
 
 from sqlalchemy import DateTime, ForeignKey, MetaData, func, text
 from sqlalchemy.dialects.postgresql import UUID
@@ -26,6 +27,25 @@ NAMING_CONVENTION = {
 
 class Base(DeclarativeBase):
     metadata = MetaData(naming_convention=NAMING_CONVENTION)
+
+    # `updated_at` is set by an `onupdate=func.now()` expression, and SQLAlchemy has no
+    # way to know what `now()` returned — so after an UPDATE it *expires* the attribute,
+    # meaning the next read of it emits a fresh SELECT. That read happens when a route
+    # serializes the row it just changed, which is outside the async greenlet and fails
+    # with `MissingGreenlet` rather than with anything that names the real cause.
+    #
+    # `eager_defaults` asks the database for the value in the statement that changed it
+    # (`UPDATE … RETURNING updated_at`, which Postgres supports) instead of discarding
+    # it. Set on the declarative base so every mapped class inherits it: the alternative
+    # is an `await session.refresh(row)` after each of a dozen commits, which costs a
+    # round-trip per write and is only correct where someone remembered to add it.
+    # `ClassVar` because it is class-level configuration, not per-instance state — ruff
+    # requires the annotation for a mutable class attribute. mypy objects that
+    # `DeclarativeBase` declares `__mapper_args__` as an instance attribute; that is a
+    # limitation of SQLAlchemy's stubs, since the mapper reads it from the class.
+    __mapper_args__: ClassVar[dict[str, Any]] = {  # type: ignore[misc]
+        "eager_defaults": True
+    }
 
 
 class UUIDPrimaryKeyMixin:

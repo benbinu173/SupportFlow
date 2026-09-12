@@ -22,19 +22,34 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import get_settings
-from tests.conftest import AUTH, PASSWORD, USERS, OrgSession, cookie_header, login
+from tests.conftest import (
+    AUTH,
+    CUSTOMERS,
+    PASSWORD,
+    TICKETS,
+    USERS,
+    OrgSession,
+    cookie_header,
+    login,
+)
 
 pytestmark = pytest.mark.security
 
 # Every module in the request path that holds a module-level logger. Listed explicitly
 # rather than discovered by walking `sys.modules`, so that adding a module with a logger
 # is a deliberate addition here rather than something silently left uncovered.
+#
+# The `api` routers are absent because they hold no logger — logging is the service
+# layer's job, and a route that logged on its own would bypass the services listed here.
 LOGGING_MODULES = (
     "app.api.auth",
     "app.api.deps",
     "app.main",
     "app.core.rate_limit",
     "app.services.auth_service",
+    "app.services.customer_service",
+    "app.services.message_service",
+    "app.services.ticket_service",
     "app.services.user_service",
 )
 
@@ -50,10 +65,26 @@ EXPECTED_EVENTS = frozenset(
         "refresh_token_reuse_detected",
         "logout",
         "permission_denied",
+        # Phases I-K. Each one is a log line that carries an id, a status, or an actor —
+        # never the subject, the description, or the body it is describing.
+        "customer_created",
+        "customer_updated",
+        "ticket_created",
+        "ticket_assigned",
+        "ticket_priority_changed",
+        "ticket_status_changed",
+        "ticket_closed",
+        "ticket_reopened",
+        "message_posted",
     }
 )
 
 WRONG_PASSWORD = "a-wrong-password-that-is-still-a-secret"
+
+# A password for the portal account, distinct from `PASSWORD`, so that "the password
+# never reaches the logs" is a claim about this run rather than about a constant that
+# happens to be shared by every other account in the suite.
+PORTAL_PASSWORD = "a-portal-password-that-is-also-a-secret"
 
 
 class LogRecorder:
@@ -122,6 +153,12 @@ def exercised(
 ) -> dict[str, str]:
     """Drive a full session — success, failure, rotation, reuse, refusal, logout.
 
+    Then a second pass through the customer, ticket, and message services, because those
+    are where the phase's new log lines are and a log-hygiene test that never reached
+    them would keep passing while covering none of them. Several of those calls carry a
+    body of customer-written text, which is the value most likely to be interpolated into
+    an event name by accident.
+
     Returns the secrets that were handled, so the tests search for exactly the values
     this run produced rather than for fixed strings.
     """
@@ -163,12 +200,71 @@ def exercised(
     assert reused.status_code == 401, reused.text
     assert logout.status_code == 200, logout.text
 
+    # --- Phases I-K, through the real services ---------------------------------
+    # A portal account is created here rather than through `add_portal_user`, so that the
+    # password is one this test chooses and can therefore search for.
+    customer = org.add_customer(name="Dana Scully", email="dana@loghygiene.com")
+    portal = org.post(
+        USERS,
+        json={
+            "name": "Dana Scully",
+            "email": "dana@loghygiene.com",
+            "password": PORTAL_PASSWORD,
+            "role": "customer",
+            "customer_id": customer["id"],
+        },
+    )
+    assert portal.status_code == 201, portal.text
+
+    # The portal account logging in as itself, which is the path a `customer_id`-linked
+    # session actually travels — and the only way to obtain a token for it, since
+    # `POST /users` returns the created user rather than a session.
+    portal_session = login(client, "dana@loghygiene.com", PORTAL_PASSWORD)
+    assert portal_session.role == "customer", portal_session.role
+
+    updated = org.patch(f"{CUSTOMERS}/{customer['id']}", json={"phone": "+1 555 0100"})
+    assert updated.status_code == 200, updated.text
+
+    ticket = org.add_ticket(
+        customer["id"], subject="The observatory is offline", description="DEEP_THROAT"
+    )
+    ticket_id = ticket["id"]
+
+    assigned = org.post(f"{TICKETS}/{ticket_id}/assign", json={"assigned_agent_id": agent.user_id})
+    assert assigned.status_code == 200, assigned.text
+    priority = org.post(f"{TICKETS}/{ticket_id}/priority", json={"priority": "high"})
+    assert priority.status_code == 200, priority.text
+    for status in ("in_progress", "resolved"):
+        moved = org.post(f"{TICKETS}/{ticket_id}/status", json={"status": status})
+        assert moved.status_code == 200, moved.text
+    closed = org.post(f"{TICKETS}/{ticket_id}/close")
+    assert closed.status_code == 200, closed.text
+    reopened = org.post(f"{TICKETS}/{ticket_id}/reopen")
+    assert reopened.status_code == 200, reopened.text
+
+    # Reopening clears the assignment, so the agent cannot reach the ticket until it is
+    # given back to them — and the messages below would 404 rather than being logged.
+    reassigned = org.post(
+        f"{TICKETS}/{ticket_id}/assign", json={"assigned_agent_id": agent.user_id}
+    )
+    assert reassigned.status_code == 200, reassigned.text
+
+    # Two posts down the two routes: `message_posted` is the event name for both, so
+    # only the internal one would be missed if this stopped after the first.
+    reply = agent.post(f"{TICKETS}/{ticket_id}/messages", json={"body": "MULDER"})
+    note = agent.post(f"{TICKETS}/{ticket_id}/notes", json={"body": "Skinner knows"})
+
+    assert reply.status_code == 201, reply.text
+    assert note.status_code == 201, note.text
+
     return {
         "password": org.password,
         "access_token": session.access_token,
         "rotated_access_token": rotated.json().get("access_token") or "",
         "refresh_token": session.refresh_token or "",
         "rotated_refresh_token": rotated_refresh,
+        "portal_password": PORTAL_PASSWORD,
+        "portal_access_token": portal_session.access_token,
     }
 
 
@@ -227,3 +323,22 @@ def test_a_password_hash_is_never_logged(logs: LogRecorder, exercised: dict[str,
     """An Argon2 hash is credential-equivalent for offline cracking, so it is not a
     log-safe value either."""
     assert "$argon2" not in logs.as_text()
+
+
+def test_no_portal_password_or_token_reaches_the_logs(
+    logs: LogRecorder, exercised: dict[str, str]
+) -> None:
+    """The same two claims for the portal path.
+
+    Phases I-K introduced a second way a password enters the system — an admin creating
+    a login for a customer — and a second way a session begins. Both go through
+    `user_service` and `auth_service`, which are already in `LOGGING_MODULES`, but a
+    service can log a field on one code path and not another, and the assertion is only
+    as broad as the requests the fixture actually made.
+    """
+    text = logs.as_text()
+
+    assert exercised["portal_password"] not in text
+    assert exercised["portal_password"][:8] not in text
+    assert exercised["portal_access_token"] not in text
+    assert exercised["portal_access_token"].split(".")[1] not in text

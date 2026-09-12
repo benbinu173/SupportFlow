@@ -13,6 +13,8 @@ The rules it encodes, from architecture §4 and §11:
   an access token up to 15 minutes ago — so a demotion takes effect immediately.
 * Permissions are resolved once, here, so no downstream code re-derives them from the
   role string and no two call sites can disagree.
+* For a portal caller, the `Customer` row they act as comes from their user row too —
+  so "my tickets" is resolved from identity, never from a request parameter.
 
 Frozen because handing a mutable identity object down the call stack invites exactly
 one bug: something mutates it. `dataclasses.replace` covers the legitimate cases.
@@ -33,6 +35,16 @@ class TenantContext:
     user_id: uuid.UUID
     organization_id: uuid.UUID
     role: UserRole
+
+    # Set only for a portal caller — a user in `PORTAL_ROLES`, linked to the `Customer`
+    # row they are acting as. It is what makes `RowScope.OWN` resolvable: "tickets this
+    # customer raised" needs a customer, and the alternative — looking one up by email
+    # at query time — would make ownership an inference rather than a fact.
+    #
+    # `None` for staff, and `None` for a portal account that has not been linked. Both
+    # cases mean the same thing to a scoped query, and the repository reads it as
+    # "matches nothing" rather than "matches everything" (ADR-015).
+    customer_id: uuid.UUID | None = None
 
     # Not a constructor parameter (`init=False`) so it cannot be supplied by a
     # caller. A `permissions=` argument would be a way for any code path to grant

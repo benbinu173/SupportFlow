@@ -77,7 +77,13 @@ def test_an_admin_sees_every_user_in_the_organization(
 
 def test_the_listing_never_exposes_a_password_hash(roles: dict[str, OrgSession]) -> None:
     """The strongest form of the check: the field does not exist in the schema at all,
-    so the assertion is about the *response*, not about one code path."""
+    so the assertion is about the *response*, not about one code path.
+
+    The field set is written out rather than sampled, which is why this test had to be
+    updated when `customer_id` was added in Phase I — that is the guard working. A new
+    field on `UserRead` reaching a response without anyone deciding it should is exactly
+    what this catches.
+    """
     response = roles["admin"].get(USERS)
 
     assert "password_hash" not in response.text
@@ -89,6 +95,7 @@ def test_the_listing_never_exposes_a_password_hash(roles: dict[str, OrgSession])
             "email",
             "role",
             "is_active",
+            "customer_id",
             "created_at",
             "last_login_at",
         }

@@ -21,10 +21,12 @@ from app.core.exceptions import (
     UserAlreadyExistsError,
     ValidationError,
 )
+from app.core.permissions import PORTAL_ROLES
 from app.core.security import hash_password
 from app.core.tenancy import TenantContext
 from app.models.enums import UserRole
 from app.models.user import User
+from app.repositories.customer_repository import CustomerRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.user import UserCreate, UserRoleUpdate
 
@@ -52,8 +54,31 @@ async def create_user(session: AsyncSession, context: TenantContext, payload: Us
     The new user's `organization_id` comes from `context` and from nowhere else. The
     request body has no field for it, so a caller cannot even attempt to create a user
     in someone else's tenant.
+
+    `customer_id` is the one conditional field: a portal account must name the customer
+    it acts as, and a staff account must not. The link is what makes `RowScope.OWN`
+    resolvable — a portal account without it authenticates successfully and then sees
+    nothing — so requiring it here is what stops that state being reachable through the
+    API at all. `PORTAL_ROLES` decides which roles these are, rather than a role
+    comparison in this file; see the note on centralization in `app/core/permissions.py`.
     """
     repository = UserRepository(session, context)
+    is_portal = payload.role in PORTAL_ROLES
+
+    if is_portal and payload.customer_id is None:
+        raise ValidationError(
+            "A customer account must be linked to a customer record. "
+            "Pass customer_id, or create the customer first."
+        )
+    if not is_portal and payload.customer_id is not None:
+        raise ValidationError("Only a customer account can be linked to a customer record.")
+
+    if payload.customer_id is not None:
+        # Tenant-scoped, so a customer id from another organization resolves to
+        # nothing and is reported as absent rather than refused as forbidden (ADR-009).
+        customer = await CustomerRepository(session, context).get(payload.customer_id)
+        if customer is None:
+            raise NotFoundError(ErrorCode.CUSTOMER_NOT_FOUND)
 
     if await repository.email_taken(payload.email):
         raise UserAlreadyExistsError()
@@ -64,6 +89,7 @@ async def create_user(session: AsyncSession, context: TenantContext, payload: Us
         email=payload.email,
         password_hash=hash_password(payload.password),
         role=payload.role,
+        customer_id=payload.customer_id,
     )
     repository.add(user)
     await session.commit()

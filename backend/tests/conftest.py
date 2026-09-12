@@ -18,7 +18,7 @@ import itertools
 import os
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -56,12 +56,15 @@ from sqlalchemy.pool import NullPool
 
 from app.core.config import get_settings
 from app.core.event_loop import loop_factory
+from app.core.permissions import PORTAL_ROLES
 from app.main import create_app
 from app.models import Base
 
 API = "/api/v1"
 AUTH = f"{API}/auth"
 USERS = f"{API}/users"
+CUSTOMERS = f"{API}/customers"
+TICKETS = f"{API}/tickets"
 
 # Comfortably past the configured 12-character minimum, and not a credential anyone
 # would mistake for a real one.
@@ -69,7 +72,37 @@ PASSWORD = "correct-horse-battery-staple"
 
 
 @pytest.fixture(scope="session")
-def client() -> Iterator[TestClient]:
+def fresh_schema(sync_engine: Engine) -> None:
+    """Drop and recreate every table, once, before the first client exists.
+
+    This used to live in `db_engine`, which was the wrong place for it. PostgreSQL caches
+    a prepared statement's result type against the relation it was planned against, and
+    dropping then recreating a table gives it a new identity — so every plan the
+    application's connection pool is already holding becomes unusable, and the next
+    request fails with `cached plan must not change result type`, naming neither the
+    reset nor the table that changed.
+
+    That only bites if the reset happens *after* the app has served a request, which is
+    exactly what a lazily-set-up `db_engine` does: `tests/security/test_row_scopes.py`
+    builds rows through the ORM before it exercises anything over HTTP, so it invites
+    `db_engine` in while `tests/security/test_log_hygiene.py` has already been issuing
+    requests against the same pool.
+
+    So the reset is attached to `client` instead. `client` is the one thing in the suite
+    that cannot be created later than the first request, which makes "the schema is reset
+    before anyone can talk to the app" a property of the fixture graph rather than of
+    collection order — and collection order is the kind of thing that changes the day
+    somebody renames a directory.
+
+    Synchronous on purpose: `sync_engine`'s docstring explains why schema work in this
+    suite avoids pytest-asyncio's default loop on Windows.
+    """
+    Base.metadata.drop_all(sync_engine)
+    Base.metadata.create_all(sync_engine)
+
+
+@pytest.fixture(scope="session")
+def client(fresh_schema: None) -> Iterator[TestClient]:
     """Synchronous test client against the real ASGI app.
 
     `backend_options` carries the same loop factory the app and the async tests
@@ -118,11 +151,15 @@ def pytest_asyncio_loop_factories(
 
 @pytest.fixture(scope="session")
 async def db_engine() -> AsyncIterator[AsyncEngine]:
-    """Session-scoped engine with the schema created once, up front.
+    """Session-scoped engine with the schema present.
 
     Built from metadata rather than by running migrations: this asserts the models
     are self-consistent, independently of whether a migration has been written yet.
     Phase E adds a separate check that migrations produce the same schema.
+
+    `checkfirst`, never a drop. The reset lives in `fresh_schema`, which `client`
+    depends on — see its docstring for why running it here broke HTTP tests that ran
+    after this fixture was first requested.
 
     **The schema is deliberately not dropped on teardown.** It used to be, and that
     broke every test that ran afterwards: the HTTP suite's `sync_engine` is also
@@ -130,16 +167,11 @@ async def db_engine() -> AsyncIterator[AsyncEngine]:
     pytest collects `tests/api/` before `tests/integration/` — would leave the tables
     gone when `tests/security/` started truncating. Two session-scoped fixtures cannot
     both own the schema's lifetime, and an ordering dependency between them is exactly
-    the kind of thing that works until someone renames a directory.
-
-    The `drop_all` at setup is what handles leftovers from an interrupted run, so
-    nothing is lost by not repeating it here. Leaving an empty schema behind in a
-    database whose name ends in `_test` costs nothing.
+    the kind of thing that works until someone renames a directory. Leaving an empty
+    schema behind in a database whose name ends in `_test` costs nothing.
     """
     engine = create_async_engine(str(get_settings().DATABASE_URL))
     async with engine.begin() as conn:
-        # Leftovers from an interrupted run would otherwise fail create_all.
-        await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
     yield engine
     await engine.dispose()
@@ -177,8 +209,7 @@ def sync_engine() -> Iterator[Engine]:
     Windows, which psycopg refuses to drive. Truncating a table needs no concurrency,
     so the loop question is best removed rather than configured.
 
-    `checkfirst=True`, never a drop: the async `db_engine` owns schema teardown, and
-    two session-scoped fixtures both dropping would race.
+    `checkfirst=True`, never a drop: `fresh_schema` owns the one reset in the suite.
     """
     engine = create_engine(get_settings().sqlalchemy_dsn, poolclass=NullPool)
     Base.metadata.create_all(engine, checkfirst=True)
@@ -231,6 +262,7 @@ class OrgSession:
     access_token: str
     refresh_token: str | None = None
     _users_created: int = field(default=0, repr=False)
+    _customers_created: int = field(default=0, repr=False)
 
     @property
     def auth(self) -> dict[str, str]:
@@ -261,6 +293,7 @@ class OrgSession:
         name: str | None = None,
         email: str | None = None,
         password: str = PASSWORD,
+        customer_id: str | None = None,
     ) -> "OrgSession":
         """Create a user in this organization through the API, then log them in.
 
@@ -270,23 +303,98 @@ class OrgSession:
 
         The caller's own `_users_created` counter makes the generated emails unique
         within the organization without a global sequence.
+
+        **A portal role gets a customer created for it** unless one is passed in. A
+        `customer` account must be linked to a `Customer` row — that link is what makes
+        `RowScope.OWN` resolvable — so the API refuses an unlinked one. Doing it here
+        keeps every existing `org.add_user("customer")` call site working and meaning
+        what it always meant: "a customer-role principal in this organization". Tests
+        that care *which* customer a portal user acts as pass `customer_id` explicitly,
+        which is what `as_portal_user` below is for.
         """
         self._users_created += 1
         suffix = self._users_created
         address = email or f"user{suffix}-{self.email}"
 
-        response = self.post(
-            USERS,
-            json={
-                "name": name or f"User {suffix}",
-                "email": address,
-                "password": password,
-                "role": role,
-            },
-        )
+        if customer_id is None and role in PORTAL_ROLES:
+            customer_id = self.add_customer(
+                name=name or f"Customer {suffix}",
+                email=f"customer{suffix}-{self.email}",
+            )["id"]
+
+        body: dict[str, str] = {
+            "name": name or f"User {suffix}",
+            "email": address,
+            "password": password,
+            "role": role,
+        }
+        if customer_id is not None:
+            body["customer_id"] = customer_id
+
+        response = self.post(USERS, json=body)
         assert response.status_code == 201, response.text
 
         return login(self.client, address, password)
+
+    def add_customer(
+        self,
+        *,
+        name: str = "Test Customer",
+        email: str | None = None,
+        phone: str | None = None,
+        external_reference: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a customer through the API and return the response body.
+
+        Returns the body rather than a wrapper object: a customer has no session of its
+        own until a portal login is created for it, so there is nothing else to carry.
+        """
+        self._customers_created += 1
+        suffix = self._customers_created
+
+        response = self.post(
+            CUSTOMERS,
+            json={
+                "name": name,
+                "email": email or f"customer{suffix}@{self.email.split('@')[-1]}",
+                "phone": phone,
+                "external_reference": external_reference,
+            },
+        )
+        assert response.status_code == 201, response.text
+        return cast("dict[str, Any]", response.json())
+
+    def add_portal_user(self, customer_id: str, *, email: str | None = None) -> "OrgSession":
+        """Create a login for a specific customer and return their session.
+
+        The `own` scope resolves through this link, so tests about "a customer sees only
+        their own tickets" need the link to name a customer they chose.
+        """
+        return self.add_user("customer", customer_id=customer_id, email=email)
+
+    def add_ticket(
+        self,
+        customer_id: str,
+        *,
+        subject: str = "Something is broken",
+        description: str = "It does not work.",
+        priority: str | None = None,
+        category: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a ticket through the API and return the response body."""
+        payload: dict[str, Any] = {
+            "subject": subject,
+            "description": description,
+            "customer_id": customer_id,
+        }
+        if priority is not None:
+            payload["priority"] = priority
+        if category is not None:
+            payload["category"] = category
+
+        response = self.post(TICKETS, json=payload)
+        assert response.status_code == 201, response.text
+        return cast("dict[str, Any]", response.json())
 
 
 def cookie_header(token: str) -> dict[str, str]:

@@ -22,7 +22,9 @@ import pytest
 from app.core.permissions import (
     ATTACHMENT_SCOPE_BY_ROLE,
     MESSAGE_SCOPE_BY_ROLE,
+    PORTAL_ROLES,
     ROLE_PERMISSIONS,
+    SENDER_TYPE_BY_ROLE,
     TICKET_SCOPE_BY_ROLE,
     Permission,
     RowScope,
@@ -31,7 +33,7 @@ from app.core.permissions import (
     row_scope_for,
 )
 from app.core.tenancy import TenantContext
-from app.models.enums import UserRole
+from app.models.enums import SenderType, UserRole
 
 pytestmark = pytest.mark.unit
 
@@ -353,6 +355,59 @@ def test_an_unknown_role_resolves_to_the_narrowest_scope() -> None:
     impostor = cast("UserRole", "not-a-role")
 
     assert row_scope_for(impostor, TICKET_SCOPE_BY_ROLE) is RowScope.OWN
+
+
+# ---------------------------------------------------------------------------
+# Role-derived attributes
+# ---------------------------------------------------------------------------
+# Two facts about a role that are not authorization decisions but are still role
+# knowledge, so they live beside the matrix rather than being repeated wherever they
+# are needed. `test_no_module_outside_permissions_compares_a_role` is what enforces
+# that: it permits only `UserRole.ADMIN` outside this module, so a second
+# `role is UserRole.CUSTOMER` anywhere would fail that guard.
+
+
+def test_the_portal_roles_are_exactly_the_roles_with_an_own_scope() -> None:
+    """The two must not be able to disagree.
+
+    `PORTAL_ROLES` decides which accounts require a linked `Customer`, and
+    `TICKET_SCOPE_BY_ROLE` decides which accounts are narrowed to their own rows. They
+    are the same set of roles — an account that is scoped to its own records is exactly
+    an account that needs to *have* records — but they are written separately because
+    they are consumed in different layers.
+
+    If they ever diverged, the failure would be subtle and bad in one of two ways: a
+    role scoped to `OWN` with no `customer_id` would be silently refused everything, or
+    a role with a `customer_id` but organization-wide scope would read every customer's
+    tickets. Deriving one from the other would hide that; asserting they agree makes it
+    a decision someone has to make on purpose.
+    """
+    own_scoped = {role for role, scope in TICKET_SCOPE_BY_ROLE.items() if scope is RowScope.OWN}
+
+    assert set(PORTAL_ROLES) == own_scoped
+
+
+def test_every_role_has_a_sender_type() -> None:
+    """A message's `sender_type` follows from its author's role.
+
+    The lookup in `message_service` is written with a fail-closed default, so a missing
+    key would produce a plausible wrong answer — a staff member's note recorded as
+    having come from the customer, which is the one direction that must never happen.
+    Coverage is asserted here so the default is unreachable rather than load-bearing.
+    """
+    assert set(SENDER_TYPE_BY_ROLE) == set(ROLES)
+
+
+def test_only_a_portal_role_sends_as_the_customer() -> None:
+    """The mapping's one meaningful distinction, stated directly.
+
+    Everything else about it is "staff send as an agent". This asserts the direction
+    that matters: no non-portal role can produce a message attributed to the customer,
+    and the customer cannot produce one attributed to staff.
+    """
+    for role, sender_type in SENDER_TYPE_BY_ROLE.items():
+        expected = SenderType.CUSTOMER if role in PORTAL_ROLES else SenderType.AGENT
+        assert sender_type is expected, f"{role.value} sends as {sender_type.value}"
 
 
 # ---------------------------------------------------------------------------

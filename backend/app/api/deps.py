@@ -112,6 +112,10 @@ async def get_tenant_context(
         organization_id=user.organization_id,
         # From the row, not from `claims.role`. See the module docstring.
         role=user.role,
+        # Also from the row. `NULL` for staff, and for a portal account that was never
+        # linked to a customer — the repository reads that as "reaches no rows", not
+        # as "reaches every row" (ADR-015).
+        customer_id=user.customer_id,
     )
 
 

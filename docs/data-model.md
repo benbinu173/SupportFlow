@@ -485,10 +485,22 @@ Types: `user_role`, `organization_plan`, `organization_status`, `ticket_status`,
 ## 7. Notes and open items
 
 **Ticket numbering is not sequence-backed.** `tickets.number` is allocated by the
-service layer, so two concurrent inserts can pick the same value; the unique index on
-`(organization_id, number)` turns that into a retryable integrity error rather than a
-duplicate. A global sequence was rejected because it would leak total ticket volume
-across tenants and skip numbers per tenant.
+service layer, and a global sequence was rejected because it would leak total ticket
+volume across tenants and skip numbers per tenant.
+
+As of Phase I–K the allocation is implemented, and it is **not** a read-then-retry:
+`TicketRepository.allocate_number` takes a transaction-scoped
+`pg_advisory_xact_lock` keyed on the organization id and then reads
+`MAX(number) + 1`. The lock makes a collision impossible rather than merely recoverable,
+is released on commit or rollback with nothing to clean up, and is per-tenant so two
+organizations never contend. The unique index on `(organization_id, number)` stays as
+the invariant backstop.
+
+The cost is that ticket creation serializes *within* a tenant — one short transaction on
+a low-frequency write. The alternative, a bounded retry around the integrity error, is
+more machinery than the problem deserves, because a failed statement aborts the whole
+transaction and so a retry needs a `SAVEPOINT`, an attempt limit, and a test for the
+exhaustion path. See ADR-016.
 
 **The schema is produced by a migration.** `backend/alembic/versions/` holds a single
 baseline revision that creates every table, enum type, index, and constraint described

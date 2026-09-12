@@ -180,8 +180,16 @@ def test_there_are_routes_to_check(api: FastAPI) -> None:
     The blunt version of the cross-check below: if the walk stops finding routes, this
     says so before any of the guards do — a failure reading "no routes" is a much
     clearer signal than one listing every route as unprotected.
+
+    The floor is a **lower bound, not a count**: it exists to catch a walk that has
+    stopped finding things, so it is set below the real total and only raised when a
+    phase adds a whole resource. Phases I-K took the surface from 12 to 28 by mounting
+    the customers, tickets, and messages routers, and this is what fails if one of those
+    `include_router` calls is ever dropped — the capability map below names the routes
+    themselves, so a quietly missing router would otherwise only show up as an absent
+    line in a dict.
     """
-    assert len(_entries(api)) >= 12
+    assert len(_entries(api)) >= 24
 
 
 def test_the_walk_finds_every_documented_route(api: FastAPI) -> None:
@@ -391,25 +399,76 @@ def test_the_guard_sees_the_permissions_a_route_declares(api: FastAPI) -> None:
     assert Permission.USER_DEACTIVATE not in _required_permissions(route)
 
 
-def test_the_users_routes_require_the_capabilities_the_matrix_assigns(
-    api: FastAPI,
-) -> None:
-    """The route → capability mapping, stated once.
+def test_every_route_declares_the_capability_the_matrix_assigns(api: FastAPI) -> None:
+    """The route → capability mapping for the whole surface, stated once.
 
-    The RBAC suite proves the behaviour end to end; this proves the *declaration*, and
-    it is the one place the whole surface of this phase is visible at a glance. A
-    change to any route's requirement has to be made here too.
+    The API suites prove the behaviour end to end; this proves the *declaration*, and it
+    is the one place the entire surface is visible at a glance. A change to any route's
+    requirement has to be made here too, which is the point: a capability is a decision,
+    and this is where every such decision is legible together.
+
+    Written as equality against the full set of resource routes, so it fails in both
+    directions — a route whose guard weakened, and a route that appeared without one.
+
+    Two things it makes visible that are easy to lose in a diff:
+
+    * Every ticket *action* carries its own capability. `/assign`, `/priority`,
+      `/status`, `/close`, and `/reopen` are five routes with five different
+      requirements, which is ADR-017: the capability a request needs is a property of
+      where it was sent, never of its body. A single `PATCH /tickets/{id}` would have
+      collapsed all five into one and made this dict four lines shorter and much less
+      informative.
+    * Messages live under `/tickets/{ticket_id}`. There is no `/messages` root, because
+      a message has no independent access rule — it is reachable exactly when its ticket
+      is (ADR-015).
     """
     declared = {
         (method, path): set(_required_permissions(route))
         for method, path, route in _entries(api)
-        if path.startswith("/api/v1/users")
+        # Authenticated API routes only. The public ones are asserted by
+        # `PUBLIC_ROUTES` above, and a route with no caller has no capability to
+        # describe — including them here would make this dict a second, weaker copy of
+        # that allowlist.
+        if path.startswith("/api/v1/") and get_current_user in _calls(route)
     }
 
     assert declared == {
+        # --- Auth ---------------------------------------------------------
+        # Login and refresh are unreachable here: they are public, so they have no
+        # capability and are not in this dict at all.
+        ("GET", "/api/v1/auth/me"): {Permission.PROFILE_VIEW},
+        ("POST", "/api/v1/auth/logout"): set(),
+        # --- Users --------------------------------------------------------
         ("GET", "/api/v1/users"): {Permission.USER_LIST},
         ("POST", "/api/v1/users"): {Permission.USER_CREATE},
         ("GET", "/api/v1/users/{user_id}"): {Permission.USER_LIST},
         ("PATCH", "/api/v1/users/{user_id}/role"): {Permission.USER_UPDATE_ROLE},
         ("POST", "/api/v1/users/{user_id}/deactivate"): {Permission.USER_DEACTIVATE},
+        # --- Customers ----------------------------------------------------
+        # Reading one customer needs `CUSTOMER_LIST`: the matrix has no separate "view
+        # customer" row, and this mirrors `/users/{user_id}`.
+        ("GET", "/api/v1/customers"): {Permission.CUSTOMER_LIST},
+        ("POST", "/api/v1/customers"): {Permission.CUSTOMER_CREATE},
+        ("GET", "/api/v1/customers/{customer_id}"): {Permission.CUSTOMER_LIST},
+        ("PATCH", "/api/v1/customers/{customer_id}"): {Permission.CUSTOMER_UPDATE},
+        # --- Tickets ------------------------------------------------------
+        ("GET", "/api/v1/tickets"): {Permission.TICKET_LIST},
+        ("POST", "/api/v1/tickets"): {Permission.TICKET_CREATE},
+        ("GET", "/api/v1/tickets/{ticket_id}"): {Permission.TICKET_VIEW},
+        # The timeline is part of seeing the ticket; §3 has no row for it.
+        ("GET", "/api/v1/tickets/{ticket_id}/events"): {Permission.TICKET_VIEW},
+        ("POST", "/api/v1/tickets/{ticket_id}/assign"): {Permission.TICKET_ASSIGN},
+        ("POST", "/api/v1/tickets/{ticket_id}/priority"): {Permission.TICKET_CHANGE_PRIORITY},
+        ("POST", "/api/v1/tickets/{ticket_id}/status"): {Permission.TICKET_CHANGE_STATUS},
+        ("POST", "/api/v1/tickets/{ticket_id}/close"): {Permission.TICKET_CLOSE},
+        ("POST", "/api/v1/tickets/{ticket_id}/reopen"): {Permission.TICKET_REOPEN},
+        # --- Messages -----------------------------------------------------
+        # Reading is one route serving two audiences; posting is two routes with two
+        # capabilities, because the audience is a property of the route and not of the
+        # body. `MESSAGE_READ_INTERNAL` is deliberately absent from the read route: it
+        # decides what a caller *sees*, not whether they may call it, and it is applied
+        # in the service where a route cannot express it.
+        ("GET", "/api/v1/tickets/{ticket_id}/messages"): {Permission.MESSAGE_READ_PUBLIC},
+        ("POST", "/api/v1/tickets/{ticket_id}/messages"): {Permission.MESSAGE_POST_REPLY},
+        ("POST", "/api/v1/tickets/{ticket_id}/notes"): {Permission.MESSAGE_POST_INTERNAL},
     }

@@ -9,9 +9,18 @@ environment can move it without touching the routes.
 from fastapi import APIRouter
 
 from app.api.auth import router as auth_router
+from app.api.customers import router as customers_router
+from app.api.messages import router as messages_router
+from app.api.tickets import router as tickets_router
 from app.api.users import router as users_router
 
 router = APIRouter()
 
 router.include_router(auth_router, prefix="/auth", tags=["auth"])
 router.include_router(users_router, prefix="/users", tags=["users"])
+router.include_router(customers_router, prefix="/customers", tags=["customers"])
+router.include_router(tickets_router, prefix="/tickets", tags=["tickets"])
+# Mounted under the same prefix as tickets rather than a `/messages` root: a message is
+# reachable exactly when its ticket is, and the URL says so. Its paths carry the
+# `{ticket_id}` segment themselves.
+router.include_router(messages_router, prefix="/tickets", tags=["messages"])
