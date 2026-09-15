@@ -20,7 +20,7 @@ from app.api.v1 import router as v1_router
 from app.core.config import get_settings
 from app.core.database import dispose_engine
 from app.core.exceptions import AppError, ErrorCode, error_body
-from app.core.rate_limit import close_client as close_rate_limit_client
+from app.core.redis import close_client as close_redis_client
 from app.core.storage import ensure_bucket
 from app.core.storage import reset_client as reset_storage_client
 
@@ -44,7 +44,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     await ensure_bucket()
     yield
-    await close_rate_limit_client()
+    await close_redis_client()
     await dispose_engine()
     reset_storage_client()
 

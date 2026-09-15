@@ -50,6 +50,7 @@ os.environ.setdefault("S3_REGION", "us-east-1")
 # has one test that lowers the value back down to prove the 429 wiring works.
 os.environ.setdefault("RATE_LIMIT_LOGIN_PER_MINUTE", "100000")
 os.environ.setdefault("RATE_LIMIT_REGISTER_PER_HOUR", "100000")
+os.environ.setdefault("RATE_LIMIT_UPLOAD_PER_HOUR", "100000")
 
 # Imported after the environment is populated, which is why this block sits below
 # the statements above. Ruff's E402 allows `os.environ` setup before imports

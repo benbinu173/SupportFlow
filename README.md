@@ -98,7 +98,8 @@ rather than falling back to something insecure.
 | Variable | Purpose |
 |---|---|
 | `DATABASE_URL` | PostgreSQL connection (required) |
-| `REDIS_URL` | Cache and pub/sub (required) |
+| `REDIS_URL` | Rate limiting today; db 0. The Celery broker uses db 2 (required) |
+| `RATE_LIMIT_*` | Per-address login/registration limits and the per-user upload limit |
 | `JWT_SECRET` | Access-token signing; minimum 32 characters (required) |
 | `CORS_ORIGINS` | Comma-separated allowlist. No wildcard — the refresh cookie needs credentials |
 | `AI_API_KEY` / `AI_MODEL` | Generation provider |
@@ -566,6 +567,57 @@ Three findings came out of this, and none of them was papered over:
 `ix_tickets_org_status_priority` leads with `status`, and a query that does not filter by
 status cannot use its second column for ordering.
 
+## Rate limiting
+
+§45 names five endpoints to limit — login, registration, AI endpoints, knowledge-base
+processing, and file upload. Three of them exist; the other two are built in later phases
+and get no speculative setting. Every limit is a fixed window in Redis and returns
+`429 RATE_LIMITED` with a `Retry-After` header.
+
+| Endpoint | Key | Window | Default |
+|---|---|---|---|
+| `POST /auth/login` | client address | 1 minute | 10 |
+| `POST /auth/register` | client address | 1 hour | 5 |
+| `POST /tickets/{id}/attachments` | **user id** | 1 hour | 60 |
+
+All three guards live in one file, [backend/app/api/rate_limits.py](backend/app/api/rate_limits.py),
+so the entire limit surface is auditable in one read — the property that matters for an
+abuse control, and the reason both limits are not declared from their own routes.
+
+**Upload is keyed on the user, which is the opposite of login.** At login there is no
+identity yet — that is what the endpoint is for — and the attack is credential stuffing
+spread across many accounts, so the address is the only key available. Upload is
+authenticated: identity exists, and the concern is one account filling the object store.
+Keying it on the address would let one person's backlog throttle everyone behind the same
+NAT, which is cost #2 ADR-014 already records against the login limiter. That trade is
+forced at login and avoidable here, so it is not repeated (ADR-022). Checked against a
+running server with the limit set to 2: the third upload from one account is refused, and
+a colleague in the same organization — same ticket, same address — is served.
+
+**The refusal happens before the file is examined.** A route dependency is resolved before
+the path operation's own parameters, so the guard runs before `file: UploadFile` is read.
+Confirmed over real HTTP rather than reasoned about: a request that is *both* over the
+limit and carrying a disallowed file type returns `429`, while the identical request from
+an account under its limit returns the validation error. The status code is what identifies
+which check ran first. uvicorn has still taken the bytes off the socket — this stops the
+work, not the transfer.
+
+**One Redis client, one lifecycle.** `get_client()` in
+[backend/app/core/redis.py](backend/app/core/redis.py) is now the only place a client is
+built. Before it, the readiness probe built its own on every poll and closed it, which is
+a real cost rather than a style point. Measured — `redis-cli info stats`, twenty
+`GET /health/ready` requests, the counter read before and after:
+
+| Probe implementation | Increase in `total_connections_received`, 20 probes |
+|---|---|
+| A client built and closed per probe | **23** |
+| The process's shared client | **2** |
+
+Redis carries rate limiting only. Caching, Pub/Sub, and short-lived task state arrive with
+the phases that give them a consumer — S, R, and P — and the refusal to cache the
+per-request user/organization join, because ADR-013 requires deactivation to bite on the
+next request rather than one TTL later, is recorded with its reasoning in ADR-022.
+
 ## Security posture
 
 Implemented in Phase C:
@@ -594,8 +646,9 @@ Implemented in Phases F–H:
   scattered role comparison or an unprotected route.
 - **Tenant isolation** enforced at three layers plus a token/row cross-check, with a
   dedicated `pytest -m security` suite.
-- **Rate limiting** on login and registration, returning `429 RATE_LIMITED` with
-  `Retry-After`.
+- **Rate limiting** on login, registration, and file upload, returning `429 RATE_LIMITED`
+  with `Retry-After`. Login and registration are keyed on the client address; upload is
+  keyed on the user. See [Rate limiting](#rate-limiting).
 - **No tokens or passwords in logs.** Every log statement passes identifiers — user
   and organization ids — and never a credential. This is enforced rather than
   reviewed: [tests/security/test_log_hygiene.py](backend/tests/security/test_log_hygiene.py)
@@ -631,11 +684,13 @@ Implemented in Phases I–K:
   through the whole lifecycle, a reply, and an internal note, and asserts no password,
   token, or hash appears in any of it — with the same positive control.
 
-Two trade-offs are deliberate and recorded in ADR-014: the rate limiter **fails open**
+Two trade-offs are deliberate and recorded in ADR-014: the login limiter **fails open**
 when Redis is unreachable (it is an abuse control, not an authentication control, and
 failing closed would turn a Redis blip into a total login outage), and it is keyed on
 the **client address rather than the account** — verified against a running server, a
-legitimate login from the same address is throttled alongside an attacker's.
+legitimate login from the same address is throttled alongside an attacker's. The upload
+limiter, arriving later, declines to inherit the second of those and keys on the user
+instead; see [Rate limiting](#rate-limiting).
 
 ## Roadmap
 
@@ -649,7 +704,8 @@ legitimate login from the same address is throttled alongside an attacker's.
 | F–H | Auth, RBAC, multi-tenancy + security tests | ✅ |
 | I–K | Customers, tickets, messages | ✅ |
 | L–N | Attachments, audit logging, search | ✅ |
-| O–Q | Redis, Celery, SLA | next |
+| O | Redis: shared client, rate-limit consolidation | ✅ |
+| P–Q | Celery, SLA | next |
 | R–S | WebSockets, analytics | |
 | T–W | AI foundation, analysis, summaries, drafts | |
 | X | Knowledge base and RAG | |
@@ -664,6 +720,9 @@ legitimate login from the same address is throttled alongside an attacker's.
   [tests/integration/test_migrations.py](backend/tests/integration/test_migrations.py)
   is what stops the two from diverging.
 - The embedding provider is deliberately undecided until Phase X (ADR-008).
+- Redis carries rate limiting only. Caching, Pub/Sub, and short-lived task state are
+  assigned to the phases that give them a consumer — S, R, and P respectively — rather
+  than built ahead of one (ADR-022).
 - The deployment target is undecided; nothing in the architecture depends on a
   specific cloud.
 - On Windows, the API must be started with
@@ -725,6 +784,6 @@ legitimate login from the same address is throttled alongside an attacker's.
   to whoever had it. That is a deliberate reading of `OPEN` as "nobody owns this", and
   the history is not lost: it is in `ticket_events`.
 - **The frontend has no screens for any of this.** Every phase since C has been
-  backend-only; the routes are exercised by 730 tests, and the SPA still shows the Phase
+  backend-only; the routes are exercised by 735 tests, and the SPA still shows the Phase
   C scaffolding.
 

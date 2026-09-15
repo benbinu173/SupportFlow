@@ -7,13 +7,12 @@ discloses infrastructure detail to an unauthenticated caller.
 import asyncio
 from typing import Literal
 
-import redis.asyncio as aioredis
 from fastapi import APIRouter, Response, status
 from pydantic import BaseModel
 from sqlalchemy import text
 
-from app.core.config import get_settings
 from app.core.database import engine
+from app.core.redis import get_client
 
 router = APIRouter()
 
@@ -51,17 +50,22 @@ async def _check_database() -> bool:
 
 
 async def _check_redis() -> bool:
-    """Whether Redis answers a PING."""
-    client = aioredis.from_url(str(get_settings().REDIS_URL))
+    """Whether Redis answers a PING.
+
+    Uses the process's shared client rather than building one. This probe runs on a
+    schedule, and a fresh `Redis.from_url` per probe meant a TCP connect and a Redis
+    handshake every time, outside the pool every other consumer shares — visible as a
+    `total_connections_received` that climbs by one per probe.
+
+    Nothing is closed here. The client is borrowed, and `aclose()` on a shared pool
+    would tear down the connections the rate limiter is using.
+    """
     try:
         async with asyncio.timeout(_PROBE_TIMEOUT_SECONDS):
-            await client.ping()
+            await get_client().ping()
     except Exception:
         return False
-    else:
-        return True
-    finally:
-        await client.aclose()
+    return True
 
 
 @router.get("/health/ready", response_model=ReadinessResponse)

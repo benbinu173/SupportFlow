@@ -64,6 +64,13 @@ class Settings(BaseSettings):
     RATE_LIMIT_LOGIN_PER_MINUTE: int = 10
     RATE_LIMIT_REGISTER_PER_HOUR: int = 5
 
+    # Per *user*, not per address — the upload endpoint is authenticated, so identity
+    # exists and is the precise thing to count (§45). 60 is one a minute sustained for
+    # an hour: far above what a person attaching screenshots and logs to tickets would
+    # reach, far below what a script filling the bucket needs. See
+    # `app/api/rate_limits.py`, which is the whole limit surface in one file.
+    RATE_LIMIT_UPLOAD_PER_HOUR: int = 60
+
     # --- Object storage ---------------------------------------------------
     # MinIO locally, any S3-compatible service in production. The endpoint and region
     # carry defaults because neither is a secret and both have an obvious local value;

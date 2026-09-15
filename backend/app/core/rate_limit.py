@@ -1,8 +1,8 @@
 """Rate limiting — Redis fixed-window counters.
 
-Guards the endpoints where guessing is the attack: login (credential stuffing) and
-registration (account-farm creation). Spec §45 requires the control, §46 requires the
-429 path be tested.
+Guards the endpoints where guessing is the attack: login (credential stuffing),
+registration (account-farm creation), and upload (one account filling the bucket).
+Spec §45 requires the controls, §46 requires the 429 path be tested.
 
 **This limiter fails open, deliberately.** If Redis is unreachable the request is
 allowed and a warning is logged. Rate limiting is an abuse control, not an
@@ -14,45 +14,27 @@ decision rather than becoming an accident.
 No HTTP types here. `app/api/deps.py` derives the key from the request; this module
 only knows about strings and counters, which is what lets it be tested without a
 client.
+
+The Redis client itself lives in `app/core/redis.py` — it is shared with the readiness
+probe, and a second consumer is the point at which it stops belonging to this module.
 """
+
+import uuid
 
 import structlog
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
-from app.core.config import get_settings
 from app.core.exceptions import RateLimitedError
+from app.core.redis import get_client
 
 logger = structlog.get_logger(__name__)
-
-_shared: Redis | None = None
-
-
-def _shared_client() -> Redis:
-    """The process-wide Redis client, built on first use.
-
-    One client, not one per call: `redis.asyncio` clients own a connection pool, and
-    constructing one per login would open and discard a connection each time. Lazy
-    rather than module-level so importing this module never requires Redis to be up.
-    """
-    global _shared
-    if _shared is None:
-        _shared = Redis.from_url(str(get_settings().REDIS_URL))
-    return _shared
-
-
-async def close_client() -> None:
-    """Release the shared client's connections. Called from the app's shutdown hook."""
-    global _shared
-    if _shared is not None:
-        await _shared.aclose()
-        _shared = None
 
 
 class RateLimiter:
     """Fixed-window counter over a Redis client.
 
-    Takes its client rather than reaching for the global one, so a test can supply a
+    Takes its client rather than reaching for the shared one, so a test can supply a
     stand-in and exercise the decision logic — including the Redis-down path — without
     a running server.
     """
@@ -63,7 +45,7 @@ class RateLimiter:
     @property
     def client(self) -> Redis:
         if self._client is None:
-            self._client = _shared_client()
+            self._client = get_client()
         return self._client
 
     async def enforce(self, key: str, *, limit: int, window_seconds: int) -> None:
@@ -116,10 +98,27 @@ class RateLimiter:
 
 
 def login_rate_limit_key(ip_address: str) -> str:
-    """Redis key for the login limiter, per client IP."""
+    """Redis key for the login limiter, per client IP.
+
+    Per IP because at this point there is no identity yet — the caller has not
+    authenticated, so the address is the only thing to count against (ADR-014).
+    """
     return f"ratelimit:login:{ip_address}"
 
 
 def register_rate_limit_key(ip_address: str) -> str:
     """Redis key for the registration limiter, per client IP."""
     return f"ratelimit:register:{ip_address}"
+
+
+def upload_rate_limit_key(user_id: uuid.UUID) -> str:
+    """Redis key for the upload limiter, per *user*.
+
+    The opposite key to the two above, and deliberately so. Upload is authenticated, so
+    identity is available and is the precise thing to count: §45's concern is one
+    account filling the bucket. Keying it on the address would reproduce cost #2 that
+    ADR-014 already records against the login limiter — one person's backlog throttling
+    everyone behind the same NAT — and this is the one place where that trade is
+    avoidable rather than forced, because the identity exists.
+    """
+    return f"ratelimit:upload:{user_id}"

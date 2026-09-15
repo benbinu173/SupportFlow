@@ -27,6 +27,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from app.core.config import get_settings
 from tests.conftest import API, PASSWORD, TICKETS, OrgSession, login
 
 pytestmark = pytest.mark.integration
@@ -724,6 +725,70 @@ def test_the_customer_sees_a_ticket_level_attachment_on_their_timeline(
 
     customer_events = portal.get(f"{TICKETS}/{ticket['id']}/events").json()
     assert "diagram.png" in str(customer_events)
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+
+def test_upload_is_rate_limited(
+    client: TestClient, register_org: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The upload route is wired to the limiter and renders 429 in the §42 envelope.
+
+    §45 names file upload among the endpoints to limit. This is the wiring, not the
+    counting: zero rather than a small number, for the same reason
+    `test_login_is_rate_limited` uses zero — the assertion must not depend on how much
+    an earlier test has already counted against this key. The counting itself is covered
+    against a stand-in client in `tests/unit/test_rate_limit.py`.
+    """
+    monkeypatch.setattr(get_settings(), "RATE_LIMIT_UPLOAD_PER_HOUR", 0, raising=False)
+
+    org = register_org()
+    customer = org.add_customer()
+    ticket = org.add_ticket(customer["id"])
+
+    response = upload(org, ticket["id"])
+
+    assert response.status_code == 429, response.text
+    assert response.json()["error"]["code"] == "RATE_LIMITED"
+    assert response.headers.get("Retry-After")
+
+
+def test_the_upload_limit_counts_the_user_not_the_address(
+    client: TestClient, register_org: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two people reaching the API from one address are counted apart.
+
+    This is the reason upload is keyed on the user id while login and registration are
+    keyed on the client address, and the difference only becomes visible with a second
+    person present. A limit of one: the same account's second upload is refused while a
+    colleague's first is served, over the same ticket, from the same `TestClient` — the
+    same address a per-IP key would have collapsed them into. Such a key would pass both
+    assertions in the test above and fail the last one here, which is cost #2 in
+    ADR-014 and the thing ADR-022 declines to repeat.
+
+    One rather than zero so that "the second is refused" and "the colleague is not" can
+    both be observed in one run. Every key carries a freshly registered user id, so no
+    counter left by an earlier test is in play.
+    """
+    monkeypatch.setattr(get_settings(), "RATE_LIMIT_UPLOAD_PER_HOUR", 1, raising=False)
+
+    org = register_org()
+    customer = org.add_customer()
+    ticket = org.add_ticket(customer["id"])
+
+    assert upload(org, ticket["id"]).status_code == 201
+
+    refused = upload(org, ticket["id"])
+    assert refused.status_code == 429, refused.text
+    assert refused.json()["error"]["code"] == "RATE_LIMITED"
+
+    # A manager, so the ticket is reachable through the organization row scope and
+    # ATTACHMENT_UPLOAD is held — a refusal here would be about permission, not limits.
+    colleague = org.add_user("manager")
+    assert upload(colleague, ticket["id"]).status_code == 201
 
 
 # ---------------------------------------------------------------------------

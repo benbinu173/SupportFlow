@@ -993,3 +993,102 @@ ones, and the honest measurement above is what that costs. Sorting added four en
 and a parameter to each list route, and the search term is capped at 200 characters
 because it reaches `websearch_to_tsquery` and two `ILIKE` patterns.
 
+---
+
+## ADR-022 — Redis's responsibilities arrive with their consumers
+
+**Status:** accepted · Phase O
+
+**Context.** §15 gives Redis four jobs: rate limiting, caching, Pub/Sub, and short-lived
+task/state coordination. Three phases after Redis was first wired in, the tally was one
+of four — and "one of four" reads as three omissions unless the other three are placed
+deliberately. §15 also closes with "Do not cache everything blindly", and §223 says "Do
+not use technologies merely for resume keywords", so building an unused cache and an
+unsubscribed Pub/Sub channel to fill out the list would violate the spec in the act of
+satisfying it.
+
+**Decision.** Redis carries rate limiting today, and each remaining responsibility is
+assigned to the phase that gives it a consumer. The client is consolidated into one
+object with one lifecycle at the same time, because three places were building their own.
+
+**Three clients, one server, no shared view of it.** `rate_limit.py` held a private
+`_shared` global; `app/api/health.py` called `aioredis.from_url(...)` **on every readiness
+probe** and closed it in a `finally`. That second one was a defect rather than a style
+problem, and it is why this consolidation needed no future phase to justify itself. It was
+measured rather than asserted — `redis-cli info stats`, twenty `GET /health/ready`
+requests, the counter read before and after:
+
+| Probe implementation | `total_connections_received` delta over 20 probes |
+|---|---|
+| A client built and closed per probe | **23** |
+| The process's shared client | **2** |
+
+`get_client()` in `app/core/redis.py` is now the only place a client is built. It is lazy,
+so importing the module never requires Redis to be up, and `Redis.from_url` opens no
+socket — which is also why the module holds **no logger**: there is no failure here to
+report, and the only thing that can go wrong is a connection error, which surfaces at the
+call site with the request that caused it. That keeps `tests/security/test_log_hygiene.py`
+honest, since its module list is hand-maintained and would otherwise need an entry for a
+module that never logs.
+
+The probe now **borrows** the client and does not close it. Its `aclose()` was correct
+while it owned what it closed; on a shared pool it would tear down the connections the
+rate limiter is using, and the symptom would be a limiter that fails open intermittently
+for reasons having nothing to do with limits.
+
+**Upload is limited per user. Login and registration are limited per address. This is
+deliberate and they are opposites.** At login there is no identity yet — that is the whole
+point of the endpoint — and the attack is credential stuffing spread across many accounts,
+so the address is the only available key. Upload is authenticated: identity exists, and
+§45's concern is one account filling the object store. Keying upload on the address would
+let one person's backlog throttle an entire office behind a NAT, which is cost #2 that
+ADR-014 already records against the login limiter. That trade is forced there and avoidable
+here, so it is not repeated. `test_the_upload_limit_counts_the_user_not_the_address` states
+it: with a limit of one, the same account's second upload is refused while a colleague's
+first is served, over the same ticket, from the same client address.
+
+**The refusal happens before the file is examined.** A route dependency is resolved before
+the path operation's own parameters, so the guard runs before `file: UploadFile` is read.
+Confirmed over real HTTP rather than reasoned about: a request that is both over the limit
+and carries a disallowed file type returns **429**, while the identical request against an
+account under its limit returns the validation error. The status code is what identifies
+which check ran first. The honest boundary is that uvicorn has already taken the bytes off
+the socket — this stops the work, not the upload of the bytes — and the `Retry-After`
+header is 3600 because the window is an hour.
+
+**Where the other three responsibilities land, and why.**
+
+- **Cache → Phase S.** §15's own example is dashboard analytics, and dashboards are Phase
+  S. The valuable half of this entry is the *rejection*: the obvious optimization is
+  caching the `users JOIN organizations` row that `deps.get_current_user` loads on every
+  authenticated request. **Refused.** ADR-013 checks `is_active` and the organization's
+  `status` on every request specifically so that deactivation and suspension take effect
+  on the *next request, not one TTL later*. That join is not measurably slow, and caching
+  it would trade a stated security property for an unmeasured performance one.
+- **Pub/Sub → Phase R**, where a WebSocket connection manager subscribes. On this backend
+  a channel with no subscriber is §223's warning wearing infrastructure.
+- **Short-lived task and state coordination → Phase P**, with Celery. `config.py` does not
+  read the `CELERY_*` variables yet, for the same reason it did not read `S3_*` before
+  Phase L: settings arrive with the code that uses them, verified rather than predicted.
+- **§45's remaining two limiters** — AI endpoints and knowledge-base processing — go with
+  the phases that build those endpoints (T–W and X). No setting exists for an endpoint
+  that does not.
+
+**The limiter's own behaviour is unchanged and stays where it was decided.** `RateLimiter`
+is untouched, including `_hit`'s `SET ... NX EX` before `INCR`, which is what guarantees a
+counter never exists without a TTL and therefore cannot become permanent. Failing open when
+Redis is unreachable remains ADR-014's decision, with its costs, and is not restated here.
+
+**Database separation.** Compose already sets limits and cache on db 0 and the Celery
+broker and result backend on db 2. Worth stating as a decision rather than leaving as a
+URL in a compose file: a `FLUSHDB`, or a `KEYS` sweep run to clear one purpose, must not be
+able to take out another. Tests use db 1.
+
+**Cost.** One more module and one more indirection between the guards and their client — in
+exchange for one pool, one shutdown path, and one answer to "is Redis up?". Upload is now
+capped at 60/hour per user by default, which a legitimate user will never reach and a
+script filling the bucket will; the ceiling is a setting because the right number depends
+on how much a given desk attaches. Nothing is cached, so every authenticated request still
+does its join — which is the cost ADR-013 already accepted, and this ADR declines to pay
+back.
+

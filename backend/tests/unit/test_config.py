@@ -81,3 +81,24 @@ def test_is_production_flag() -> None:
 def test_access_token_ttl_is_short_by_default() -> None:
     """Access tokens are unrevokable, so a short TTL is the revocation mechanism."""
     assert _settings().ACCESS_TOKEN_EXPIRE_MINUTES <= 30
+
+
+@pytest.mark.unit
+def test_the_upload_limit_is_on_by_default_and_tunable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The default is what stands between a fresh deployment and no upload limit.
+
+    Every guard in `app/api/rate_limits.py` reads this setting per request, so a
+    default that quietly became 0 — or a field that stopped existing — would disable an
+    abuse control without failing anything. The explicit 60 is deliberate: changing a
+    security default should mean editing a test that names it, and `.env.example` and
+    `config.py` carry the reasoning for why it is 60 rather than 5 or 500.
+
+    conftest sets this variable in `os.environ` so the suite stays off the limiter, and
+    `_env_file=None` suppresses dotenv but not the process environment — so, exactly as
+    in `test_required_settings_have_no_default`, it has to be unset explicitly before
+    the default is observable at all.
+    """
+    monkeypatch.delenv("RATE_LIMIT_UPLOAD_PER_HOUR", raising=False)
+
+    assert _settings().RATE_LIMIT_UPLOAD_PER_HOUR == 60
+    assert _settings(RATE_LIMIT_UPLOAD_PER_HOUR="2").RATE_LIMIT_UPLOAD_PER_HOUR == 2

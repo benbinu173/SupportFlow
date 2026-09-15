@@ -10,22 +10,20 @@ code rather than about the double — in particular `INCR` on a missing key crea
 """
 
 import math
+import uuid
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from redis.asyncio import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import RedisError
 
-from app.core import rate_limit
 from app.core.exceptions import ErrorCode, RateLimitedError
 from app.core.rate_limit import (
     RateLimiter,
-    _shared_client,
-    close_client,
     login_rate_limit_key,
     register_rate_limit_key,
+    upload_rate_limit_key,
 )
 
 pytestmark = pytest.mark.unit
@@ -390,51 +388,18 @@ def test_the_keys_are_endpoint_scoped_and_readable() -> None:
     assert login_rate_limit_key("1.1.1.1") != register_rate_limit_key("1.1.1.1")
 
 
-def test_the_shared_client_is_built_once() -> None:
-    """Lazily built, then process-wide.
+def test_the_upload_key_counts_users_not_addresses() -> None:
+    """The upload limiter is keyed on the user, and the test says so in both
+    directions.
 
-    `redis.asyncio` clients own a connection pool, so constructing one per login would
-    open and discard a connection every time. Resolving the URL opens no connection,
-    which is why this needs no running Redis.
-
-    **Deliberately does not close it.** In a full run this module executes after the
-    HTTP suite, whose application has already built — and used — this same global on its
-    own event loop. Releasing a live pool from here would be reaching across loops,
-    which is the failure this asserts nothing about. `close_client` is covered
-    separately, against a client this test owns.
+    Distinct per user, so one account's backlog cannot throttle a colleague — the
+    failure ADR-014 records as a known cost of the login limiter, avoided here because
+    the caller is authenticated and identity exists. And keyed on something that is not
+    an address, because two users behind one NAT are two users.
     """
-    first = _shared_client()
+    one = uuid.uuid4()
+    other = uuid.uuid4()
 
-    assert isinstance(first, Redis)
-    assert _shared_client() is first
-
-    # And a limiter with no client of its own resolves to that same object.
-    assert RateLimiter().client is first
-
-
-async def test_closing_releases_the_shared_client_and_is_idempotent(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Called from the app's shutdown hook, so it has to be both effective and safe.
-
-    The second call is the case that matters: shutdown runs on a clean exit and on a
-    failure, and releasing an already-released pool must not raise.
-
-    The global is replaced with a stub rather than closed for real — see the test above
-    for why. Substituting it also lets the *effect* be asserted (the pool was released,
-    the global was cleared) rather than merely the absence of an exception.
-    """
-    releases: list[str] = []
-
-    class StubClient:
-        async def aclose(self) -> None:
-            releases.append("closed")
-
-    monkeypatch.setattr("app.core.rate_limit._shared", StubClient())
-
-    await close_client()
-    assert releases == ["closed"]
-    assert rate_limit._shared is None
-
-    await close_client()
-    assert releases == ["closed"], "closing twice released the pool twice"
+    assert upload_rate_limit_key(one) == f"ratelimit:upload:{one}"
+    assert upload_rate_limit_key(one) != upload_rate_limit_key(other)
+    assert upload_rate_limit_key(one) != login_rate_limit_key(str(one))

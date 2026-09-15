@@ -24,6 +24,7 @@ from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
 
 from app.api.deps import Context, DbSession, Origin, require_permission
+from app.api.rate_limits import limit_upload
 from app.core.file_validation import content_disposition
 from app.core.permissions import Permission
 from app.core.storage import open_stream
@@ -38,7 +39,10 @@ router = APIRouter()
     response_model=AttachmentRead,
     status_code=status.HTTP_201_CREATED,
     summary="Attach a file to a ticket",
-    dependencies=[Depends(require_permission(Permission.ATTACHMENT_UPLOAD))],
+    dependencies=[
+        Depends(require_permission(Permission.ATTACHMENT_UPLOAD)),
+        Depends(limit_upload),
+    ],
 )
 async def upload_attachment(
     ticket_id: uuid.UUID,
@@ -63,6 +67,9 @@ async def upload_attachment(
       the configured limit the answer is `413`.
     * **Authorization** is `ATTACHMENT_UPLOAD` and the ticket's row scope, so an agent
       can only attach to a ticket assigned to them and a customer only to their own.
+
+    §45 also names file upload as an endpoint to rate-limit, which is the second guard
+    above — per user, not per address, because the caller is authenticated.
 
     `message_id` is optional and, when present, must name a message on *this* ticket.
     Attaching to an internal note makes the file internal too, which is why the answer

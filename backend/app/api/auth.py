@@ -22,14 +22,10 @@ from app.api.deps import (
     header_or_none,
     require_permission,
 )
+from app.api.rate_limits import limit_login, limit_register
 from app.core.config import get_settings
 from app.core.exceptions import AuthenticationRequiredError
 from app.core.permissions import Permission
-from app.core.rate_limit import (
-    RateLimiter,
-    login_rate_limit_key,
-    register_rate_limit_key,
-)
 from app.core.security import refresh_token_ttl_seconds
 from app.schemas.auth import LoginRequest, LogoutResponse, RegisterRequest, TokenResponse
 from app.schemas.user import UserRead
@@ -39,37 +35,8 @@ logger = structlog.get_logger(__name__)
 
 router = APIRouter()
 
-# One limiter for the process; it owns the shared Redis client.
-_limiter = RateLimiter()
-
 # Width of the `refresh_tokens.user_agent` column.
 _MAX_USER_AGENT = 500
-
-
-# ---------------------------------------------------------------------------
-# Rate-limit guards
-# ---------------------------------------------------------------------------
-# Expressed as route dependencies rather than called inside the endpoint bodies, so
-# the limit is enforced before the service is reached. The point is to stop the work
-# happening, not to discard its result.
-
-
-async def _limit_login(request: Request) -> None:
-    settings = get_settings()
-    await _limiter.enforce(
-        login_rate_limit_key(client_ip(request)),
-        limit=settings.RATE_LIMIT_LOGIN_PER_MINUTE,
-        window_seconds=60,
-    )
-
-
-async def _limit_register(request: Request) -> None:
-    settings = get_settings()
-    await _limiter.enforce(
-        register_rate_limit_key(client_ip(request)),
-        limit=settings.RATE_LIMIT_REGISTER_PER_HOUR,
-        window_seconds=3600,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +114,7 @@ def _user_agent(request: Request) -> str | None:
     response_model=TokenResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Create an organization and its first administrator",
-    dependencies=[Depends(_limit_register)],
+    dependencies=[Depends(limit_register)],
 )
 async def register(
     payload: RegisterRequest, request: Request, response: Response, db: DbSession
@@ -170,7 +137,7 @@ async def register(
     "/login",
     response_model=TokenResponse,
     summary="Exchange credentials for an access token",
-    dependencies=[Depends(_limit_login)],
+    dependencies=[Depends(limit_login)],
 )
 async def login(
     payload: LoginRequest, request: Request, response: Response, db: DbSession
