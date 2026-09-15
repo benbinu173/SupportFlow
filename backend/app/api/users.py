@@ -15,7 +15,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, status
 
-from app.api.deps import Context, DbSession, require_permission
+from app.api.deps import Context, DbSession, Origin, require_permission
 from app.core.permissions import Permission
 from app.schemas.user import UserCreate, UserRead, UserRoleUpdate
 from app.services import user_service
@@ -55,14 +55,16 @@ async def list_users(
     summary="Create a user in the organization",
     dependencies=[Depends(require_permission(Permission.USER_CREATE))],
 )
-async def create_user(payload: UserCreate, context: Context, db: DbSession) -> UserRead:
+async def create_user(
+    payload: UserCreate, context: Context, db: DbSession, origin: Origin
+) -> UserRead:
     """Add a user to the caller's organization.
 
     The new account's organization comes from the caller's verified tenant. The
     request body has no organization field, so creating a user in another tenant is
     not something a client can express.
     """
-    user = await user_service.create_user(db, context, payload)
+    user = await user_service.create_user(db, context, payload, origin=origin)
     return UserRead.model_validate(user)
 
 
@@ -90,14 +92,14 @@ async def get_user(user_id: uuid.UUID, context: Context, db: DbSession) -> UserR
     dependencies=[Depends(require_permission(Permission.USER_UPDATE_ROLE))],
 )
 async def update_role(
-    user_id: uuid.UUID, payload: UserRoleUpdate, context: Context, db: DbSession
+    user_id: uuid.UUID, payload: UserRoleUpdate, context: Context, db: DbSession, origin: Origin
 ) -> UserRead:
     """Change a user's role.
 
     Refused if it would leave the organization without an administrator — nobody would
     remain who could grant the role back.
     """
-    user = await user_service.update_role(db, context, user_id, payload)
+    user = await user_service.update_role(db, context, user_id, payload, origin=origin)
     return UserRead.model_validate(user)
 
 
@@ -107,11 +109,13 @@ async def update_role(
     summary="Deactivate a user",
     dependencies=[Depends(require_permission(Permission.USER_DEACTIVATE))],
 )
-async def deactivate_user(user_id: uuid.UUID, context: Context, db: DbSession) -> UserRead:
+async def deactivate_user(
+    user_id: uuid.UUID, context: Context, db: DbSession, origin: Origin
+) -> UserRead:
     """Deactivate a user, preserving their history.
 
     Deactivation rather than deletion, so ticket authorship and audit records stay
     intact. Refused for your own account and for the last administrator.
     """
-    user = await user_service.deactivate_user(db, context, user_id)
+    user = await user_service.deactivate_user(db, context, user_id, origin=origin)
     return UserRead.model_validate(user)

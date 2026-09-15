@@ -1,25 +1,25 @@
 """Customer persistence."""
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from datetime import datetime
+from typing import Any
 
 from sqlalchemy import ColumnElement, or_
+from sqlalchemy.orm import InstrumentedAttribute
 
 from app.models.customer import Customer
 from app.repositories.base import TenantScopedRepository
+from app.repositories.search import like_pattern
+from app.schemas.customer import CustomerSortKey
+from app.schemas.fields import SortOrder
 
-
-def escape_like(term: str) -> str:
-    """Escape the wildcards in a user-supplied search term.
-
-    SQLAlchemy parameterizes the value, so this is not about injection — a `%` in a
-    bind parameter is data and nothing more. It is about *meaning*: `%` and `_` are
-    LIKE metacharacters, so a customer searching for `50%` would otherwise match every
-    record in the table, and one searching for `a_b` would match `aXb`. The backslash
-    is escaped first, since it is the escape character itself and escaping it later
-    would double up on the escapes added before it.
-    """
-    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+# `CustomerSortKey` to the column it names. Keyed by the enum, so a member added with no
+# column behind it is a type error rather than a `KeyError` at request time.
+_CUSTOMER_SORT_COLUMNS: Mapping[CustomerSortKey, InstrumentedAttribute[Any]] = {
+    CustomerSortKey.NAME: Customer.name,
+    CustomerSortKey.CREATED_AT: Customer.created_at,
+}
 
 
 class CustomerRepository(TenantScopedRepository[Customer]):
@@ -54,8 +54,18 @@ class CustomerRepository(TenantScopedRepository[Customer]):
             criteria.append(Customer.id != excluding)
         return await self.exists(*criteria)
 
-    async def search(self, *, term: str | None, limit: int, offset: int) -> Sequence[Customer]:
-        """A page of customers, newest first, optionally filtered by name or email.
+    async def search(
+        self,
+        *,
+        term: str | None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+        sort: CustomerSortKey = CustomerSortKey.CREATED_AT,
+        order: SortOrder = SortOrder.DESC,
+        limit: int,
+        offset: int,
+    ) -> Sequence[Customer]:
+        """A page of customers, optionally searched, date-filtered, and sorted.
 
         A substring match rather than a prefix one, because someone typing a support
         agent's memory of a customer is as likely to remember the domain or the second
@@ -65,22 +75,34 @@ class CustomerRepository(TenantScopedRepository[Customer]):
         `term=None` and `term=""` both mean "no filter" — a query string that arrives
         empty is not a search for the empty string, and matching on it would return
         everything anyway while giving the planner a pointless predicate.
+
+        The date bounds are half-open — `created_after` inclusive, `created_before`
+        exclusive — matching `/tickets` and `/audit-logs`, so a caller can walk adjacent
+        windows without a boundary row appearing in both.
+
+        **`Customer.id` is always the final sort key**, as it is for tickets. `name` in
+        particular is not unique, and offset pagination over a non-unique sort without a
+        tiebreak silently repeats one row and drops another.
         """
         criteria: list[ColumnElement[bool]] = []
         if term and term.strip():
-            pattern = f"%{escape_like(term.strip())}%"
+            pattern = like_pattern(term)
             criteria.append(
                 or_(
                     Customer.name.ilike(pattern, escape="\\"),
                     Customer.email.ilike(pattern, escape="\\"),
                 )
             )
+        if created_after is not None:
+            criteria.append(Customer.created_at >= created_after)
+        if created_before is not None:
+            criteria.append(Customer.created_at < created_before)
+
+        column = _CUSTOMER_SORT_COLUMNS[sort]
+        direction = column.desc if order is SortOrder.DESC else column.asc
 
         statement = (
-            self._select(*criteria)
-            .order_by(Customer.created_at.desc(), Customer.id)
-            .limit(limit)
-            .offset(offset)
+            self._select(*criteria).order_by(direction(), Customer.id).limit(limit).offset(offset)
         )
         result = await self.session.execute(statement)
         return result.scalars().all()

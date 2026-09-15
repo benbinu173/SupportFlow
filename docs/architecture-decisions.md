@@ -690,3 +690,306 @@ wrong. Nothing is lost — the history is in `ticket_events`.
 is the price of the guard being readable at the route, and it is the same price ADR-013
 already paid for capabilities.
 
+---
+
+## ADR-018 — Uploads are proxied through the API, and the storage key is server-generated
+
+**Status:** accepted · Phase L
+
+**Context.** Spec §33 describes the flow as
+`Frontend -> FastAPI -> validated upload -> object storage -> database metadata` and ends
+with "prevent path traversal". The conventional design for file uploads against S3 — a
+presigned `PUT`, then a second request to record the metadata — collapses that flow to
+`Frontend -> storage`, with FastAPI involved only in issuing a URL.
+
+**Decision.** Every byte goes through the API. Uploads are `multipart/form-data` to
+`POST /tickets/{id}/attachments`, downloads are a `StreamingResponse` from
+`GET /attachments/{id}`, and the client never receives a URL or a storage key.
+
+The key is `f"{organization_id}/{ticket_id}/{uuid4().hex}"`, composed entirely from
+server-side values. The client's filename is stored in a column of its own for display,
+with its directory stripped, and reaches neither the key nor the bucket.
+
+**Why proxying.** A presigned URL is a capability handed to the client *and then used
+without the API in the path*. Authorization cannot be enforced on a request that does not
+come through the application, so tenant scoping — which holds for every row in the
+database — would stop applying at the one point where the data actually leaves. The
+metadata row could still be written afterwards, and the object could still be fetched by
+anyone the URL was leaked to, until it expires.
+
+There is no way to describe that as anything other than a hole in the isolation story, so
+§33's first three arrows are read as the intended architecture rather than as a
+description of one deployment. `test_an_organization_cannot_download_another_s_attachment`
+is the assertion that the choice is load-bearing: it is a cross-tenant read of a *file*,
+which a presigned URL could not have refused.
+
+**Why a generated key.** §33's "prevent path traversal" is usually implemented as a
+sanitizer over the client's filename, and a sanitizer is a list of the attacks someone
+thought of. Composing the key from `organization_id`, `ticket_id`, and a fresh `uuid4`
+makes traversal unrepresentable: there is no client string in the key, so there is
+nothing to traverse with. The test asserts the *shape* of the key — three slash-separated
+components, the last exactly 32 hex characters — rather than scanning it for `..`, because
+the shape is the reason, and a scan would pass for a key that happened to be safe.
+
+The filename is still sanitized for display, since it is echoed back in
+`Content-Disposition` and stored on the row. That is a correctness concern, not a security
+boundary: `../../shot.png` is *accepted* — every signal the validator can check is
+consistent — and simply displays as `shot.png`.
+
+**Consequences.**
+
+- The API is on the hot path for every byte, so a large upload occupies a worker. It runs
+  in a thread (`anyio.to_thread.run_sync`) because `boto3` is synchronous and would
+  otherwise block the event loop for the duration — the same class of mistake ADR-011
+  exists to prevent. Size is capped at `MAX_ATTACHMENT_BYTES` (25 MiB) and counted as the
+  bytes stream in, not read from `Content-Length`.
+- `ensure_bucket()` runs in the lifespan **before** the `yield`, and a failure is logged
+  as a warning rather than raised: storage being down should not stop the API from serving
+  tickets. An upload attempted while storage is unreachable returns
+  `503 STORAGE_UNAVAILABLE`, which a client can retry, rather than an opaque 500.
+- Download responses carry the *detected* content type, `X-Content-Type-Options: nosniff`,
+  and `Content-Disposition: attachment`. Without the last two a browser may render a
+  stored file in the API's own origin, which turns an accepted upload into stored XSS.
+- Deleting a ticket cascades to the attachment rows and removes nothing from the bucket.
+  Orphaned objects need a lifecycle policy or a sweeper, and neither belongs in a request.
+  It is a documented limitation rather than a silent one.
+
+---
+
+## ADR-019 — An attachment is reachable exactly when its message is
+
+**Status:** accepted · Phase L, correcting a prediction in ADR-013
+
+**Context.** ADR-013 introduced `ATTACHMENT_SCOPE_BY_ROLE` alongside `TICKET_SCOPE_BY_ROLE`
+and `MESSAGE_SCOPE_BY_ROLE`, and predicted that the attachment map would be the first to
+diverge: "an attachment on an internal note is not visible to the customer who owns the
+ticket". Phase L is where that prediction came due.
+
+**Decision.** The prediction was right about the rule and wrong about the shape. The role
+map does **not** diverge — reading the matrix in `docs/requirements.md` §3, admin is
+`all`, manager is `all`, agent is `assigned`, customer is `own`, which is character for
+character what the ticket map says. `ATTACHMENT_SCOPE_BY_ROLE` stays
+`dict(TICKET_SCOPE_BY_ROLE)`, and `test_the_three_scope_maps_agree_today` stays green.
+
+The divergence the prediction described is a **row** rule, not a role rule, and it is
+resolved the way message visibility already is: an attachment has no `customer_id` and no
+`assigned_agent_id`, so `row_scope_predicate` has no columns to take for it. It is reached
+through its ticket.
+
+So the rule is applied in two layers, both mirroring `MessageRepository.list_for_ticket`:
+
+1. **The route resolves the ticket first**, through the same
+   `ticket_service.require_visible_ticket` the ticket routes use. An agent who cannot see
+   the ticket cannot see its files. `AttachmentRepository` is deliberately *not* row-scoped
+   for the same reason `MessageRepository` is not.
+2. **On top of that, one row rule:** an attachment whose `message_id` names an internal
+   note requires `MESSAGE_READ_INTERNAL`. Without it the attachment is a 404,
+   indistinguishable from one that does not exist. Applied by default in both
+   `list_for_ticket` and `get_visible`, so a caller that forgets the flag gets the
+   restrictive answer rather than the permissive one.
+
+This is ADR-015's shape applied one level deeper: the scope is resolved where the query is
+built, and a scope that cannot be resolved from the row's own columns is resolved by
+walking to the row that has them.
+
+**The correction made while testing it.** The download route has three ways to refuse —
+no such attachment, an attachment on an unreachable ticket, and an attachment on an
+internal note — and the docstring claimed all three were indistinguishable. Two were not:
+`require_visible_ticket` raises `TICKET_NOT_FOUND`, so an attachment id on someone else's
+ticket reported a *different* error code than an id that never existed. A caller holding
+an id could therefore tell "this file exists, on a ticket that is not mine" from "no such
+file", which is precisely the oracle ADR-009 exists to remove — and exactly the leak a
+route that reports the wrong resource name produces. `get_attachment` now catches that and
+re-raises as `ATTACHMENT_NOT_FOUND`: the route is `/attachments/{id}`, so an attachment is
+what the caller asked for and an attachment is what is missing.
+
+`tests/security/test_row_scopes.py` found it, by asserting the two 404 bodies are
+byte-identical rather than merely both 404.
+
+**Cost.** Two layers to reason about, and a caller must resolve a ticket before it can
+reach a file. That is the price of an attachment having no scope of its own, and it is
+what makes the customer-facing rule hold without splitting the role map.
+
+**Revisit when a message-delete route is added.** `docs/data-model.md` records that
+`attachments.message_id` is `SET NULL` on message deletion, so an attachment outlives the
+message it arrived with — and an attachment on an internal note would lose its internal
+marking and become ticket-level. There is no message-delete route today, so the path is
+unreachable; a comment in the code names it, and the README lists it as a limitation.
+
+---
+
+## ADR-020 — Audit rows are written in the actor's own transaction
+
+**Status:** accepted · Phase M
+
+**Context.** §34 lists the actions worth recording. `audit_logs` existed from Phase D
+with four indexes, `AuditAction` already enumerated §34's list, and `Permission.AUDIT_VIEW`
+was already held by admin alone — but nothing wrote a row. The table was empty.
+
+The design question is not what to record but *when* the record commits. The tempting
+shape is a small helper called after the action, opening its own session so a failure to
+audit cannot fail the action.
+
+**Decision.** `audit_service` follows `ticket_service.record_event`, the closest analogue
+and the pattern the project already trusts: **it never commits.** `record()` takes a
+session and adds a row; the caller's transaction commits both or neither. Two entry points
+exist because registration has an actor and no `TenantContext` yet:
+
+| Function | Identity from |
+|---|---|
+| `record(session, *, organization_id, actor_user_id, actor_email, action, ...)` | explicit arguments |
+| `record_for(session, context, action, *, target_type, target_id, ...)` | the authenticated context |
+
+Every wired call site uses `record_for`, so no call site can stamp the wrong actor —
+the identity comes from the request, not from the arguments. `record` exists only for
+registration, where there is no context to take.
+
+**Why one transaction.** An audit trail that can disagree with the data it audits answers
+no compliance question. A helper with its own session creates exactly that: the ticket is
+assigned and the audit write fails, or worse, the audit write succeeds and the assignment
+rolls back, leaving a trail describing something that never happened. Sharing the
+transaction makes the two states identical by construction instead of by a retry policy —
+and it is the same reasoning that puts `ticket_events` in the actor's transaction.
+
+**Request provenance.** `client_ip`, `user_agent`, and `request_id` are threaded in as an
+explicit `Origin` dependency rather than set on a `ContextVar` by middleware. A
+`ContextVar` would be invisible at the call site — a reader cannot tell from `record_for`
+that it captures anything — and untestable without driving a real request. An explicit
+parameter is both.
+
+`TenantContext` gained one field for this: `email`, denormalized into the row. It exists
+because `AuditLog.actor_email` is there precisely so a row survives its actor's deletion
+(`actor_user_id` is `SET NULL`), and `TenantContext` had no email to put in it. The field
+is commented as investigation-only, like `ip_address` beside it, and is never read for a
+decision.
+
+**`before` and `after` land in `extra_data`**, satisfying §34's "before/after values where
+appropriate" and mirroring the `from_value`/`to_value` pair on `ticket_events`, so the two
+views of one change agree rather than merely both existing.
+
+**What is deliberately not audited.** Customer and message writes. `AuditAction` is a
+PostgreSQL enum with no member for either, so adding one is a migration; and both are
+already fully attributable — a customer's creation is implied by the ticket that names
+them and by `ticket_events`, and every message writes an event carrying its authenticated
+actor. Adding enum members is deferred to a phase that needs them rather than done
+speculatively.
+
+**Registration is audited**, which has a consequence worth stating: a fresh organization's
+trail is never empty. It holds exactly one `user_created` row for the founding
+administrator, with `metadata={"source": "registration"}`. The tempting test assertion
+("a new organization's audit list is empty") is therefore wrong, and the right one is that
+a second organization cannot see those rows. The test says so in as many words.
+
+**Cost.** Every audited route gained a parameter, and a service that never commits is a
+convention a future caller can break by committing early. The repository exposing only
+`add` and the list methods — asserted by a test that the module defines no `update` or
+`delete`, and by `AuditLog` having no `updated_at` — is what keeps "append-only" checkable
+rather than aspirational.
+
+---
+
+## ADR-021 — Search narrows and can never widen; index reachability is measured
+
+**Status:** accepted · Phase N
+
+**Context.** §14 asks for search across ticket number, subject, description, customer
+name, customer email, and message content, plus filtering, sorting, and date ranges.
+`ix_tickets_fts` had existed since Phase D and no query had ever used it.
+
+**Decision.** One predicate builder, `ticket_search_predicate(term, *, include_internal)`
+in `app/repositories/search.py`, returning a single disjunction over four arms:
+
+```sql
+(
+     to_tsvector('english'::regconfig, (subject::text || ' '::text) || description)
+       @@ websearch_to_tsquery('english'::regconfig, :q)
+  OR CAST(number AS TEXT) = :q
+  OR EXISTS (SELECT 1 FROM messages  WHERE ... AND to_tsvector('english'::regconfig, body) @@ ...)
+  OR EXISTS (SELECT 1 FROM customers WHERE ... AND (name ILIKE :pattern ESCAPE '\' OR email ILIKE ...))
+)
+```
+
+**Search narrows; it never widens.** Every caller ANDs this with the caller's scope
+predicate, and no code path in the module returns a predicate usable *instead of* a scope.
+That is worth stating as a design property rather than a happy accident, because the
+classic form of this bug is a query parameter that grants access — and `q` is a query
+parameter. `test_search_cannot_widen_an_agents_row_scope` states it directly: the term
+appears only in a colleague's ticket, and the agent gets an empty list *and* the same 404
+the ticket route gives.
+
+**`include_internal` is the phase's one real hazard.** A customer holds `MESSAGE_LIST` and
+reaches their own ticket, so without this the message arm would let them find a ticket by
+typing a phrase that appears only in a note they cannot read — search becoming the way
+around a filter every other route applies. The caller passes
+`context.has(Permission.MESSAGE_READ_INTERNAL)` and the arm is **dropped entirely** rather
+than filtered afterwards: an internal-note row that is fetched and then discarded is a row
+that was read, and the version of this bug that matters is the one where the filter is
+applied one query too late. Asserted from both sides — the customer must not find it, and
+the agent must, so the filter is narrow rather than merely present.
+
+**A term is data, not a pattern.** `escape_like` handles the LIKE metacharacters and moved
+here from `customer_repository.py` unchanged, because the ticket search needed the same
+function and that is the moment a helper stops belonging to one caller. Trivially, `100%`
+searches for the customer named `100% Cotton` instead of matching every row.
+`websearch_to_tsquery` rather than `plainto_tsquery`: it cannot raise on malformed input
+and it understands the quoted phrases a support agent types.
+
+**The FTS expression is imported, not restated.** `TICKET_FTS_EXPRESSION` and
+`MESSAGE_FTS_EXPRESSION` are module-level constants declared by the models that own the
+indexes, and both the `Index(...)` and the query read the same object. PostgreSQL matches
+an expression index to a query by the expression *as text*, so the prettier
+`to_tsvector('english', subject || ' ' || description)` would silently lose the index —
+no error, no wrong rows, just a sequential scan. Sharing the constant makes the divergence
+unrepresentable rather than merely discouraged, and
+`test_the_search_predicate_contains_each_indexed_expression_verbatim` compares the two
+strings exactly, with no normalization, because exact is what the planner does.
+
+**The measurement, and what it showed.** With 5,000 tickets, 20,000 messages, and 20,000
+customers seeded in one organization, `EXPLAIN (ANALYZE, BUFFERS)` gave:
+
+| Query | Plan | Time |
+|---|---|---|
+| ticket FTS arm alone | Bitmap Index Scan on `ix_tickets_fts` | 1.5 ms |
+| message FTS arm alone | Bitmap Index Scan on `ix_messages_fts` | 3.8 ms |
+| customer name `ILIKE` alone | Seq Scan — index declined | 19.4 ms |
+| full predicate, real term | Index Scan Backward on `ix_tickets_org_created_at` + filter | 42.8 ms |
+| full predicate, term matching nothing | same, 5,000 rows removed by filter | 103.2 ms |
+| `sort=priority desc` | Seq Scan + top-N heapsort | 3.7 ms |
+| `sort=name desc` on customers | Seq Scan + top-N heapsort | 18.6 ms |
+
+- **The four-arm OR does not use either full-text index.** The planner estimates the
+  disjunction at roughly 75% of the tenant's rows — there is no selectivity function for
+  `@@` against a generic `tsquery`, and the two `EXISTS` arms are hashed subplans of
+  unknown selectivity — and at that estimate, walking the tenant's `created_at` index in
+  sort order and filtering is genuinely the better plan. It is acceptable at these sizes
+  and it is **linear in the tenant's ticket count**, which the last row shows: a term
+  matching nothing still costs a pass over every ticket the organization has. The
+  individual arms are index-driven, so the reachable fix is to **union** the arms and
+  deduplicate instead of OR-ing them. That changes the query's shape and its ordering
+  semantics, so it is deferred and documented rather than smuggled in with the feature.
+- **`ix_customers_name_trgm` works and the planner declines it.** Forced with
+  `enable_seqscan = off` it runs in 3.1 ms against the seq scan's 18.6 ms, but the
+  planner's costs are 928 versus 608 the other way. GIN cost estimation is pessimistic
+  here; the index is chosen as the table grows and nothing needs doing.
+- **`ix_customers_org_name` was not added**, which is the decision the plan said this
+  measurement would make. `sort=name` is 18.6 ms for 20,000 customers and the Sort node is
+  50 of the plan's 1,301 cost — the scan dominates, not the sort, and that was the stated
+  condition for adding it.
+
+**Why `priority` sorts by declaration order.** The PostgreSQL enum is ordered
+`LOW < MEDIUM < HIGH < URGENT`, so `order=desc` leads with `URGENT`. Sorting the label
+alphabetically would put `HIGH` first. Correct, and not obvious enough to leave unstated —
+so it is in the route docstring and pinned by a test.
+
+**Why `id` is always appended to the sort.** Offset pagination over equal sort keys
+repeats and skips rows, because PostgreSQL is free to return equal rows in a different
+order per query. It only shows up under load, which is exactly when it is expensive to
+find. `test_pages_over_equal_sort_keys_do_not_repeat_or_skip_a_row` pages over six
+deliberately-equal priorities and asserts the two pages are disjoint and their union is
+everything.
+
+**Cost.** The four-arm OR is one index-unfriendly query instead of four index-friendly
+ones, and the honest measurement above is what that costs. Sorting added four enum values
+and a parameter to each list route, and the search term is capped at 200 characters
+because it reaches `websearch_to_tsquery` and two `ILIKE` patterns.
+

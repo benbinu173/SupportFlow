@@ -46,6 +46,15 @@ class TenantContext:
     # "matches nothing" rather than "matches everything" (ADR-015).
     customer_id: uuid.UUID | None = None
 
+    # The caller's email, copied from their user row. **Not an authorization input** —
+    # nothing in this codebase reads it to decide anything, and `has()` and `scope_for`
+    # cannot see it. It is here because `AppError`s are logged with the user id and
+    # `audit_logs` denormalizes the actor's email so a row survives its actor's deletion
+    # (`actor_user_id` is `SET NULL`), and carrying it on the one object that already
+    # represents "who is calling" beats threading a second parameter through every
+    # audited call site.
+    email: str | None = None
+
     # Not a constructor parameter (`init=False`) so it cannot be supplied by a
     # caller. A `permissions=` argument would be a way for any code path to grant
     # itself capabilities; deriving it from `role` in __post_init__ means the only
@@ -78,3 +87,23 @@ class TenantContext:
         # No permissions in the repr: this ends up in log lines, and a 38-element set
         # per request buries the two ids that matter.
         return f"<TenantContext user={self.user_id} org={self.organization_id} role={self.role}>"
+
+
+@dataclass(frozen=True, slots=True)
+class RequestOrigin:
+    """Where a request came from, as far as the socket and the headers can say.
+
+    Lives here rather than in `app/api/deps.py` because the audit service needs the
+    type, and a service importing from the API layer would invert the dependency the
+    rest of the project keeps straight. It sits beside `TenantContext` because it is the
+    same kind of object: per-request context derived once and passed down.
+
+    **Both fields are client-controlled and neither is used for a decision.** The IP is
+    the peer address, which a client cannot forge but a reverse proxy collapses; the
+    user agent is a header the client writes freely. They exist so an audit row can
+    answer "where did this come from" during an investigation — a question asked after
+    the fact, by a person, and never by the code.
+    """
+
+    ip_address: str | None = None
+    user_agent: str | None = None

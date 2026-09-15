@@ -13,6 +13,10 @@ BASE_ENV = {
     "DATABASE_URL": "postgresql+psycopg://u:p@localhost:5432/db",
     "REDIS_URL": "redis://localhost:6379/0",
     "JWT_SECRET": "a" * 32,
+    # Object-storage credentials, required and defaultless for the same reason the
+    # three above are: a missing secret must stop the process, not pick a fallback.
+    "S3_ACCESS_KEY": "minioadmin",
+    "S3_SECRET_KEY": "minioadmin",
 }
 
 
@@ -47,7 +51,9 @@ def test_short_jwt_secret_is_rejected() -> None:
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("secret_field", ["DATABASE_URL", "REDIS_URL", "JWT_SECRET"])
+@pytest.mark.parametrize(
+    "secret_field", ["DATABASE_URL", "REDIS_URL", "JWT_SECRET", "S3_ACCESS_KEY", "S3_SECRET_KEY"]
+)
 def test_required_settings_have_no_default(
     secret_field: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

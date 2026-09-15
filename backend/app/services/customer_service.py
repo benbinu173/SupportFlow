@@ -11,6 +11,7 @@ email is unique within the organization.
 """
 
 import uuid
+from datetime import datetime
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,7 +20,8 @@ from app.core.exceptions import CustomerAlreadyExistsError, ErrorCode, NotFoundE
 from app.core.tenancy import TenantContext
 from app.models.customer import Customer
 from app.repositories.customer_repository import CustomerRepository
-from app.schemas.customer import CustomerCreate, CustomerUpdate
+from app.schemas.customer import CustomerCreate, CustomerSortKey, CustomerUpdate
+from app.schemas.fields import SortOrder
 
 logger = structlog.get_logger(__name__)
 
@@ -29,12 +31,28 @@ async def list_customers(
     context: TenantContext,
     *,
     term: str | None,
+    created_after: datetime | None,
+    created_before: datetime | None,
+    sort: CustomerSortKey,
+    order: SortOrder,
     limit: int,
     offset: int,
 ) -> list[Customer]:
-    """A page of customers in the caller's organization, optionally searched."""
+    """A page of customers in the caller's organization, optionally searched.
+
+    Passed through rather than defaulted, as `ticket_service.list_tickets` explains: the
+    route owns the query parameter's default value.
+    """
     return list(
-        await CustomerRepository(session, context).search(term=term, limit=limit, offset=offset)
+        await CustomerRepository(session, context).search(
+            term=term,
+            created_after=created_after,
+            created_before=created_before,
+            sort=sort,
+            order=order,
+            limit=limit,
+            offset=offset,
+        )
     )
 
 

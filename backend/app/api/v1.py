@@ -8,6 +8,8 @@ environment can move it without touching the routes.
 
 from fastapi import APIRouter
 
+from app.api.attachments import router as attachments_router
+from app.api.audit import router as audit_router
 from app.api.auth import router as auth_router
 from app.api.customers import router as customers_router
 from app.api.messages import router as messages_router
@@ -24,3 +26,9 @@ router.include_router(tickets_router, prefix="/tickets", tags=["tickets"])
 # reachable exactly when its ticket is, and the URL says so. Its paths carry the
 # `{ticket_id}` segment themselves.
 router.include_router(messages_router, prefix="/tickets", tags=["messages"])
+# No prefix, because this router holds both shapes: the list is
+# `/tickets/{ticket_id}/attachments` and the download is `/attachments/{id}`. Both paths
+# are written in full, which is what lets the download exist at all — a download has only
+# an id, so it cannot live under `/tickets`.
+router.include_router(attachments_router, tags=["attachments"])
+router.include_router(audit_router, tags=["audit"])

@@ -6,11 +6,27 @@ and `UserCreate` cannot drift into accepting different passwords — which is th
 inconsistency that only shows up when someone registers one way and is created another.
 """
 
+from enum import StrEnum
 from typing import Annotated
 
 from pydantic import AfterValidator, EmailStr
 
 from app.core.config import get_settings
+
+
+class SortOrder(StrEnum):
+    """The direction of a list's sort.
+
+    Here rather than in `ticket.py` because both `/tickets` and `/customers` take it,
+    and a second enum spelled the same way is how two routes end up accepting
+    `order=descending` and `order=desc`. An enum at all, rather than a `str` compared
+    against `"asc"`, so a bad value is a 422 from FastAPI's own validation rather than a
+    silent fall-through to the default - which is the failure that makes a client's
+    reversed sort look like a data problem.
+    """
+
+    ASC = "asc"
+    DESC = "desc"
 
 
 def _normalize_email(value: str) -> str:

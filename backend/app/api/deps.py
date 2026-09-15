@@ -37,7 +37,7 @@ from app.core.exceptions import (
 )
 from app.core.permissions import Permission
 from app.core.security import decode_access_token
-from app.core.tenancy import TenantContext
+from app.core.tenancy import RequestOrigin, TenantContext
 from app.models.enums import OrganizationStatus
 from app.models.user import User
 
@@ -116,6 +116,9 @@ async def get_tenant_context(
         # linked to a customer — the repository reads that as "reaches no rows", not
         # as "reaches every row" (ADR-015).
         customer_id=user.customer_id,
+        # For the audit log's denormalized actor column, not for any decision. See the
+        # field's comment on `TenantContext`.
+        email=user.email,
     )
 
 
@@ -192,3 +195,23 @@ def header_or_none(request: Request, name: str, *, max_length: int) -> str | Non
     """
     value = request.headers.get(name)
     return value[:max_length] if value else None
+
+
+def request_origin(request: Request) -> RequestOrigin:
+    """Build the `RequestOrigin` for this request.
+
+    The two fields come from the two existing helpers rather than reading the request
+    directly: `client_ip` carries the reasoning about why `X-Forwarded-For` is not
+    consulted, and `header_or_none` carries the truncation rule. Neither is worth
+    restating here, where a divergence would be invisible.
+    """
+    return RequestOrigin(
+        ip_address=client_ip(request),
+        # 500 matches the column width on `audit_logs.user_agent`; the refresh-token
+        # provenance fields truncate for the same reason. A client can send a header of
+        # any length it likes, and an over-long one must not become an integrity error.
+        user_agent=header_or_none(request, "user-agent", max_length=500),
+    )
+
+
+Origin = Annotated[RequestOrigin, Depends(request_origin)]

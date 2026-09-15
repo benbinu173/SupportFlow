@@ -39,7 +39,8 @@ from app.core.security import (
     refresh_token_expiry,
     verify_and_update_password,
 )
-from app.models.enums import UserRole
+from app.core.tenancy import RequestOrigin
+from app.models.enums import AuditAction, UserRole
 from app.models.organization import Organization
 from app.models.refresh_token import RefreshToken
 from app.models.user import User
@@ -47,6 +48,7 @@ from app.repositories.organization_repository import OrganizationRepository
 from app.repositories.refresh_token_repository import RefreshTokenRepository
 from app.repositories.user_repository import find_users_by_email_across_tenants
 from app.schemas.auth import LoginRequest, RegisterRequest
+from app.services import audit_service
 
 logger = structlog.get_logger(__name__)
 
@@ -150,6 +152,25 @@ async def register(
         # is more machinery than the race is worth.
         await session.rollback()
         raise ConflictError("That organization name is already taken.") from exc
+
+    # The one call site with no `TenantContext`: the organization and its admin are
+    # being created by this call, so there is no authenticated identity to read an actor
+    # from yet. The founding admin is their own actor here, which is why this goes
+    # through `record` rather than `record_for` — and why the identity is spelled out
+    # rather than defaulted. Without this row a tenant's trail begins with its *second*
+    # user, and "who created this organization" is unanswerable from the trail itself.
+    audit_service.record(
+        session,
+        organization_id=organization.id,
+        actor_user_id=user.id,
+        actor_email=user.email,
+        action=AuditAction.USER_CREATED,
+        target_type="user",
+        target_id=user.id,
+        after={"role": user.role.value, "email": user.email},
+        metadata={"source": "registration"},
+        origin=RequestOrigin(ip_address=ip_address, user_agent=user_agent),
+    )
 
     result, token_row = _issue_tokens(user, user_agent=user_agent, ip_address=ip_address)
     session.add(token_row)

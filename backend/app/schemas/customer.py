@@ -8,11 +8,29 @@ they do.
 
 import uuid
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.fields import Email
+
+
+class CustomerSortKey(StrEnum):
+    """The columns a customer list may be ordered by.
+
+    Only two, and that is the decision rather than a first instalment. `name` answers
+    "find me the account" and `created_at` answers "what came in recently"; `email` is
+    searchable through `q` and sorting by it would order the list by domain, which is a
+    grouping nobody asked for. A member with no use is a member whose index has to be
+    maintained for nothing.
+
+    The direction is `order`, not the key. `created_at` with `desc` stays the default so
+    that adding this parameter changed no existing response.
+    """
+
+    NAME = "name"
+    CREATED_AT = "created_at"
 
 
 class CustomerRead(BaseModel):

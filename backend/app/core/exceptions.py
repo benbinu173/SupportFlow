@@ -61,6 +61,7 @@ class ErrorCode(StrEnum):
     USER_NOT_FOUND = "USER_NOT_FOUND"
     CUSTOMER_NOT_FOUND = "CUSTOMER_NOT_FOUND"
     TICKET_NOT_FOUND = "TICKET_NOT_FOUND"
+    ATTACHMENT_NOT_FOUND = "ATTACHMENT_NOT_FOUND"
 
     # --- Transport-level ---------------------------------------------------
     # Raised by the framework, not by domain code: the *route* does not exist, or the
@@ -72,9 +73,12 @@ class ErrorCode(StrEnum):
 
     # --- Domain rules ------------------------------------------------------
     INVALID_TICKET_TRANSITION = "INVALID_TICKET_TRANSITION"
+    UNSUPPORTED_FILE_TYPE = "UNSUPPORTED_FILE_TYPE"
+    FILE_TOO_LARGE = "FILE_TOO_LARGE"
 
     # --- Infrastructure ----------------------------------------------------
     RATE_LIMITED = "RATE_LIMITED"
+    STORAGE_UNAVAILABLE = "STORAGE_UNAVAILABLE"
     AI_SERVICE_ERROR = "AI_SERVICE_ERROR"
     INTERNAL_SERVER_ERROR = "INTERNAL_SERVER_ERROR"
 
@@ -188,6 +192,7 @@ _NOT_FOUND_MESSAGES: dict[ErrorCode, str] = {
     ErrorCode.USER_NOT_FOUND: "User not found.",
     ErrorCode.CUSTOMER_NOT_FOUND: "Customer not found.",
     ErrorCode.TICKET_NOT_FOUND: "Ticket not found.",
+    ErrorCode.ATTACHMENT_NOT_FOUND: "Attachment not found.",
 }
 
 
@@ -258,6 +263,59 @@ class ValidationError(AppError):
     code = ErrorCode.VALIDATION_ERROR
     status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
     message = "The request could not be processed."
+
+
+class UnsupportedFileTypeError(AppError):
+    """An upload whose type could not be established, or could not be trusted.
+
+    Spec §33: *"Never trust filename or MIME type alone."* All three of the inputs the
+    client controls — the extension, the declared `Content-Type`, and the bytes — must
+    agree, and the bytes get the final word. This covers every way they can fail to:
+    an extension outside the allowlist, a declared type outside it, or a file whose
+    leading bytes are not the signature of the type it claims to be.
+
+    A zero-byte file lands here too. It has no signature, so there is nothing to agree
+    with, and a dedicated rule for it would be a special case for the same answer.
+
+    The message deliberately does not say *which* check failed. That distinction is of
+    no use to a legitimate client — which either uploaded the right file or did not —
+    and is of considerable use to someone probing what the validator accepts.
+    """
+
+    code = ErrorCode.UNSUPPORTED_FILE_TYPE
+    status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
+    message = "That file type is not supported."
+
+
+class FileTooLargeError(AppError):
+    """An upload past the configured ceiling.
+
+    413 rather than 422: the request was well-formed and the type may be perfectly
+    acceptable — the body is simply more than this service will accept, which is what
+    413 means and what a client's retry logic keys on.
+    """
+
+    code = ErrorCode.FILE_TOO_LARGE
+    status_code = status.HTTP_413_CONTENT_TOO_LARGE
+    message = "That file is too large."
+
+
+class StorageUnavailableError(AppError):
+    """Object storage could not be reached, or refused the operation.
+
+    503 rather than 500: this is a dependency being down, not a bug, and it is
+    recoverable — the client can retry the same upload. Reporting it as a 500 would
+    tell the client to give up on something that will work in a minute, and would bury
+    it among the errors that genuinely need a person.
+
+    The storage layer's own error is logged with its cause and never returned: an S3
+    error message carries the bucket and key, which is infrastructure detail a client
+    has no business seeing.
+    """
+
+    code = ErrorCode.STORAGE_UNAVAILABLE
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    message = "File storage is temporarily unavailable."
 
 
 # ---------------------------------------------------------------------------

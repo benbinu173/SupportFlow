@@ -19,6 +19,7 @@ Three things live here that a route cannot express:
 
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,15 +32,28 @@ from app.core.exceptions import (
     ValidationError,
 )
 from app.core.permissions import TICKET_SCOPE_BY_ROLE, Permission, RowScope
-from app.core.tenancy import TenantContext
-from app.models.enums import TicketEventType, TicketPriority, TicketStatus, can_transition
+from app.core.tenancy import RequestOrigin, TenantContext
+from app.models.enums import (
+    AuditAction,
+    TicketEventType,
+    TicketPriority,
+    TicketStatus,
+    can_transition,
+)
 from app.models.ticket import Ticket
 from app.models.ticket_event import TicketEvent
 from app.repositories.customer_repository import CustomerRepository
 from app.repositories.ticket_event_repository import TicketEventRepository
 from app.repositories.ticket_repository import TicketRepository
 from app.repositories.user_repository import UserRepository
-from app.schemas.ticket import TicketCreate, TicketPriorityUpdate, TicketStatusUpdate
+from app.schemas.fields import SortOrder
+from app.schemas.ticket import (
+    TicketCreate,
+    TicketPriorityUpdate,
+    TicketSortKey,
+    TicketStatusUpdate,
+)
+from app.services import audit_service
 
 logger = structlog.get_logger(__name__)
 
@@ -62,17 +76,40 @@ async def list_tickets(
     status: TicketStatus | None,
     priority: TicketPriority | None,
     assigned_agent_id: uuid.UUID | None,
+    unassigned: bool,
     customer_id: uuid.UUID | None,
+    term: str | None,
+    created_after: datetime | None,
+    created_before: datetime | None,
+    sort: TicketSortKey,
+    order: SortOrder,
     limit: int,
     offset: int,
 ) -> list[Ticket]:
-    """A page of tickets the caller may reach, newest first."""
+    """A page of tickets the caller may reach, filtered and searched.
+
+    Every parameter is passed through rather than defaulted here: the route is where a
+    query parameter's default belongs, and a service that also had an opinion about it
+    would be a second place for the two to disagree. `include_internal` is the exception
+    and is *not* a parameter — it is read from the context inside the repository, so no
+    caller can ask for the internal-note arm of a search.
+
+    Increasingly, this function's body is the answer to "where does a ticket list come
+    from" and nothing else. That is deliberate: the parameters are a contract with the
+    route, and any logic added here would be logic the repository cannot see.
+    """
     return list(
         await TicketRepository(session, context).list_tickets(
             status=status,
             priority=priority,
             assigned_agent_id=assigned_agent_id,
+            unassigned=unassigned,
             customer_id=customer_id,
+            term=term,
+            created_after=created_after,
+            created_before=created_before,
+            sort=sort,
+            order=order,
             limit=limit,
             offset=offset,
         )
@@ -113,7 +150,11 @@ async def list_events(
 
 
 async def create_ticket(
-    session: AsyncSession, context: TenantContext, payload: TicketCreate
+    session: AsyncSession,
+    context: TenantContext,
+    payload: TicketCreate,
+    *,
+    origin: RequestOrigin | None = None,
 ) -> Ticket:
     """Raise a ticket.
 
@@ -183,6 +224,19 @@ async def create_ticket(
         TicketEventType.CREATED,
         to_value=TicketStatus.OPEN.value,
     )
+    audit_service.record_for(
+        session,
+        context,
+        AuditAction.TICKET_CREATED,
+        target_type="ticket",
+        target_id=ticket.id,
+        # The subject is the one field that makes a trail read as a story rather than a
+        # list of ids. It carries no `before` — there was no earlier ticket to describe,
+        # which is what an absent `before` key means throughout the trail.
+        after={"number": ticket.number, "status": ticket.status.value},
+        metadata={"subject": ticket.subject},
+        origin=origin,
+    )
     await session.commit()
 
     logger.info(
@@ -202,6 +256,7 @@ async def assign_ticket(
     ticket_id: uuid.UUID,
     *,
     assigned_agent_id: uuid.UUID | None,
+    origin: RequestOrigin | None = None,
 ) -> Ticket:
     """Assign, reassign, or unassign a ticket.
 
@@ -249,6 +304,21 @@ async def assign_ticket(
         from_value=str(previous) if previous else None,
         to_value=str(assigned_agent_id) if assigned_agent_id else None,
     )
+    audit_service.record_for(
+        session,
+        context,
+        # §34's list has no "unassigned" action, and a ticket going back on the queue is
+        # a change to the same field `TICKET_ASSIGNED` names. A distinct member would
+        # mean a migration to record the same field going in the other direction.
+        AuditAction.TICKET_ASSIGNED,
+        target_type="ticket",
+        target_id=ticket.id,
+        # Both ends as ids, or `None` when the field was empty. The difference between
+        # "never assigned" and "assigned to nobody" is the whole content of this record.
+        before={"assigned_agent_id": str(previous) if previous else None},
+        after={"assigned_agent_id": str(assigned_agent_id) if assigned_agent_id else None},
+        origin=origin,
+    )
     await session.commit()
 
     logger.info(
@@ -267,6 +337,8 @@ async def change_priority(
     context: TenantContext,
     ticket_id: uuid.UUID,
     payload: TicketPriorityUpdate,
+    *,
+    origin: RequestOrigin | None = None,
 ) -> Ticket:
     """Change the effective business priority.
 
@@ -290,6 +362,16 @@ async def change_priority(
         from_value=previous.value,
         to_value=payload.priority.value,
     )
+    audit_service.record_for(
+        session,
+        context,
+        AuditAction.TICKET_PRIORITY_CHANGED,
+        target_type="ticket",
+        target_id=ticket.id,
+        before={"priority": previous.value},
+        after={"priority": payload.priority.value},
+        origin=origin,
+    )
     await session.commit()
 
     logger.info(
@@ -308,6 +390,8 @@ async def change_status(
     context: TenantContext,
     ticket_id: uuid.UUID,
     payload: TicketStatusUpdate,
+    *,
+    origin: RequestOrigin | None = None,
 ) -> Ticket:
     """Move a ticket between the working states.
 
@@ -324,7 +408,7 @@ async def change_status(
     if hint is not None:
         raise InvalidTicketTransitionError(ticket.status.value, payload.status.value, hint)
 
-    _transition(session, context, ticket, payload.status)
+    _transition(session, context, ticket, payload.status, origin=origin)
     await session.commit()
 
     logger.info(
@@ -338,7 +422,11 @@ async def change_status(
 
 
 async def close_ticket(
-    session: AsyncSession, context: TenantContext, ticket_id: uuid.UUID
+    session: AsyncSession,
+    context: TenantContext,
+    ticket_id: uuid.UUID,
+    *,
+    origin: RequestOrigin | None = None,
 ) -> Ticket:
     """Close a resolved ticket. `RESOLVED → CLOSED`, and nothing else.
 
@@ -351,7 +439,7 @@ async def close_ticket(
     """
     ticket = await require_visible_ticket(session, context, ticket_id)
 
-    _transition(session, context, ticket, TicketStatus.CLOSED)
+    _transition(session, context, ticket, TicketStatus.CLOSED, origin=origin)
     await session.commit()
 
     logger.info(
@@ -364,7 +452,11 @@ async def close_ticket(
 
 
 async def reopen_ticket(
-    session: AsyncSession, context: TenantContext, ticket_id: uuid.UUID
+    session: AsyncSession,
+    context: TenantContext,
+    ticket_id: uuid.UUID,
+    *,
+    origin: RequestOrigin | None = None,
 ) -> Ticket:
     """Reopen a closed ticket. `CLOSED → OPEN`.
 
@@ -384,7 +476,14 @@ async def reopen_ticket(
     """
     ticket = await require_visible_ticket(session, context, ticket_id)
 
-    _transition(session, context, ticket, TicketStatus.OPEN, event_type=TicketEventType.REOPENED)
+    _transition(
+        session,
+        context,
+        ticket,
+        TicketStatus.OPEN,
+        event_type=TicketEventType.REOPENED,
+        origin=origin,
+    )
     ticket.resolved_at = None
     ticket.closed_at = None
 
@@ -415,6 +514,7 @@ def _transition(
     target: TicketStatus,
     *,
     event_type: TicketEventType = TicketEventType.STATUS_CHANGED,
+    origin: RequestOrigin | None = None,
 ) -> None:
     """Validate one lifecycle edge and apply it. **The only writer of `Ticket.status`.**
 
@@ -426,6 +526,11 @@ def _transition(
     `CheckConstraint` on the table requires `resolved_at` for a `resolved` row and
     `closed_at` implies it too. Forgetting is an integrity error rather than a ticket
     that claims to be resolved and has no resolution time.
+
+    **The audit row is written here for the same reason the status is.** Being the only
+    writer makes this the only place that knows both ends of the change, so it is also
+    the only place that can report it without guessing — the property ADR-017 leans on,
+    applied to the trail rather than to the lifecycle.
     """
     current = ticket.status
     if not can_transition(current, target):
@@ -454,6 +559,29 @@ def _transition(
         to_value=target.value,
     )
 
+    # §34 names reopening and resolution separately from a plain status change, and
+    # the difference is the *action*, not the status it lands on: `CLOSED -> OPEN` via
+    # `/reopen` is "reopened", while `IN_PROGRESS -> RESOLVED` via `/status` is
+    # "resolved". Both would otherwise collapse into `TICKET_STATUS_CHANGED`, and a
+    # trail whose entries all read the same is one nobody can filter.
+    if event_type is TicketEventType.REOPENED:
+        action = AuditAction.TICKET_REOPENED
+    elif target is TicketStatus.RESOLVED:
+        action = AuditAction.TICKET_RESOLVED
+    else:
+        action = AuditAction.TICKET_STATUS_CHANGED
+
+    audit_service.record_for(
+        session,
+        context,
+        action,
+        target_type="ticket",
+        target_id=ticket.id,
+        before={"status": current.value},
+        after={"status": target.value},
+        origin=origin,
+    )
+
 
 def record_event(
     session: AsyncSession,
@@ -463,13 +591,20 @@ def record_event(
     *,
     from_value: str | None = None,
     to_value: str | None = None,
+    extra_data: dict[str, Any] | None = None,
 ) -> TicketEvent:
     """Append to the ticket's timeline. Never commits — the caller is mid-transaction.
 
-    Public because the message service writes timeline entries too, and one event
-    writer is the point: every entry then carries the authenticated caller as its actor
-    and the ticket's own organization, rather than each caller assembling those itself
-    and one of them eventually getting it wrong.
+    Public because the message and attachment services write timeline entries too, and
+    one event writer is the point: every entry then carries the authenticated caller as
+    its actor and the ticket's own organization, rather than each caller assembling
+    those itself and one of them eventually getting it wrong.
+
+    `from_value`/`to_value` are `String(100)` and describe a field this event *changed*.
+    An event that carries something else — an attachment's filename, say — belongs in
+    `extra_data`, which is JSONB and exists for exactly that; a name squeezed into
+    `to_value` would be truncated at 100 characters and would put text in a column the
+    renderer reads as "the value this changed to".
     """
     event = TicketEvent(
         organization_id=context.organization_id,
@@ -480,6 +615,8 @@ def record_event(
         actor_user_id=context.user_id,
         from_value=from_value,
         to_value=to_value,
+        # Always a dict: the column is `nullable=False` over `'{}'::jsonb`.
+        extra_data=extra_data or {},
     )
     return TicketEventRepository(session, context).add(event)
 

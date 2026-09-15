@@ -64,6 +64,23 @@ class Settings(BaseSettings):
     RATE_LIMIT_LOGIN_PER_MINUTE: int = 10
     RATE_LIMIT_REGISTER_PER_HOUR: int = 5
 
+    # --- Object storage ---------------------------------------------------
+    # MinIO locally, any S3-compatible service in production. The endpoint and region
+    # carry defaults because neither is a secret and both have an obvious local value;
+    # the credentials do not, per the module docstring.
+    S3_ENDPOINT: str = "http://localhost:9000"
+    S3_ACCESS_KEY: str
+    S3_SECRET_KEY: str
+    S3_BUCKET: str = "supportflow-attachments"
+    S3_REGION: str = "us-east-1"
+
+    # The upload ceiling, enforced by counting bytes as they stream rather than by
+    # trusting the request's Content-Length — see `app/services/attachment_service.py`.
+    # 25 MiB is comfortably above any screenshot or log a support desk would attach and
+    # well below the point where proxying the bytes through the API stops being
+    # reasonable.
+    MAX_ATTACHMENT_BYTES: int = 25 * 1024 * 1024
+
     # --- CORS -------------------------------------------------------------
     # Explicit allowlist. Required because the refresh cookie is sent with
     # credentials, which forbids a wildcard origin.

@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 
 from app.core.config import get_settings
 from tests.conftest import (
+    API,
     AUTH,
     CUSTOMERS,
     PASSWORD,
@@ -46,6 +47,8 @@ LOGGING_MODULES = (
     "app.api.deps",
     "app.main",
     "app.core.rate_limit",
+    "app.services.attachment_service",
+    "app.services.audit_service",
     "app.services.auth_service",
     "app.services.customer_service",
     "app.services.message_service",
@@ -76,6 +79,11 @@ EXPECTED_EVENTS = frozenset(
         "ticket_closed",
         "ticket_reopened",
         "message_posted",
+        # Phases L-M. `attachment_created` carries an id, a size, and a detected type —
+        # not the filename. `audit_recorded` carries the actor, the action, and the
+        # target id, and none of the `before`/`after` payloads it stores on the row.
+        "attachment_created",
+        "audit_recorded",
     }
 )
 
@@ -85,6 +93,17 @@ WRONG_PASSWORD = "a-wrong-password-that-is-still-a-secret"
 # never reaches the logs" is a claim about this run rather than about a constant that
 # happens to be shared by every other account in the suite.
 PORTAL_PASSWORD = "a-portal-password-that-is-also-a-secret"
+
+# The signature is all `validate` reads, so a real PNG header followed by filler is a
+# file the validator accepts without this test needing a binary fixture on disk.
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+
+# Distinctive names, so the assertions below search for values this run produced rather
+# than for a substring that could plausibly appear in any log line. Both are treated as
+# customer text: the first is the name of a file that was stored, the second the name of
+# one that was refused.
+UPLOADED_FILENAME = "observatory-sighting-9931.png"
+REFUSED_FILENAME = "payload-8823.exe"
 
 
 class LogRecorder:
@@ -257,6 +276,29 @@ def exercised(
     assert reply.status_code == 201, reply.text
     assert note.status_code == 201, note.text
 
+    # --- Phases L-M, through the real services ---------------------------------
+    # Two uploads: one the validator accepts, one it refuses. Both log lines are
+    # asserted below, and the refused one is the entry most at risk of carrying the
+    # client's own text — a validator that says *why* it refused is one careless
+    # interpolation away from saying *what* it refused.
+    uploaded = org.post(
+        f"{TICKETS}/{ticket_id}/attachments",
+        files={"file": (UPLOADED_FILENAME, PNG_BYTES, "image/png")},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+
+    refused = org.post(
+        f"{TICKETS}/{ticket_id}/attachments",
+        files={"file": (REFUSED_FILENAME, b"MZ\x90\x00", "application/octet-stream")},
+    )
+    assert refused.status_code == 422, refused.text
+
+    # The audit viewer. Every action in this fixture has written a row by now, and this
+    # is what reads them back — as the founding administrator, who is the only role
+    # §3's matrix gives `AUDIT_VIEW`.
+    trail = org.get(f"{API}/audit-logs", params={"limit": 100})
+    assert trail.status_code == 200, trail.text
+
     return {
         "password": org.password,
         "access_token": session.access_token,
@@ -342,3 +384,27 @@ def test_no_portal_password_or_token_reaches_the_logs(
     assert exercised["portal_password"][:8] not in text
     assert exercised["portal_access_token"] not in text
     assert exercised["portal_access_token"].split(".")[1] not in text
+
+
+def test_no_filename_reaches_the_logs(logs: LogRecorder, exercised: dict[str, str]) -> None:
+    """A filename is customer-supplied text, and is treated as such.
+
+    This is the claim Phases I-K made about the ticket subject and the message body,
+    extended to the one text field those phases did not have. A name can carry as much
+    as a subject can — `redundancy-list-q4.xlsx` says as much as a sentence — so the
+    attachment service logs the id, the size, and the detected type, and nothing the
+    client wrote.
+
+    **Both paths are asserted, not just the successful one.** `attachment_rejected` is
+    the tempting exception: the reason it carries is diagnostically valuable, and the
+    natural next step is to add the name it was found on. It does not, because the
+    reason already describes the shape of the refusal and the actor id says who to ask.
+    A test that only covered the accepted upload would leave that door open.
+    """
+    text = logs.as_text()
+
+    assert UPLOADED_FILENAME not in text
+    assert REFUSED_FILENAME not in text
+    # The stem alone, in case something logs a name without its extension.
+    assert "observatory-sighting-9931" not in text
+    assert "payload-8823" not in text

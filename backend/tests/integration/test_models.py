@@ -37,6 +37,8 @@ from app.models.enums import (
     TicketStatus,
     UserRole,
 )
+from app.models.message import MESSAGE_FTS_EXPRESSION
+from app.models.ticket import TICKET_FTS_EXPRESSION
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
@@ -566,6 +568,60 @@ async def test_every_tenant_table_is_indexed_on_organization_id(
         )
     )
     assert list(unindexed) == []
+
+
+@pytest.mark.parametrize(
+    ("table", "index_name", "column"),
+    [("tickets", "ix_tickets_fts", "subject"), ("messages", "ix_messages_fts", "body")],
+    ids=["tickets", "messages"],
+)
+async def test_full_text_index_exists_in_the_catalog(
+    db: AsyncSession, table: str, index_name: str, column: str
+) -> None:
+    """The full-text index is real in PostgreSQL, not only in the model metadata.
+
+    The metadata half lives in tests/unit/test_model_indexes.py. This is the half that
+    matters more: a model can declare an index that no migration ever created, and every
+    metadata-level assertion would still pass while every query sequentially scanned.
+    Phase N added `ix_messages_fts` precisely because message search had no index, so
+    "the index is actually there" is the claim worth checking.
+
+    The expression is compared after stripping whitespace and parentheses. PostgreSQL
+    normalises what it stores - it renders `(subject::text || ' '::text) || description`
+    wrapped in extra parentheses - so an exact match would fail on formatting rather
+    than on meaning. Dropping parentheses is safe for these expressions because the only
+    operators involved are text concatenation (associative) and function calls.
+    """
+    row = (
+        await db.execute(
+            text(
+                """
+                SELECT am.amname, pg_get_expr(i.indexprs, i.indrelid)
+                FROM pg_index i
+                JOIN pg_class ic ON ic.oid = i.indexrelid
+                JOIN pg_am am ON am.oid = ic.relam
+                JOIN pg_class tc ON tc.oid = i.indrelid
+                WHERE tc.relname = :table AND ic.relname = :index
+                """
+            ),
+            {"table": table, "index": index_name},
+        )
+    ).one_or_none()
+
+    assert row is not None, f"{index_name} does not exist on {table}"
+    access_method, catalog_expression = row
+    assert access_method == "gin", f"{index_name} is a {access_method} index, not GIN"
+
+    declared = TICKET_FTS_EXPRESSION if table == "tickets" else MESSAGE_FTS_EXPRESSION
+
+    def strip(expression: str) -> str:
+        return "".join(expression.split()).replace("(", "").replace(")", "")
+
+    assert strip(catalog_expression) == strip(declared), (
+        f"{index_name} indexes {catalog_expression!r} in the catalog but the model "
+        f"declares {declared!r}; queries built from the model would not match it"
+    )
+    assert column in catalog_expression
 
 
 async def test_message_defaults_to_customer_visible(db: AsyncSession) -> None:

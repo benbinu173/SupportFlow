@@ -10,13 +10,15 @@ same permission, and `USER_LIST` guards `/users/{user_id}` for the same reason.
 """
 
 import uuid
+from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, status
 
 from app.api.deps import Context, DbSession, require_permission
 from app.core.permissions import Permission
-from app.schemas.customer import CustomerCreate, CustomerRead, CustomerUpdate
+from app.schemas.customer import CustomerCreate, CustomerRead, CustomerSortKey, CustomerUpdate
+from app.schemas.fields import SortOrder
 from app.services import customer_service
 
 router = APIRouter()
@@ -32,10 +34,14 @@ async def list_customers(
     context: Context,
     db: DbSession,
     q: Annotated[str | None, Query(max_length=200, description="Match name or email")] = None,
+    created_after: Annotated[datetime | None, Query(description="Inclusive lower bound.")] = None,
+    created_before: Annotated[datetime | None, Query(description="Exclusive upper bound.")] = None,
+    sort: Annotated[CustomerSortKey, Query()] = CustomerSortKey.CREATED_AT,
+    order: Annotated[SortOrder, Query()] = SortOrder.DESC,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> list[CustomerRead]:
-    """A page of customers in the caller's organization, newest first.
+    """A page of customers in the caller's organization.
 
     Returns a plain array rather than a `{items, total}` envelope, consistent with
     `/users`: every field in an envelope has to be maintained and tested, and nothing
@@ -44,9 +50,23 @@ async def list_customers(
     `q` is a substring match over name and email, served by the table's two trigram
     indexes. Wildcards in the term are escaped, so a search for `50%` finds a customer
     whose name contains "50%" rather than every customer in the organization.
+
+    The date bounds are half-open, matching `/tickets` and `/audit-logs`: `created_after`
+    inclusive, `created_before` exclusive. `sort` and `order` were added in Phase N and
+    are defaulted to `created_at desc`, which is what this route returned before it had
+    the parameters — so no existing client saw a change. Ties are broken by customer id,
+    so `sort=name` over a repeated name still pages cleanly.
     """
     customers = await customer_service.list_customers(
-        db, context, term=q, limit=limit, offset=offset
+        db,
+        context,
+        term=q,
+        created_after=created_after,
+        created_before=created_before,
+        sort=sort,
+        order=order,
+        limit=limit,
+        offset=offset,
     )
     return [CustomerRead.model_validate(customer) for customer in customers]
 

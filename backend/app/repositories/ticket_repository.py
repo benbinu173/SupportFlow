@@ -1,15 +1,21 @@
 """Ticket persistence, including row scope and the per-tenant number allocation."""
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from datetime import datetime
+from typing import Any
 
 from sqlalchemy import ColumnElement, func, select, text
+from sqlalchemy.orm import InstrumentedAttribute
 
-from app.core.permissions import TICKET_SCOPE_BY_ROLE
+from app.core.permissions import TICKET_SCOPE_BY_ROLE, Permission
 from app.models.enums import TicketPriority, TicketStatus
 from app.models.ticket import Ticket
 from app.repositories.base import TenantScopedRepository
 from app.repositories.scoping import row_scope_predicate
+from app.repositories.search import ticket_search_predicate
+from app.schemas.fields import SortOrder
+from app.schemas.ticket import TicketSortKey
 
 
 def _lock_key(organization_id: uuid.UUID) -> int:
@@ -23,6 +29,20 @@ def _lock_key(organization_id: uuid.UUID) -> int:
     a wrong answer, which is the property that matters.
     """
     return int.from_bytes(organization_id.bytes[:8], "big", signed=True)
+
+
+# `TicketSortKey` to the column it names. Keyed by the enum so mypy reports a member
+# added to `TicketSortKey` with no entry here, which a `match` over strings would not.
+#
+# `Any` in the value position because the four columns have four different Python types
+# (`datetime`, `datetime`, `int`, `TicketPriority`). The element type is uniform in the
+# way that matters — every one of them is a mapped attribute that can be ordered.
+_TICKET_SORT_COLUMNS: Mapping[TicketSortKey, InstrumentedAttribute[Any]] = {
+    TicketSortKey.CREATED_AT: Ticket.created_at,
+    TicketSortKey.UPDATED_AT: Ticket.updated_at,
+    TicketSortKey.NUMBER: Ticket.number,
+    TicketSortKey.PRIORITY: Ticket.priority,
+}
 
 
 class TicketRepository(TenantScopedRepository[Ticket]):
@@ -63,22 +83,41 @@ class TicketRepository(TenantScopedRepository[Ticket]):
         status: TicketStatus | None = None,
         priority: TicketPriority | None = None,
         assigned_agent_id: uuid.UUID | None = None,
+        unassigned: bool = False,
         customer_id: uuid.UUID | None = None,
+        term: str | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+        sort: TicketSortKey = TicketSortKey.CREATED_AT,
+        order: SortOrder = SortOrder.DESC,
         limit: int,
         offset: int = 0,
     ) -> Sequence[Ticket]:
-        """A page of tickets the caller may reach, newest first.
+        """A page of tickets the caller may reach, filtered, searched, and sorted.
 
         The filters are **narrowing only**. They compose with the scope predicate and
         cannot widen it: an agent asking for `assigned_agent_id=<someone else>` gets an
         empty page, not that agent's queue, because the scope predicate is applied
         regardless and both conditions must hold. That is the property
         `tests/security/test_row_scopes.py` asserts directly, since "a query parameter
-        that widens access" is the classic version of this bug.
+        that widens access" is the classic version of this bug. `term` is subject to the
+        same rule, which is what `tests/api/test_search.py` checks from the other side.
 
-        Ordered by `created_at` descending — the queue's natural order, and the
-        direction `ix_tickets_org_agent_status_created` was built for. It was declared
-        with `created_at` ascending, which PostgreSQL reads backwards at no cost.
+        `unassigned` is the second half of a tri-state the route resolves: the caller
+        passes either an agent id, or `unassigned=True`, or neither. Both at once is
+        refused at the route rather than resolved here, because "which filter wins" has
+        no defensible answer and a repository is the wrong place to invent one.
+
+        `created_after` is inclusive and `created_before` exclusive, so adjacent windows
+        tile without overlap or gap. The direction is a decision, not an accident: a
+        caller paging through time needs the boundary row in exactly one window, and
+        half-open is the only convention under which that holds for a `timestamptz`.
+
+        **Ordering always ends with `Ticket.id`.** Without a unique tiebreak, offset
+        pagination over equal sort values repeats and skips rows - two tickets created in
+        the same transaction share a `created_at` to the microsecond, and the page that
+        ends on one of them is not the page that continues from it. The bug only appears
+        under load, which is exactly when it is not being looked for.
         """
         criteria: list[ColumnElement[bool]] = [self._scope()]
         if status is not None:
@@ -87,14 +126,30 @@ class TicketRepository(TenantScopedRepository[Ticket]):
             criteria.append(Ticket.priority == priority)
         if assigned_agent_id is not None:
             criteria.append(Ticket.assigned_agent_id == assigned_agent_id)
+        if unassigned:
+            criteria.append(Ticket.assigned_agent_id.is_(None))
         if customer_id is not None:
             criteria.append(Ticket.customer_id == customer_id)
+        if created_after is not None:
+            criteria.append(Ticket.created_at >= created_after)
+        if created_before is not None:
+            criteria.append(Ticket.created_at < created_before)
+        if term and term.strip():
+            # ANDed with the scope predicate above, never substituted for it. The
+            # `include_internal` argument comes from the caller's capability rather than
+            # from the request, so a customer cannot ask for the internal arm.
+            criteria.append(
+                ticket_search_predicate(
+                    term,
+                    include_internal=self.context.has(Permission.MESSAGE_READ_INTERNAL),
+                )
+            )
+
+        column = _TICKET_SORT_COLUMNS[sort]
+        direction = column.desc if order is SortOrder.DESC else column.asc
 
         statement = (
-            self._select(*criteria)
-            .order_by(Ticket.created_at.desc(), Ticket.id)
-            .limit(limit)
-            .offset(offset)
+            self._select(*criteria).order_by(direction(), Ticket.id).limit(limit).offset(offset)
         )
         result = await self.session.execute(statement)
         return result.scalars().all()

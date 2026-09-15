@@ -113,6 +113,10 @@ pytest -m security          # tenant-isolation and authz tests only
 ruff check . && ruff format --check .
 mypy app alembic
 
+# End-to-end against a running server, including the parts TestClient cannot show
+# (real multipart, real streaming, real headers). Needs the API on :8000.
+python scripts/phase_ln_walkthrough.py
+
 # Frontend (from frontend/)
 npm test
 npm run typecheck
@@ -399,6 +403,169 @@ The unique index on `(organization_id, number)` stays: the lock is the mechanism
 index is the invariant. Verified by creating eight tickets from eight threads against one
 organization and asserting the numbers are exactly 1–8.
 
+## Attachments
+
+A ticket can carry files. Spec §33's flow is
+`Frontend -> FastAPI -> validated upload -> object storage -> database metadata`, and all
+four arrows go through the API:
+
+```
+POST /api/v1/tickets/{ticket_id}/attachments   multipart, optional message_id form field
+GET  /api/v1/tickets/{ticket_id}/attachments   metadata, newest first
+GET  /api/v1/attachments/{attachment_id}       the bytes, streamed
+```
+
+**Uploads are proxied; there are no presigned URLs.** A presigned URL is handed to the
+client and then fetched without the API in the path, so authorization cannot be enforced
+on it — the tenant scoping that applies to every row would stop applying at the one point
+where the bytes actually leave. Proxying is the only shape that satisfies §33's last
+line, and ADR-018 records what it costs.
+
+**The storage key is server-generated**: `{organization_id}/{ticket_id}/{uuid4().hex}`.
+The client's filename never reaches it, so path traversal is impossible by construction
+rather than by sanitizing — §33's "prevent path traversal" is satisfied by the shape of
+the key, and the test asserts that shape rather than searching it for `..`. The filename
+is kept for display, with its directory stripped.
+
+**Validation refuses three disagreements.** Allowed types are PNG, JPEG, GIF, PDF, and
+plain text. For each upload the extension, the declared `Content-Type`, and the bytes'
+leading signature must agree *and* the signature must actually have been read — which is
+§33's "never trust filename or MIME type alone" taken literally, since all three inputs
+are client-controlled. `text/plain` has no signature, so it is accepted only when the
+extension and the declared type agree; that hole is stated in the module rather than left
+implicit. Size is enforced by counting bytes as they stream, not by trusting
+`Content-Length`, because a header is a claim.
+
+**A file on an internal note is internal.** An attachment has no `customer_id` and no
+`assigned_agent_id` of its own, so it has no row scope to take — it is reached through
+its ticket, and every attachment route resolves the ticket first with the same scope
+predicate the ticket routes use (ADR-019). On top of that, one row rule: an attachment
+whose `message_id` names an internal note requires `MESSAGE_READ_INTERNAL`, and without
+it the attachment is a **404 indistinguishable from one that never existed**. The
+capability is not what stops a customer here — every role holds `ATTACHMENT_UPLOAD` and
+`ATTACHMENT_DOWNLOAD` — the row scope is.
+
+Downloads are streamed with the **detected** content type, a `Content-Length` from the
+stored size, `Content-Disposition: attachment` with the sanitized filename, and
+`X-Content-Type-Options: nosniff` — without which a browser may render a stored file as
+HTML in the API's own origin.
+
+## Audit log
+
+`GET /api/v1/audit-logs` reads back what §34 asks to be recorded: who did what, to which
+object, when, and from where. It is **admin-only**, ordered newest first with `id` as the
+tiebreak so the page boundary is stable, filterable by `action`, `actor_user_id`,
+`target_type`, `target_id`, and a half-open date range, and paginated like every other
+list.
+
+| Action | Written by |
+|---|---|
+| `USER_CREATED` | `POST /users`, and registration for the founding admin |
+| `USER_ROLE_UPDATED` | `PATCH /users/{id}` |
+| `USER_DEACTIVATED` | `POST /users/{id}/deactivate` |
+| `TICKET_CREATED` | `POST /tickets` |
+| `TICKET_ASSIGNED` | `POST /tickets/{id}/assign` |
+| `TICKET_PRIORITY_CHANGED` | `PATCH /tickets/{id}/priority` |
+| `TICKET_STATUS_CHANGED` | every lifecycle transition |
+| `TICKET_RESOLVED` | the transition *into* `RESOLVED` |
+| `TICKET_REOPENED` | `POST /tickets/{id}/reopen` |
+
+**Rows are written in the actor's own transaction.** The service never commits, so the
+audit row and the change it describes commit together or not at all — a trail that can
+disagree with the data it audits answers no compliance question (ADR-020). `before` and
+`after` values land in `extra_data` under those keys, mirroring `ticket_events`, so the
+two views of one change agree.
+
+**Registration is itself an audited action**, so a fresh organization's trail is never
+empty: it holds exactly one `user_created` row for its founding administrator. That is a
+deliberate consequence of auditing the endpoint rather than seeding the table, and it is
+what `tests/security/test_tenant_isolation.py` asserts a second organization cannot see.
+
+The repository exposes `add` and the list methods and nothing else, and `AuditLog` has no
+`updated_at` — so "an audit trail that can be edited answers no compliance question" is
+checkable rather than merely written down. Customer and message writes are deliberately
+*not* audited: `AuditAction` has no member for either and the enum is a PostgreSQL type,
+so adding one is a migration, and both are already fully attributable through
+`ticket_events`.
+
+## Search, filtering, and sorting
+
+§14's search lives on the two list routes rather than on new ones, so `GET /tickets`
+and `GET /customers` keep returning plain arrays.
+
+`q` on `/tickets` is one disjunction over four arms — subject and description as
+full-text, the ticket number read as text, message content, and the customer's name or
+email as a substring — **ANDed with the caller's row scope**. The direction matters: a
+search narrows and can never widen, and the version of this feature that matters is the
+one where `q` is a query parameter that grants access. `q` on `/customers` searches name
+and email only.
+
+A term is data, not a pattern: `%`, `_`, and `\` are escaped before they reach `LIKE`, so
+a customer searching `100%` finds the customer named `100% Cotton` rather than every
+customer in the organization. Full-text terms go through `websearch_to_tsquery` rather
+than `plainto_tsquery` because it cannot raise on malformed input and it understands
+quoted phrases, which is what a support agent types.
+
+`sort` and `order` are enums, so an unknown key is FastAPI's own `422` and the column map
+is one mypy can check for exhaustiveness. `/tickets` sorts by `created_at` (default),
+`updated_at`, `number`, or `priority`; `/customers` by `created_at` (default) or `name`.
+**`priority` sorts by the PostgreSQL enum's declaration order**, so `order=desc` puts
+`URGENT` first — correct, and not obvious enough to leave unstated. **`id` is always
+appended as the final sort key**: without a unique tiebreak, offset pagination over equal
+`created_at` values silently repeats and skips rows, which is a bug that only appears
+under load.
+
+`created_after` is **inclusive** and `created_before` is **exclusive**, so adjacent
+windows can be walked without a gap or a double count. The tri-state assignee filter
+arrives as two parameters — `assigned_agent_id=<uuid>` for one agent's tickets,
+`unassigned=true` for the queue with nobody on it, neither for no filter, and **both is a
+`422`** rather than a silent pick.
+
+### What the index measurement actually showed
+
+Phase D built `ix_tickets_fts` and no query used it for four phases; Phase N added
+`ix_messages_fts`, because message content was the one searched field with no index
+behind it. Whether those indexes are *used* is a measurement, not an assumption, and the
+measured answer is mixed in a way worth recording.
+
+Against a seeded organization (5,000 tickets, 20,000 messages, 20,000 customers) with
+`EXPLAIN (ANALYZE, BUFFERS)`:
+
+| Query | Plan | Time |
+|---|---|---|
+| ticket full-text arm alone | Bitmap Index Scan on **`ix_tickets_fts`** | 1.5 ms |
+| message full-text arm alone | Bitmap Index Scan on **`ix_messages_fts`** | 3.8 ms |
+| customer name `ILIKE` alone | **Seq Scan**, index declined | 19.4 ms |
+| the full `q` predicate, real term | Index Scan Backward on `ix_tickets_org_created_at`, filter | 42.8 ms |
+| the full `q` predicate, term matching nothing | same, **5,000 rows removed by filter** | 103.2 ms |
+| `sort=priority desc` | Seq Scan + top-N heapsort | 3.7 ms |
+| `sort=name desc` on customers | Seq Scan + top-N heapsort | 18.6 ms |
+
+Three findings came out of this, and none of them was papered over:
+
+- **The four-arm OR does not use either full-text index.** The planner estimates the
+  disjunction at roughly 75% of the tenant's rows — it has no selectivity function for
+  `@@` against a generic `tsquery`, and the two `EXISTS` arms are hashed subplans of
+  unknown selectivity — and at that estimate walking the tenant's `created_at` index in
+  sort order and filtering is the right call. It is fine at these sizes and it is
+  *linear in the tenant's ticket count*, which the typo row shows: a term matching
+  nothing still costs a full pass over the organization's tickets. The reachable fix is
+  to union the arms instead of OR-ing them, so each arm is index-driven and the result is
+  deduplicated — a real change to the query shape, deferred rather than smuggled in. The
+  individual arms do use their indexes, which is what makes the union plausible.
+- **`ix_customers_name_trgm` exists and works, and the planner declines it.** Forced
+  with `enable_seqscan = off` it runs in 3.1 ms against the seq scan's 18.6 ms, but the
+  planner's estimate is 928 versus 608 the other way. PostgreSQL's GIN cost model is
+  pessimistic here; the index will be chosen as the table grows, and nothing needs doing.
+- **`ix_customers_org_name` is not worth adding.** `sort=name` is 18.6 ms for 20,000
+  customers and the Sort node is 50 of the plan's 1,301 cost — the scan dominates, not
+  the sort, which is the stated condition for adding it. So the decision is *no index*,
+  made by measurement rather than by taste.
+
+`sort=priority` likewise has no index and does not need one: the existing
+`ix_tickets_org_status_priority` leads with `status`, and a query that does not filter by
+status cannot use its second column for ordering.
+
 ## Security posture
 
 Implemented in Phase C:
@@ -481,8 +648,8 @@ legitimate login from the same address is throttled alongside an attacker's.
 | E | Alembic migrations | ✅ |
 | F–H | Auth, RBAC, multi-tenancy + security tests | ✅ |
 | I–K | Customers, tickets, messages | ✅ |
-| L–N | Attachments, audit logging, search | next |
-| O–Q | Redis, Celery, SLA | |
+| L–N | Attachments, audit logging, search | ✅ |
+| O–Q | Redis, Celery, SLA | next |
 | R–S | WebSockets, analytics | |
 | T–W | AI foundation, analysis, summaries, drafts | |
 | X | Knowledge base and RAG | |
@@ -490,8 +657,8 @@ legitimate login from the same address is throttled alongside an attacker's.
 
 ## Known limitations
 
-- One migration exists: the baseline. There is no upgrade path *from* an older schema
-  yet, because the baseline is the first revision.
+- Two migrations exist: the baseline, and Phase N's message full-text index. The
+  baseline is still the first revision, so there is no upgrade path from an older schema.
 - The test suite builds its schema with `Base.metadata.create_all` rather than by
   applying migrations. That keeps tests fast, and the drift check in
   [tests/integration/test_migrations.py](backend/tests/integration/test_migrations.py)
@@ -520,10 +687,36 @@ legitimate login from the same address is throttled alongside an attacker's.
   the total, and `GET /tickets` has no `count()`. This matches `/users` and is the
   documented behaviour rather than an oversight — a total can be added later as a
   compatible change.
-- **`GET /tickets` filters; it does not search.** Status, priority, assignee, and
-  customer only. Keyword search over `ix_tickets_fts` is Phase N and is deliberately not
-  half-wired early, so the index goes unused for one more phase.
-- **No assignment notifications, no SLA, no attachments.** Phases L–N follow.
+- **Search over the four arms does not use the full-text indexes**, and degrades linearly
+  with an organization's ticket count — a term matching nothing costs a full pass over
+  that organization's tickets (103 ms for 5,000). The individual arms are index-driven and
+  the reachable fix is to union them rather than OR them, which is a change to the query
+  shape and is deliberately not smuggled in with the feature. The measurement is in
+  [the section above](#what-the-index-measurement-actually-showed).
+- **Attachment objects are orphaned when a ticket is deleted.** Rows are cascade-deleted
+  with the ticket, and nothing removes the objects from the bucket — deleting stored
+  objects needs a lifecycle policy or a sweeper, and neither belongs in a request. There
+  is also **no attachment delete route**: the permission matrix has no `ATTACHMENT_DELETE`
+  row, so none was invented.
+- **`attachments.message_id` is `SET NULL` when a message is deleted**, so an attachment
+  outlives the message it arrived with — and an attachment on an internal note would lose
+  its internal marking and become ticket-level. There is no message-delete route, so the
+  path is unreachable today; the day one is added is the day this needs revisiting. It is
+  a comment in the code rather than a silent gap.
+- **No virus scanning, no thumbnails, no OCR.** Files are validated for type and size and
+  stored; nothing inspects their contents beyond the leading signature.
+- **Message hits in search are not relevance-ranked.** The message arm is a boolean
+  predicate, so it decides which tickets match and not what order they come back in;
+  results are ordered by the `sort` parameter like any other list.
+- **Ticket and customer lists have no total count.** Pagination caps the page, not the
+  total. A total is a compatible addition later, and `GET /audit-logs` follows the same
+  convention.
+- **Audit rows are never written for customer or message writes.** `AuditAction` is a
+  PostgreSQL enum with no member for either, and both are already attributable through
+  `ticket_events`.
+- **The audit log is append-only by construction, not by privilege.** No route and no
+  repository method updates or deletes a row, and the model has no `updated_at` — but the
+  application's database role can still do both directly.
 - **Ticket creation serializes within a tenant.** One advisory lock per organization, so
   a support desk's write path holds the lock only for the length of one short
   transaction. The alternative — a retry loop on a unique-violation — was worse; see
@@ -531,7 +724,7 @@ legitimate login from the same address is throttled alongside an attacker's.
 - **A reopen discards the assignment**, so the ticket goes back on the queue rather than
   to whoever had it. That is a deliberate reading of `OPEN` as "nobody owns this", and
   the history is not lost: it is in `ticket_events`.
-- **The frontend has no screens for any of this.** Phases I–K were backend-only, like
-  F–H; the routes are exercised by 562 tests, and the SPA still shows the Phase C
-  scaffolding.
+- **The frontend has no screens for any of this.** Every phase since C has been
+  backend-only; the routes are exercised by 730 tests, and the SPA still shows the Phase
+  C scaffolding.
 

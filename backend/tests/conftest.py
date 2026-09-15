@@ -32,6 +32,17 @@ os.environ.setdefault(
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/1")
 os.environ.setdefault("JWT_SECRET", "test-secret-value-that-is-long-enough-32")
 
+# Object storage. `S3_ACCESS_KEY` and `S3_SECRET_KEY` have no defaults in `Settings` —
+# a missing secret must fail at startup rather than fall back — so without these the
+# whole suite would refuse to import on a machine with no `.env`, which is every CI
+# checkout. The values match the `minio` service in `docker-compose.yml`, so the
+# attachment tests talk to the same container the app does in development.
+os.environ.setdefault("S3_ENDPOINT", "http://localhost:9000")
+os.environ.setdefault("S3_ACCESS_KEY", "minioadmin")
+os.environ.setdefault("S3_SECRET_KEY", "minioadmin")
+os.environ.setdefault("S3_BUCKET", "supportflow-attachments")
+os.environ.setdefault("S3_REGION", "us-east-1")
+
 # The rate limiter is real and hits real Redis, but the whole suite logs in far more
 # often from the same address than any human would. Raising the ceilings here keeps
 # every other test off the limiter's path; `tests/unit/test_rate_limit.py` exercises

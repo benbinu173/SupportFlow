@@ -23,12 +23,13 @@ from app.core.exceptions import (
 )
 from app.core.permissions import PORTAL_ROLES
 from app.core.security import hash_password
-from app.core.tenancy import TenantContext
-from app.models.enums import UserRole
+from app.core.tenancy import RequestOrigin, TenantContext
+from app.models.enums import AuditAction, UserRole
 from app.models.user import User
 from app.repositories.customer_repository import CustomerRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.user import UserCreate, UserRoleUpdate
+from app.services import audit_service
 
 logger = structlog.get_logger(__name__)
 
@@ -48,7 +49,13 @@ async def get_user(session: AsyncSession, context: TenantContext, user_id: uuid.
     return user
 
 
-async def create_user(session: AsyncSession, context: TenantContext, payload: UserCreate) -> User:
+async def create_user(
+    session: AsyncSession,
+    context: TenantContext,
+    payload: UserCreate,
+    *,
+    origin: RequestOrigin | None = None,
+) -> User:
     """Add a user to the caller's organization.
 
     The new user's `organization_id` comes from `context` and from nowhere else. The
@@ -92,6 +99,21 @@ async def create_user(session: AsyncSession, context: TenantContext, payload: Us
         customer_id=payload.customer_id,
     )
     repository.add(user)
+    # Flushed, not committed, so the id exists for the audit row and both land in one
+    # transaction. §34 asks for `USER_CREATED`; a user that exists without it would be
+    # an account nobody can account for.
+    await session.flush()
+    audit_service.record_for(
+        session,
+        context,
+        AuditAction.USER_CREATED,
+        # The new user is the target; the caller is the actor. Two different rows, and
+        # conflating them would make "who created this account" unanswerable.
+        target_type="user",
+        target_id=user.id,
+        after={"role": payload.role.value, "email": payload.email},
+        origin=origin,
+    )
     await session.commit()
 
     logger.info(
@@ -109,6 +131,8 @@ async def update_role(
     context: TenantContext,
     user_id: uuid.UUID,
     payload: UserRoleUpdate,
+    *,
+    origin: RequestOrigin | None = None,
 ) -> User:
     """Change a user's role.
 
@@ -125,7 +149,26 @@ async def update_role(
     if user.role is UserRole.ADMIN and payload.role is not UserRole.ADMIN:
         await _require_another_admin(repository, user, action="change this user's role")
 
+    previous = user.role
+    # A no-op role change writes no audit row. §34 records *actions*, and an entry
+    # saying a role changed from admin to admin records an event that did not happen —
+    # which is worse than a gap, because it is wrong rather than absent.
+    if previous is payload.role:
+        return user
+
     user.role = payload.role
+    audit_service.record_for(
+        session,
+        context,
+        AuditAction.USER_ROLE_UPDATED,
+        target_type="user",
+        target_id=user.id,
+        # Both ends, per §34's "before/after values where appropriate". This is the one
+        # action where the pair is the whole point of the record.
+        before={"role": previous.value},
+        after={"role": payload.role.value},
+        origin=origin,
+    )
     await session.commit()
 
     logger.info(
@@ -139,7 +182,11 @@ async def update_role(
 
 
 async def deactivate_user(
-    session: AsyncSession, context: TenantContext, user_id: uuid.UUID
+    session: AsyncSession,
+    context: TenantContext,
+    user_id: uuid.UUID,
+    *,
+    origin: RequestOrigin | None = None,
 ) -> User:
     """Deactivate a user.
 
@@ -164,6 +211,16 @@ async def deactivate_user(
         await _require_another_admin(repository, user, action="deactivate this user")
 
     user.is_active = False
+    audit_service.record_for(
+        session,
+        context,
+        AuditAction.USER_DEACTIVATED,
+        target_type="user",
+        target_id=user.id,
+        before={"is_active": True},
+        after={"is_active": False},
+        origin=origin,
+    )
     await session.commit()
 
     logger.info(

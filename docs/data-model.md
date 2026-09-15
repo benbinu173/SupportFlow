@@ -399,6 +399,26 @@ queues. Each targets a small, hot subset of a table whose majority is cold
 (resolved tickets, read notifications, completed jobs). Excluding those rows keeps the
 index small enough to stay resident.
 
+### Attachments have no scope of their own
+
+`attachments` carries `organization_id` like every tenant table, but no `customer_id` and
+no `assigned_agent_id` — so `row_scope_predicate` has no columns to take for it. Its
+owner is reached through its ticket, and every attachment route resolves the ticket first
+through the same `require_visible_ticket` the ticket routes use. `AttachmentRepository` is
+therefore deliberately not row-scoped, exactly as `MessageRepository` is not.
+
+On top of that, one row rule: **an attachment whose `message_id` names an internal note
+requires `MESSAGE_READ_INTERNAL`.** Without it the attachment is a 404, indistinguishable
+from one that does not exist. This is ADR-013's predicted divergence arriving as a *row*
+rule rather than the role split it expected — `ATTACHMENT_SCOPE_BY_ROLE` is still
+character for character `TICKET_SCOPE_BY_ROLE`, because `docs/requirements.md` §3's matrix
+says the same four role qualifiers for both. See ADR-019.
+
+`storage_key` is server-generated as `{organization_id}/{ticket_id}/{uuid4().hex}`; the
+client's `filename` is for display only, with its directory stripped. Traversal is
+prevented by the shape of the key rather than by sanitizing a client string, which is a
+property no future caller can erode by forgetting a filter. See ADR-018.
+
 ---
 
 ## 4. Constraints that encode business rules
@@ -450,7 +470,7 @@ stored `null` read back as `None` either way, so nothing in Python could have no
 | A user | `SET NULL` on tickets, messages, events, audit logs | Deactivating an agent must not delete their ticket history |
 | A customer | `SET NULL` on `users.customer_id` | Removing a contact must not delete the login |
 | A ticket | `SET NULL` on `ai_usage.ticket_id` | Spend that vanishes when a ticket is deleted cannot be reconciled |
-| A message | `SET NULL` on `attachments.message_id` | An attachment outlives the message it arrived with |
+| A message | `SET NULL` on `attachments.message_id` | An attachment outlives the message it arrived with — and a file on an internal note would lose its internal marking and become ticket-level. No message-delete route exists, so the path is unreachable; ADR-019 names it as a thing to revisit the day one is added |
 
 The rule: cascades follow *composition* (the child has no meaning alone), and
 `SET NULL` follows *attribution* (the record must survive its actor).
@@ -502,12 +522,14 @@ more machinery than the problem deserves, because a failed statement aborts the 
 transaction and so a retry needs a `SAVEPOINT`, an attempt limit, and a test for the
 exhaustion path. See ADR-016.
 
-**The schema is produced by a migration.** `backend/alembic/versions/` holds a single
-baseline revision that creates every table, enum type, index, and constraint described
-above. The test suite builds its schema from metadata instead, for speed; the drift
-check in `tests/integration/test_migrations.py` asserts that metadata autogenerates to
-an empty diff against a migrated database, which is what keeps the two honest. See
-ADR-012 and the migration commands in the [README](../README.md).
+**The schema is produced by a migration.** `backend/alembic/versions/` holds a baseline
+revision that creates every table, enum type, index, and constraint described above, and
+one later revision (Phase N) that adds `ix_messages_fts`. The baseline is still the first
+revision, so there is no upgrade path from a schema older than it. The test suite builds
+its schema from metadata instead, for speed; the drift check in
+`tests/integration/test_migrations.py` asserts that metadata autogenerates to an empty
+diff against a migrated database, which is what keeps the two honest. See ADR-012 and the
+migration commands in the [README](../README.md).
 
 **One model declaration is written in PostgreSQL's own words.** `ix_tickets_fts` is an
 expression index, and the catalog normalises its expression — the config literal
@@ -515,6 +537,25 @@ becomes a `regconfig` cast and the operands gain `::text`. Autogenerate compares
 expressions as text, so the model matches the stored form verbatim. Left in its
 natural spelling, every later `alembic revision --autogenerate` would emit a
 drop-and-recreate of this index.
+
+**Phase N made that spelling shared rather than merely correct.** Each expression now
+lives in a module-level constant — `TICKET_FTS_EXPRESSION` in `app/models/ticket.py` and
+`MESSAGE_FTS_EXPRESSION` in `app/models/message.py` — read by both the `Index(...)` and
+`app/repositories/search.py`, which is the only place a search term becomes SQL. An
+expression index is matched to a query by the expression as text, so a query that
+spelled it slightly differently would silently sequential-scan: no error, no wrong rows,
+just a plan nobody looks at. Sharing the constant makes that divergence unrepresentable,
+and `tests/unit/test_model_indexes.py` asserts the query's text contains the index's
+expression character for character. The migration that adds `ix_messages_fts` imports the
+constant rather than restating it, which is a deliberate departure from how the baseline
+writes `ix_tickets_fts` — the baseline had to restate it because the model was corrected
+after autogenerate had already run.
+
+`ix_messages_fts` is a GIN index over `to_tsvector('english'::regconfig, body)`. It
+arrived in Phase N because message content is one of §14's search fields and was the only
+one with nothing behind it. What it is actually used by is a measurement, not an
+assumption, and the answer is mixed: the message arm alone uses it, and the four-arm `q`
+predicate does not. ADR-021 has the plans and the numbers.
 
 **Ticket transitions** are defined alongside the enums (`TICKET_TRANSITIONS`,
 `can_transition`) so the rule has one source of truth shared by the service layer and

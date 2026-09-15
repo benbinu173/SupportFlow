@@ -10,11 +10,34 @@ edge, and would make "which capability did this request need?" depend on its bod
 
 import uuid
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.enums import Sentiment, TicketEventType, TicketPriority, TicketStatus
+
+
+class TicketSortKey(StrEnum):
+    """The columns a ticket list may be ordered by.
+
+    An enum rather than a free string for two reasons. A typo is a 422 with a list of
+    the accepted values, instead of a query that silently falls back to the default and
+    a client that concludes its sort is unsupported. And the repository's column map is
+    keyed by this type, so mypy's exhaustiveness checking - not a reviewer's attention -
+    is what notices a member added here with no column behind it.
+
+    `CREATED_AT` is the default, and the direction of every key is chosen by `order`
+    rather than being fixed per key. `PRIORITY` is worth a word: it sorts by the
+    PostgreSQL enum's declaration order, which is `LOW < MEDIUM < HIGH < URGENT`, so
+    `order=desc` puts `URGENT` first. That is correct and it is not obvious, which is
+    why it is stated here and again on the route.
+    """
+
+    CREATED_AT = "created_at"
+    UPDATED_AT = "updated_at"
+    NUMBER = "number"
+    PRIORITY = "priority"
 
 
 class TicketRead(BaseModel):

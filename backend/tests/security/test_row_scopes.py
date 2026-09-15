@@ -40,7 +40,7 @@ from app.models.organization import Organization
 from app.models.ticket import Ticket
 from app.models.user import User
 from app.repositories.ticket_repository import TicketRepository
-from tests.conftest import TICKETS, OrgSession
+from tests.conftest import API, TICKETS, OrgSession
 
 pytestmark = pytest.mark.security
 
@@ -557,3 +557,176 @@ def test_a_refused_action_leaves_the_ticket_alone(
         f"{TICKETS}/{ada_ticket['id']}/status", json={"status": "in_progress"}
     )
     assert allowed.status_code == 200, allowed.text
+
+
+# ---------------------------------------------------------------------------
+# Attachments — the row scope, plus the one rule an attachment adds
+# ---------------------------------------------------------------------------
+# An attachment carries no `customer_id` and no `assigned_agent_id` of its own, so
+# `row_scope_predicate` has no columns to take and the repository is not row-scoped.
+# Its owner is its ticket, and every attachment route resolves the ticket first — which
+# is why the claims below are about *two* things at once: that the scope is still
+# applied, and that it is applied through the ticket rather than skipped.
+
+PNG_BODY = b"\x89PNG\r\n\x1a\n" + b"scoped bytes"
+
+# The download route, which lives under `/attachments` rather than `/tickets`: a
+# download has only an id to go on, so it cannot be addressed through its ticket.
+ATTACHMENTS = f"{API}/attachments"
+
+
+def _upload(session: OrgSession, ticket_id: str, *, message_id: str | None = None) -> str:
+    """Attach a PNG and return its id, asserting the upload was allowed."""
+    response = session.post(
+        f"{TICKETS}/{ticket_id}/attachments",
+        files={"file": ("evidence.png", PNG_BODY, "image/png")},
+        data={"message_id": message_id} if message_id else None,
+    )
+    assert response.status_code == 201, response.text
+    return str(response.json()["id"])
+
+
+def _listed(session: OrgSession, ticket_id: str) -> set[str]:
+    """The attachment ids a session can see on a ticket."""
+    response = session.get(f"{TICKETS}/{ticket_id}/attachments")
+    assert response.status_code == 200, response.text
+    return {row["id"] for row in response.json()}
+
+
+@pytest.fixture
+def attachments(scoped_org: dict[str, Any]) -> dict[str, str]:
+    """One ticket-level file and one on an internal note, both on Ada's ticket.
+
+    Both go up as the admin, because the point of this fixture is who may read them
+    *back* — the uploader is not the interesting variable. The note is the admin's, so
+    the fixture runs before any agent is in the picture.
+    """
+    admin = scoped_org["admin"]
+    ada_ticket = scoped_org["tickets"]["ada"]["id"]
+
+    note = admin.post(f"{TICKETS}/{ada_ticket}/notes", json={"body": "Skinner knows"}).json()
+
+    return {
+        "ticket_id": ada_ticket,
+        "public": _upload(admin, ada_ticket),
+        "internal": _upload(admin, ada_ticket, message_id=note["id"]),
+    }
+
+
+def test_an_agent_cannot_download_a_colleague_s_ticket_s_file(
+    scoped_org: dict[str, Any], attachments: dict[str, str]
+) -> None:
+    """The row is in the tenant; the file is not.
+
+    Quinn is an agent — so they hold `ATTACHMENT_DOWNLOAD` and the capability is not
+    what refuses them. The ticket's row scope is, which is why the answer is the same
+    404 a genuinely absent attachment gets rather than a 403.
+    """
+    idle = scoped_org["idle_agent"]
+
+    for attachment_id in (attachments["public"], attachments["internal"]):
+        response = idle.get(f"{ATTACHMENTS}/{attachment_id}")
+        assert response.status_code == 404, response.text
+        assert response.json()["error"]["code"] == "ATTACHMENT_NOT_FOUND"
+
+
+def test_an_agent_cannot_list_a_colleague_s_ticket_s_files(
+    scoped_org: dict[str, Any], attachments: dict[str, str]
+) -> None:
+    """404 rather than an empty list: "not your ticket" and "no files here" are
+    different facts, and an empty list would report the second."""
+    response = scoped_org["idle_agent"].get(f"{TICKETS}/{attachments['ticket_id']}/attachments")
+
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "TICKET_NOT_FOUND"
+
+
+def test_the_assigned_agent_sees_both_files(
+    scoped_org: dict[str, Any], attachments: dict[str, str]
+) -> None:
+    """The positive control for the two refusals above.
+
+    Without this, both would pass against a repository that returned nothing to anyone —
+    which is why every scope test in this file has its mirror.
+    """
+    agent = scoped_org["agent"]
+
+    assert _listed(agent, attachments["ticket_id"]) == {
+        attachments["public"],
+        attachments["internal"],
+    }
+    assert agent.get(f"{ATTACHMENTS}/{attachments['public']}").status_code == 200
+    assert agent.get(f"{ATTACHMENTS}/{attachments['internal']}").status_code == 200
+
+
+def test_a_customer_cannot_read_another_customer_s_file(
+    scoped_org: dict[str, Any], attachments: dict[str, str]
+) -> None:
+    """Grace's portal account against Ada's ticket.
+
+    `RowScope.OWN`, resolved through the user's customer link — the same mechanism every
+    other Ada-owned resource uses.
+    """
+    grace = scoped_org["grace_portal"]
+
+    assert grace.get(f"{TICKETS}/{attachments['ticket_id']}/attachments").status_code == 404
+    assert grace.get(f"{ATTACHMENTS}/{attachments['public']}").status_code == 404
+
+
+def test_a_customer_cannot_reach_a_file_on_an_internal_note(
+    scoped_org: dict[str, Any], attachments: dict[str, str]
+) -> None:
+    """The divergence ADR-013 predicted, and the reason it is a row rule.
+
+    Ada owns the ticket, holds `ATTACHMENT_DOWNLOAD`, and can reach every route below.
+    Nothing in §3's matrix stops her at a file attached to a note she cannot read —
+    which is why the rule is resolved through the message rather than through the role.
+    """
+    ada = scoped_org["ada_portal"]
+
+    # Absent from the list rather than listed and refused on download: a metadata row
+    # naming a file she cannot open is itself a hint about a private conversation.
+    assert _listed(ada, attachments["ticket_id"]) == {attachments["public"]}
+
+    refused = ada.get(f"{ATTACHMENTS}/{attachments['internal']}")
+    missing = ada.get(f"{ATTACHMENTS}/{uuid.uuid4()}")
+
+    assert refused.status_code == 404, refused.text
+    assert refused.content == missing.content, "indistinguishable from an id that never existed"
+
+
+def test_the_customer_does_see_their_own_ticket_level_file(
+    scoped_org: dict[str, Any], attachments: dict[str, str]
+) -> None:
+    """The other half of the previous test, and the one that keeps it honest.
+
+    A file attached to the *ticket* was sent to the ticket's audience. Hiding it from
+    Ada would be a different bug, and a test that only asserted the internal file was
+    hidden would not notice it.
+    """
+    ada = scoped_org["ada_portal"]
+
+    response = ada.get(f"{ATTACHMENTS}/{attachments['public']}")
+
+    assert response.status_code == 200, response.text
+    assert response.content == PNG_BODY
+
+
+def test_a_refused_attachment_read_leaves_storage_alone(
+    scoped_org: dict[str, Any], attachments: dict[str, str]
+) -> None:
+    """The refusal happens before the object is fetched.
+
+    Checked by the shape of the answer rather than by instrumenting storage: a 404 whose
+    body matches a genuinely absent id is one that was produced by the authorization
+    path, not by a failed fetch. A route that streamed first and refused afterwards
+    would have to have read the bytes to have answered at all.
+    """
+    idle = scoped_org["idle_agent"]
+
+    refused = idle.get(f"{ATTACHMENTS}/{attachments['public']}")
+    missing = idle.get(f"{ATTACHMENTS}/{uuid.uuid4()}")
+
+    assert refused.status_code == 404
+    assert refused.content == missing.content
+    assert refused.headers.get("content-disposition") is None

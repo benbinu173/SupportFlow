@@ -184,12 +184,13 @@ def test_there_are_routes_to_check(api: FastAPI) -> None:
     The floor is a **lower bound, not a count**: it exists to catch a walk that has
     stopped finding things, so it is set below the real total and only raised when a
     phase adds a whole resource. Phases I-K took the surface from 12 to 28 by mounting
-    the customers, tickets, and messages routers, and this is what fails if one of those
-    `include_router` calls is ever dropped — the capability map below names the routes
+    the customers, tickets, and messages routers, and Phases L-M took it to 32 by
+    mounting attachments and audit — and this is what fails if one of those
+    `include_router` calls is ever dropped. The capability map below names the routes
     themselves, so a quietly missing router would otherwise only show up as an absent
     line in a dict.
     """
-    assert len(_entries(api)) >= 24
+    assert len(_entries(api)) >= 28
 
 
 def test_the_walk_finds_every_documented_route(api: FastAPI) -> None:
@@ -471,4 +472,21 @@ def test_every_route_declares_the_capability_the_matrix_assigns(api: FastAPI) ->
         ("GET", "/api/v1/tickets/{ticket_id}/messages"): {Permission.MESSAGE_READ_PUBLIC},
         ("POST", "/api/v1/tickets/{ticket_id}/messages"): {Permission.MESSAGE_POST_REPLY},
         ("POST", "/api/v1/tickets/{ticket_id}/notes"): {Permission.MESSAGE_POST_INTERNAL},
+        # --- Attachments --------------------------------------------------
+        # Listing takes `ATTACHMENT_DOWNLOAD` rather than a capability of its own: §3's
+        # matrix has no "list attachments" row, and a metadata list is only useful to
+        # someone who may fetch the file. Same reasoning as `/customers/{id}` →
+        # `CUSTOMER_LIST`.
+        #
+        # The download is at `/attachments/{id}` rather than under `/tickets`, because a
+        # download has only an id to go on. It is scoped just as the list is — both
+        # resolve the ticket underneath before returning anything.
+        ("POST", "/api/v1/tickets/{ticket_id}/attachments"): {Permission.ATTACHMENT_UPLOAD},
+        ("GET", "/api/v1/tickets/{ticket_id}/attachments"): {Permission.ATTACHMENT_DOWNLOAD},
+        ("GET", "/api/v1/attachments/{attachment_id}"): {Permission.ATTACHMENT_DOWNLOAD},
+        # --- Audit --------------------------------------------------------
+        # One route, admin-only via §3 row 87. There is no write route because an audit
+        # trail a client can write is not an audit trail; every row is written from
+        # inside the transaction of the action it describes.
+        ("GET", "/api/v1/audit-logs"): {Permission.AUDIT_VIEW},
     }

@@ -38,6 +38,27 @@ if TYPE_CHECKING:
     from app.models.user import User
 
 
+# The full-text index expression for a ticket's searchable text, in the exact form
+# PostgreSQL stores it. `ix_tickets_fts` indexes this string and
+# `app/repositories/search.py` queries with it, so the query and the index are the same
+# string by construction rather than by a comment asking them to agree.
+#
+# Every character here is load-bearing:
+#
+# * `'english'::regconfig` — the config cast is what the catalog records. A bare
+#   `'english'` is a different parse tree.
+# * `subject::text` and `' '::text` — `subject` and `description` are `varchar`, so the
+#   casts are what the catalog records too. The parenthesisation is the concatenation's,
+#   not a style choice.
+#
+# The prettier `to_tsvector('english', subject || ' ' || description)` is the form a
+# human writes and the form that silently loses the index. `EXPLAIN` is what proves this
+# one keeps it — see the README's search section.
+TICKET_FTS_EXPRESSION = (
+    "to_tsvector('english'::regconfig, (subject::text || ' '::text) || description)"
+)
+
+
 class Ticket(UUIDPrimaryKeyMixin, OrganizationScopedMixin, TimestampMixin, Base):
     """A support request.
 
@@ -98,9 +119,13 @@ class Ticket(UUIDPrimaryKeyMixin, OrganizationScopedMixin, TimestampMixin, Base)
         # text, so a model that disagrees with the catalog produces a spurious
         # drop-and-recreate of this index in every future migration. `alembic check`
         # caught exactly that — see the drift check in the test suite.
+        #
+        # Phase N moved the string to `TICKET_FTS_EXPRESSION` above, because from that
+        # phase on a *query* has to match it too. The comment's warning still applies;
+        # what changed is that the two sides now share one constant.
         Index(
             "ix_tickets_fts",
-            text("to_tsvector('english'::regconfig, (subject::text || ' '::text) || description)"),
+            text(TICKET_FTS_EXPRESSION),
             postgresql_using="gin",
         ),
         # --- Invariants --------------------------------------------------------

@@ -21,6 +21,8 @@ from app.core.config import get_settings
 from app.core.database import dispose_engine
 from app.core.exceptions import AppError, ErrorCode, error_body
 from app.core.rate_limit import close_client as close_rate_limit_client
+from app.core.storage import ensure_bucket
+from app.core.storage import reset_client as reset_storage_client
 
 logger = structlog.get_logger(__name__)
 
@@ -33,10 +35,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     use, so there is nothing to open here. Closing them is not optional: pooled
     connections outlive the process otherwise, and linger server-side until the
     database or Redis times them out.
+
+    The one thing that *is* opened here is the object-storage bucket, because unlike a
+    connection pool there is no useful moment to create it later — and because a
+    deployment whose bucket does not exist should learn that at startup rather than from
+    the first user who tries to attach a screenshot. `ensure_bucket` reports a failure
+    instead of raising one, so MinIO being down degrades attachments and nothing else.
     """
+    await ensure_bucket()
     yield
     await close_rate_limit_client()
     await dispose_engine()
+    reset_storage_client()
 
 
 # ---------------------------------------------------------------------------

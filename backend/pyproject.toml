@@ -17,6 +17,7 @@ dependencies = [
     "pgvector==0.5.0",
     "redis==8.1.0",
     "celery==5.6.3",
+    "boto3==1.43.93",             # S3-compatible object storage for attachments
     "pyjwt[crypto]==2.13.0",       # ADR-002
     "pwdlib[argon2]==0.3.1",       # ADR-001
     "email-validator==2.3.0",      # required by pydantic.EmailStr
@@ -47,7 +48,7 @@ include = ["app*"]
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-src = ["app", "tests"]
+src = ["app", "scripts", "tests"]
 
 [tool.ruff.lint]
 select = [
@@ -80,6 +81,9 @@ known-first-party = ["app", "tests"]
 "tests/**" = ["S101", "S105", "S106"]
 # Alembic generates its own style.
 "alembic/**" = ["E501", "I001"]
+# Operator scripts report to a person rather than a log, so they print and assert, and
+# they carry a throwaway account password the same way the tests do.
+"scripts/**" = ["S101", "S105", "S106"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -96,6 +100,17 @@ plugins = ["pydantic.mypy"]
 [[tool.mypy.overrides]]
 module = ["tests.*"]
 disallow_untyped_defs = false
+
+# boto3 and botocore ship no `py.typed` marker, so strict mode refuses to analyse them.
+# The alternative is `boto3-stubs[s3]`, which pins its own boto3 version and drags in
+# `mypy-boto3-s3` and `botocore-stubs` for the four S3 calls this project makes — a
+# larger and more brittle dependency than the thing it types. `app/core/storage.py` is
+# the only module that imports either, and it is a thin translation layer over them:
+# every call is wrapped, every failure becomes a domain error, and the untyped objects
+# never escape it.
+[[tool.mypy.overrides]]
+module = ["boto3.*", "botocore.*"]
+ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------
 # pytest

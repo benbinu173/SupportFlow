@@ -17,6 +17,17 @@ if TYPE_CHECKING:
     from app.models.user import User
 
 
+# The full-text index expression for a message body, in the exact form PostgreSQL stores
+# it. `ix_messages_fts` indexes this string and `app/repositories/search.py` queries with
+# it, so the two are the same string by construction rather than by discipline.
+#
+# `body` is `Text`, so no cast is needed — the tickets expression needs casts only
+# because `subject` and `description` are `varchar`. The config is written as a
+# `regconfig` cast rather than as a bare literal because that is what the catalog
+# records, and a query that omits the cast does not match the index.
+MESSAGE_FTS_EXPRESSION = "to_tsvector('english'::regconfig, body)"
+
+
 class Message(UUIDPrimaryKeyMixin, OrganizationScopedMixin, TimestampMixin, Base):
     """A message on a ticket.
 
@@ -37,6 +48,21 @@ class Message(UUIDPrimaryKeyMixin, OrganizationScopedMixin, TimestampMixin, Base
             "ticket_id",
             "created_at",
             postgresql_where=text("is_internal = false"),
+        ),
+        # Message content, for spec §14's search. Added in Phase N, which is the first
+        # phase that searches a message body — `escape_like` and the FTS expression now
+        # live together in `app/repositories/search.py`.
+        #
+        # Written in the form PostgreSQL stores, for the reason `ix_tickets_fts` records
+        # at length: an expression index is matched against a query by the *expression*,
+        # and a query that spells it more prettily silently loses the index. The string
+        # is `MESSAGE_FTS_EXPRESSION` below, which the query imports rather than
+        # restating — the drift that comment warns about is prevented here by the two
+        # sides sharing one constant instead of by a comment asking them not to diverge.
+        Index(
+            "ix_messages_fts",
+            text(MESSAGE_FTS_EXPRESSION),
+            postgresql_using="gin",
         ),
         # An internal note is staff-only by definition, so it can never be authored
         # by a customer. Enforced here because the consequence of getting it wrong

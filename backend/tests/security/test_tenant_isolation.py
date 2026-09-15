@@ -12,6 +12,7 @@ an id that never existed, and that is the only answer that discloses nothing.
 These tests are marked `security`, so `make security` runs this suite on its own.
 """
 
+import json
 import uuid
 from collections.abc import Callable
 
@@ -20,9 +21,15 @@ from httpx import Response
 
 from app.core.security import create_access_token
 from app.models.enums import UserRole
-from tests.conftest import AUTH, CUSTOMERS, PASSWORD, TICKETS, USERS, OrgSession, login
+from tests.conftest import API, AUTH, CUSTOMERS, PASSWORD, TICKETS, USERS, OrgSession, login
 
 pytestmark = pytest.mark.security
+
+# The two routes with no ticket in their path. `/audit-logs` is addressed by nothing at
+# all — its tenancy *is* its scoping — and `/attachments/{id}` is addressed by an id that
+# only the owning tenant can resolve.
+ATTACHMENTS = f"{API}/attachments"
+AUDIT = f"{API}/audit-logs"
 
 
 @pytest.fixture(autouse=True)
@@ -805,6 +812,252 @@ def test_a_token_naming_another_organization_cannot_reach_the_new_routes(
     headers = {"Authorization": f"Bearer {forged}"}
 
     for path in (CUSTOMERS, TICKETS, f"{TICKETS}/{ticket['id']}/messages"):
+        response = northwind.client.get(path, headers=headers)
+        assert response.status_code == 403, f"{path} was reachable: {response.text}"
+        assert response.json()["error"]["code"] == "TENANT_ACCESS_DENIED"
+
+
+# ---------------------------------------------------------------------------
+# Attachments and the audit trail
+# ---------------------------------------------------------------------------
+# Phases L-M added the two resources whose tenancy is least obvious, because neither
+# carries an `organization_id` a client could be asked about: an attachment is reached
+# through its ticket, and an audit row is reached through nothing at all — it is served
+# by a tenant-scoped query and by that query alone. Both are checked here for the same
+# reason every resource above is: a new table is a new place for the filter to be
+# forgotten on one query, and the route that was missed is never the one that got tested.
+
+# The signature is all the validator reads, so a real PNG header plus filler is a file
+# the upload accepts without this file needing a binary fixture on disk.
+PNG_BODY = b"\x89PNG\r\n\x1a\n" + b"northwind bytes"
+TEXT_BODY = b"2026-09-15 ERROR the observatory is offline\n"
+
+NORTHWIND_FILENAME = "northwind-private-sighting.png"
+
+
+@pytest.fixture
+def northwind_files(tenant_records: dict[str, object]) -> dict[str, object]:
+    """Northwind's ticket with two files on it: one at ticket level, one on a note.
+
+    Both are uploaded by Northwind's own agent — the ticket is assigned to them, so the
+    upload passes the ticket's row scope as well as the tenant filter — which makes the
+    refusal asserted below a genuine cross-tenant one rather than a role check wearing a
+    tenant check's clothes.
+
+    Two files rather than one because the *reachability* of an attachment in another
+    organization is resolved through its ticket, and an internal note is the case where
+    that resolution is least direct. If the tenant filter held for the ticket-level file
+    and not for the note's, one file would not have shown it.
+    """
+    northwind = tenant_records["northwind"]
+    ticket = tenant_records["ticket"]
+    agent = tenant_records["agent"]
+    assert isinstance(northwind, OrgSession)
+    assert isinstance(ticket, dict)
+    assert isinstance(agent, OrgSession)
+
+    upload_path = f"{TICKETS}/{ticket['id']}/attachments"
+    ticket_level = agent.post(
+        upload_path,
+        files={"file": (NORTHWIND_FILENAME, PNG_BODY, "image/png")},
+    )
+    assert ticket_level.status_code == 201, ticket_level.text
+
+    note = agent.post(f"{TICKETS}/{ticket['id']}/notes", json={"body": "Skinner knows"})
+    assert note.status_code == 201, note.text
+    on_note = agent.post(
+        upload_path,
+        files={"file": ("northwind-debrief.txt", TEXT_BODY, "text/plain")},
+        data={"message_id": note.json()["id"]},
+    )
+    assert on_note.status_code == 201, on_note.text
+
+    return {
+        **tenant_records,
+        "ticket_level": ticket_level.json()["id"],
+        "on_note": on_note.json()["id"],
+    }
+
+
+def test_an_organization_cannot_download_another_s_attachment(
+    northwind_files: dict[str, object],
+) -> None:
+    """The download route takes an attachment id and nothing else, so the tenant filter
+    on that lookup is the whole of its tenancy.
+
+    A presigned URL would have made this untestable — the id in the URL *is* the
+    authorization — which is the practical reason §33's "do not expose private files
+    without authorization" is honoured by proxying.
+    """
+    southwind = northwind_files["southwind"]
+    assert isinstance(southwind, OrgSession)
+
+    for name in ("ticket_level", "on_note"):
+        attachment_id = northwind_files[name]
+        assert isinstance(attachment_id, str)
+
+        cross_tenant = southwind.get(f"{ATTACHMENTS}/{attachment_id}")
+        never_existed = southwind.get(f"{ATTACHMENTS}/{uuid.uuid4()}")
+
+        assert cross_tenant.status_code == 404, cross_tenant.text
+        assert cross_tenant.json()["error"]["code"] == "ATTACHMENT_NOT_FOUND"
+        assert_indistinguishable_from_a_missing_record(cross_tenant, never_existed)
+        # Not the stored bytes, and not the name either — the filename is the tenant's
+        # own text, and a refusal that echoed it would disclose what the file was called.
+        assert NORTHWIND_FILENAME not in cross_tenant.text
+        assert cross_tenant.content != PNG_BODY
+
+
+def test_an_organization_cannot_list_another_s_attachments(
+    northwind_files: dict[str, object],
+) -> None:
+    """The list route resolves the ticket first, so its refusal is the ticket's — the
+    same 404 every other ticket route gives, reached before any attachment is queried."""
+    southwind = northwind_files["southwind"]
+    ticket = northwind_files["ticket"]
+    assert isinstance(southwind, OrgSession)
+    assert isinstance(ticket, dict)
+
+    response = southwind.get(f"{TICKETS}/{ticket['id']}/attachments")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "TICKET_NOT_FOUND"
+    assert NORTHWIND_FILENAME not in response.text
+
+
+def test_an_organization_cannot_upload_onto_another_s_ticket(
+    northwind_files: dict[str, object],
+) -> None:
+    """The write half, which is the one a URL-based design would not have had to check.
+
+    A tenant filter that only narrowed reads would let Southwind store an object under
+    Northwind's key prefix and leave a row pointing at it — the file would be invisible
+    and the row would never be written, but the *bucket* would be a shared namespace
+    between tenants. Asserted on both sides: the refusal, and the fact that Northwind's
+    list is still the two files it uploaded.
+    """
+    northwind = northwind_files["northwind"]
+    southwind = northwind_files["southwind"]
+    ticket = northwind_files["ticket"]
+    assert isinstance(northwind, OrgSession)
+    assert isinstance(southwind, OrgSession)
+    assert isinstance(ticket, dict)
+
+    response = southwind.post(
+        f"{TICKETS}/{ticket['id']}/attachments",
+        files={"file": ("planted.png", PNG_BODY, "image/png")},
+    )
+
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "TICKET_NOT_FOUND"
+
+    listed = northwind.get(f"{TICKETS}/{ticket['id']}/attachments").json()
+    assert "planted.png" not in {attachment["filename"] for attachment in listed}
+
+
+def test_a_tenant_s_audit_trail_contains_only_its_own_rows(
+    northwind_files: dict[str, object],
+) -> None:
+    """The viewer is the one route with no id in it, so tenancy is the whole of its
+    scoping — there is no row for a filter to be forgotten on, only the query itself.
+
+    **A fresh organization's trail is not empty, and that is by design**: registration is
+    itself an audited action, which is what the founding `USER_CREATED` row records. So
+    the claim cannot be "Southwind sees nothing" — Southwind sees exactly its own
+    registration and nothing else, and the distinction between those two is the whole of
+    this test. Asserting emptiness would have passed against a route that returned `[]`
+    for everyone, including Northwind's admin.
+    """
+    northwind = northwind_files["northwind"]
+    southwind = northwind_files["southwind"]
+    assert isinstance(northwind, OrgSession)
+    assert isinstance(southwind, OrgSession)
+
+    northwind_rows = northwind.get(AUDIT, params={"limit": 100}).json()
+    southwind_rows = southwind.get(AUDIT, params={"limit": 100}).json()
+
+    assert len(northwind_rows) > 1, "Northwind acted, so its trail is more than its own signup"
+    assert [row["action"] for row in southwind_rows] == ["user_created"], (
+        "Southwind has done nothing but register, and registering is one row"
+    )
+    assert southwind_rows[0]["actor_user_id"] == southwind.user_id
+
+    # The claim, stated as the intersection it is: no id in one trail appears in the
+    # other, and no field of Northwind's rows survives into Southwind's response.
+    assert not {row["id"] for row in northwind_rows} & {row["id"] for row in southwind_rows}
+    assert northwind.email not in json.dumps(southwind_rows)
+
+
+def test_an_organization_cannot_reach_another_s_audit_rows_by_filter(
+    northwind_files: dict[str, object],
+) -> None:
+    """A filter narrows the tenant's own rows; it can never reach past them.
+
+    Every parameter is pointed at a real Northwind row, and each result is asserted to be
+    a **subset of the same caller's unfiltered trail** rather than the empty list. The
+    subset claim is the stronger one and it is the only correct one for the third
+    parameter: a *timestamp* is not tenant data, so a boundary taken from Northwind's
+    oldest row also admits Southwind's own registration — which is Southwind's row to
+    see, and asserting it away would be asserting a bug.
+    """
+    northwind = northwind_files["northwind"]
+    southwind = northwind_files["southwind"]
+    ticket = northwind_files["ticket"]
+    assert isinstance(northwind, OrgSession)
+    assert isinstance(southwind, OrgSession)
+    assert isinstance(ticket, dict)
+
+    northwind_rows = northwind.get(AUDIT, params={"limit": 100}).json()
+    assert len(northwind_rows) > 1, "the filters below name rows that must exist"
+    northwind_ids = {row["id"] for row in northwind_rows}
+    boundary = northwind_rows[-1]["created_at"]
+
+    own = {row["id"] for row in southwind.get(AUDIT, params={"limit": 100}).json()}
+
+    for params in (
+        {"actor_user_id": northwind.user_id},
+        {"target_type": "ticket", "target_id": ticket["id"]},
+        {"created_after": boundary},
+    ):
+        response = southwind.get(AUDIT, params=params)
+        assert response.status_code == 200, response.text
+
+        returned = {row["id"] for row in response.json()}
+        assert returned <= own, f"{params} returned a row outside this tenant's trail"
+        assert not returned & northwind_ids, f"{params} returned another tenant's row"
+
+
+def test_a_forged_tenant_claim_cannot_reach_the_attachment_or_audit_routes(
+    northwind_files: dict[str, object],
+) -> None:
+    """The confused-deputy check, repeated for the phase's surface.
+
+    A forged token is genuinely signed and unexpired and names a real tenant; it is
+    refused because the claim disagrees with the user's own row. Repeated here because
+    `/attachments/{id}` and `/audit-logs` were mounted after the original test was
+    written, and a router added later is the one most likely to carry a different
+    dependency.
+
+    Only routes that *exist* are listed. A bare `/attachments` prefix is not one — there
+    is no list-all route under it — and including it would have asserted 403 against a
+    404 from the router itself, which is a claim about path spelling rather than about
+    the guard.
+    """
+    northwind = northwind_files["northwind"]
+    southwind = northwind_files["southwind"]
+    ticket_level = northwind_files["ticket_level"]
+    assert isinstance(northwind, OrgSession)
+    assert isinstance(southwind, OrgSession)
+    assert isinstance(ticket_level, str)
+
+    forged = create_access_token(
+        uuid.UUID(northwind.user_id),
+        uuid.UUID(southwind.user_id),  # a tenant this user does not belong to
+        UserRole.ADMIN,
+    )
+    headers = {"Authorization": f"Bearer {forged}"}
+
+    for path in (AUDIT, f"{ATTACHMENTS}/{ticket_level}"):
         response = northwind.client.get(path, headers=headers)
         assert response.status_code == 403, f"{path} was reachable: {response.text}"
         assert response.json()["error"]["code"] == "TENANT_ACCESS_DENIED"
