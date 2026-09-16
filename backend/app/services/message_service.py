@@ -31,7 +31,7 @@ from app.models.message import Message
 from app.models.ticket import Ticket
 from app.repositories.message_repository import MessageRepository
 from app.schemas.message import MessageCreate
-from app.services import ticket_service
+from app.services import notification_service, ticket_service
 
 logger = structlog.get_logger(__name__)
 
@@ -97,8 +97,16 @@ async def post_reply(
     if message.sender_type is SenderType.AGENT and ticket.first_response_at is None:
         ticket.first_response_at = datetime.now(UTC)
 
-    ticket_service.record_event(session, context, ticket, TicketEventType.MESSAGE_ADDED)
+    event = ticket_service.record_event(session, context, ticket, TicketEventType.MESSAGE_ADDED)
+    # The message is passed, not inferred. `MESSAGE_ADDED` records that the thread grew,
+    # not who grew it, and the distinction §26 draws — "new customer reply" — is exactly
+    # `sender_type`. Reading it off the caller's role instead would misfile an AI draft,
+    # which has no role and must never be mistaken for the customer writing in (§41).
+    notifications = await notification_service.notify_for_event(
+        session, context, ticket, event, message=message
+    )
     await session.commit()
+    notification_service.enqueue_delivery(notifications)
 
     logger.info(
         "message_posted",

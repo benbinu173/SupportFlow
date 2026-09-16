@@ -99,6 +99,8 @@ rather than falling back to something insecure.
 |---|---|
 | `DATABASE_URL` | PostgreSQL connection (required) |
 | `REDIS_URL` | Rate limiting today; db 0. The Celery broker uses db 2 (required) |
+| `CELERY_BROKER_URL` / `CELERY_RESULT_BACKEND` | Redis db 2 — a separate database from the cache, so a `FLUSHDB` cannot take out a queue |
+| `SMTP_*` | Mail server. Defaults to Mailpit on `localhost:1025`; `SMTP_USERNAME`/`SMTP_PASSWORD`/`SMTP_STARTTLS` for a real provider |
 | `RATE_LIMIT_*` | Per-address login/registration limits and the per-user upload limit |
 | `JWT_SECRET` | Access-token signing; minimum 32 characters (required) |
 | `CORS_ORIGINS` | Comma-separated allowlist. No wildcard — the refresh cookie needs credentials |
@@ -114,9 +116,18 @@ pytest -m security          # tenant-isolation and authz tests only
 ruff check . && ruff format --check .
 mypy app alembic
 
+# The notification worker, needed for any email to actually be sent. Separate from
+# the API process and from the tests, which record the enqueue rather than sending.
+celery -A app.workers.celery_app worker --loglevel=info --pool=solo
+
 # End-to-end against a running server, including the parts TestClient cannot show
 # (real multipart, real streaming, real headers). Needs the API on :8000.
 python scripts/phase_ln_walkthrough.py
+
+# The same, for notifications: needs the API on :8000, the worker above, and Mailpit.
+# Reads the delivered message back out of Mailpit's API at :8025 — see the Notifications
+# section for the full three-process setup.
+python scripts/phase_p_walkthrough.py
 
 # Frontend (from frontend/)
 npm test
@@ -613,10 +624,97 @@ a real cost rather than a style point. Measured — `redis-cli info stats`, twen
 | A client built and closed per probe | **23** |
 | The process's shared client | **2** |
 
-Redis carries rate limiting only. Caching, Pub/Sub, and short-lived task state arrive with
-the phases that give them a consumer — S, R, and P — and the refusal to cache the
-per-request user/organization join, because ADR-013 requires deactivation to bite on the
-next request rather than one TTL later, is recorded with its reasoning in ADR-022.
+Redis carries rate limiting and the Celery broker. Caching and Pub/Sub arrive with the
+phases that give them a consumer — S and R — and the refusal to cache the per-request
+user/organization join, because ADR-013 requires deactivation to bite on the next request
+rather than one TTL later, is recorded with its reasoning in ADR-022.
+
+## Notifications
+
+Notifications are the one resource here whose access rule is not a role scope. §3's matrix
+gives `NOTIFICATION_LIST` to all four roles, so the guard on every route is uniform and
+everything that narrows a query lives in one predicate: `user_id = the caller`. A
+notification belonging to a colleague produces the **same 404** as an id nobody wrote
+(ADR-009), and so does one belonging to another tenant. Neither reply names the tenant, the
+recipient, or the delivery state.
+
+```
+GET  /api/v1/notifications                 ?unread_only=&limit=&offset=   newest first
+GET  /api/v1/notifications/unread-count    {"unread": 3}
+POST /api/v1/notifications/{id}/read       idempotent — re-marking does not move the time
+POST /api/v1/notifications/read-all        {"marked_read": 3}
+```
+
+**The row is written in the request's transaction; only the email is queued.** An
+assignment, a customer reply, or a resolution writes the notification inside the same commit
+that makes the change, so a notification can never describe something that did not happen.
+The slow, fallible, external part — SMTP — is what goes to Celery, and the task is handed an
+id and nothing else. That ordering is load-bearing: the task's first act is to read the row,
+so it must be enqueued *after* the commit. ADR-023 has the reasoning and the measurement.
+
+**What notifies whom**, from §26's list of seven. Four have producers today:
+
+| Event | Recipient |
+|---|---|
+| Ticket assigned | the new assignee |
+| Ticket reassigned | the new assignee (distinguished by `from_value`) |
+| New customer reply | the assigned agent |
+| Ticket resolved | every portal login of the ticket's customer |
+
+`CREATED`, `UNASSIGNED`, `PRIORITY_CHANGED`, `INTERNAL_NOTE_ADDED`, `ATTACHMENT_ADDED` and
+`REOPENED` notify nobody, because §26 does not list them — stated explicitly rather than
+left to omission, and pinned by a test. SLA warnings arrive with Phase Q, AI-analysis
+completions with T–W, and **manager mentions are deferred**: the phrase occurs exactly once
+in the specification, with no syntax, no resolution rule, and no UI, so
+`NotificationType.MENTION` stays in the enum unreachable.
+
+Authorship of a reply is read from `message.sender_type`, not from the caller's role. An
+`AI_DRAFT` has no role and must never be mistaken for the customer writing in (§41).
+
+### Three processes, and why
+
+Nothing sends email unless a worker is running, and the tests deliberately do not start one.
+The suite replaces the *enqueue* with a recorder rather than turning on `task_always_eager`,
+because eager mode runs the task inline — inside the request that produced the notification
+— and the task body would then start a second event loop inside the one already serving that
+request. `asyncio` refuses, so eager mode would fail every request that produced a
+notification rather than merely testing differently.
+
+```bash
+# 1. the API, from backend/
+python -m uvicorn app.main:app --loop app.core.event_loop:loop_factory --port 8000
+
+# 2. the worker, from backend/ — --pool=solo because fork is not available on Windows
+celery -A app.workers.celery_app worker --loglevel=info --pool=solo
+
+# 3. the walkthrough: drives the API, then reads the message back out of Mailpit's API
+python scripts/phase_p_walkthrough.py
+```
+
+Mailpit is the local mail server, on SMTP `1025` with an HTTP UI and API on `8025`. The
+walkthrough uses the API half, so the proof that a message *left the process* is a `GET`
+rather than a person looking at an inbox.
+
+### At-least-once, and the column that narrows it
+
+`task_acks_late=True` is what stops a worker killed mid-send from silently losing an email,
+and its price is that a worker dying after sending but before acknowledging is handed the
+same task again. `notifications.emailed_at` makes the task return early on a row that
+already carries one, which narrows that from "any redelivery duplicates mail" to "a crash
+between the send and the mark does". It is **narrowed, not closed** — closing it would need
+the send and the mark in one atomic step, which SMTP is not part of.
+
+Retries are for transient failures only: a connection refused or a socket timeout is worth
+another attempt, a refused recipient is not. Backoff is in minutes (1, 2, 4, 8, 10,
+jittered), and the first version of this was `retry_backoff=True` — one second, which is
+about fifty seconds for all six attempts, and gives up while a restarting mail server is
+still booting. A run against a closed port is what caught it; see ADR-023. A notification
+whose retries are exhausted is **not** retried again: the row stays with `emailed_at IS
+NULL`, which is the query a backlog sweep would use.
+
+Two settings are not defaults and both matter: `task_serializer`/`accept_content` are
+JSON-only, because a worker unpickling from a broker runs whatever the payload says, and
+`worker_prefetch_multiplier=1`, because a task here can block for a full SMTP timeout.
 
 ## Security posture
 
@@ -705,7 +803,8 @@ instead; see [Rate limiting](#rate-limiting).
 | I–K | Customers, tickets, messages | ✅ |
 | L–N | Attachments, audit logging, search | ✅ |
 | O | Redis: shared client, rate-limit consolidation | ✅ |
-| P–Q | Celery, SLA | next |
+| P | Celery, notifications, email delivery | ✅ |
+| Q | SLA monitoring, beat | next |
 | R–S | WebSockets, analytics | |
 | T–W | AI foundation, analysis, summaries, drafts | |
 | X | Knowledge base and RAG | |
@@ -713,16 +812,32 @@ instead; see [Rate limiting](#rate-limiting).
 
 ## Known limitations
 
-- Two migrations exist: the baseline, and Phase N's message full-text index. The
-  baseline is still the first revision, so there is no upgrade path from an older schema.
+- Three migrations exist: the baseline, Phase N's message full-text index, and Phase P's
+  `notifications.emailed_at`. The baseline is still the first revision, so there is no
+  upgrade path from an older schema.
 - The test suite builds its schema with `Base.metadata.create_all` rather than by
   applying migrations. That keeps tests fast, and the drift check in
   [tests/integration/test_migrations.py](backend/tests/integration/test_migrations.py)
   is what stops the two from diverging.
 - The embedding provider is deliberately undecided until Phase X (ADR-008).
-- Redis carries rate limiting only. Caching, Pub/Sub, and short-lived task state are
-  assigned to the phases that give them a consumer — S, R, and P respectively — rather
-  than built ahead of one (ADR-022).
+- Redis carries rate limiting and the Celery broker. Caching and Pub/Sub are assigned to
+  the phases that give them a consumer — S and R — rather than built ahead of one
+  (ADR-022).
+- **A "ticket resolved" notification reaches the customer's *portal login*, so a customer
+  record with no login gets no notification at all** — no row is written, rather than a row
+  addressed to the agent who resolved it. `notifications.user_id` is NOT NULL and §26
+  describes no second recipient model (ADR-023).
+- **A customer can have more than one portal login**, and a resolution then notifies all of
+  them. Nothing forbids the second account; the alternative was picking one arbitrarily.
+- **A notification whose five email retries are exhausted is not retried again.** The row
+  keeps `emailed_at IS NULL`, which is the query a backlog sweep would use, but that sweep
+  is not written yet.
+- **Manager mentions are specified but unbuilt.** §26 lists them once, with no syntax and no
+  resolution rule. `NotificationType.MENTION` is in the enum and unreachable.
+- **No WebSocket push.** The notification is persisted so that Phase R has something to
+  push, but clients poll today.
+- **No Celery beat service.** Every task is event-driven; the first scheduled one is SLA
+  monitoring in Phase Q (ADR-023).
 - The deployment target is undecided; nothing in the architecture depends on a
   specific cloud.
 - On Windows, the API must be started with

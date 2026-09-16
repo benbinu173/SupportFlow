@@ -52,6 +52,24 @@ os.environ.setdefault("RATE_LIMIT_LOGIN_PER_MINUTE", "100000")
 os.environ.setdefault("RATE_LIMIT_REGISTER_PER_HOUR", "100000")
 os.environ.setdefault("RATE_LIMIT_UPLOAD_PER_HOUR", "100000")
 
+# Celery. `Settings` gives both a default, so these are set for the opposite reason to
+# the block above: to make it obvious that the suite *is* pointed at a test broker. The
+# URL is never contacted — see `queued_emails` for why the task is not run inline — but a
+# setting left at its production default is one a future test could publish to the real
+# thing through by accident.
+os.environ.setdefault("CELERY_BROKER_URL", "redis://localhost:6379/1")
+os.environ.setdefault("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
+
+# SMTP. Nothing in the suite talks to a real mail server: `tests/unit/test_email_delivery.py`
+# replaces `send_email` outright, and the live end-to-end in
+# `scripts/phase_p_walkthrough.py` is what exercises Mailpit. These are set so the
+# settings are populated and a stray send fails fast against a closed port rather than
+# hanging on the default host.
+os.environ.setdefault("SMTP_HOST", "localhost")
+os.environ.setdefault("SMTP_PORT", "1025")
+os.environ.setdefault("SMTP_FROM", "support@supportflow.local")
+os.environ.setdefault("SMTP_TIMEOUT_SECONDS", "2")
+
 # Imported after the environment is populated, which is why this block sits below
 # the statements above. Ruff's E402 allows `os.environ` setup before imports
 # precisely because this pattern is unavoidable for test configuration.
@@ -77,6 +95,7 @@ AUTH = f"{API}/auth"
 USERS = f"{API}/users"
 CUSTOMERS = f"{API}/customers"
 TICKETS = f"{API}/tickets"
+NOTIFICATIONS = f"{API}/notifications"
 
 # Comfortably past the configured 12-character minimum, and not a credential anyone
 # would mistake for a real one.
@@ -252,6 +271,39 @@ def truncate_tables(sync_engine: Engine) -> Iterator[None]:
 # ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def queued_emails(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record the notification ids delivery was queued for, and queue nothing.
+
+    **Autouse, because no test in this suite should reach a broker.** Assigning a ticket,
+    replying, and resolving one all queue an email now, and those paths run in hundreds of
+    tests that have nothing to do with Celery. Left alone they would publish real messages
+    to whatever Redis `CELERY_BROKER_URL` names — harmless if it is the test database and a
+    confusing failure if it is not, and slow either way.
+
+    **The task is not run inline, and `task_always_eager` is deliberately not enabled.**
+    Eager mode executes `.delay()` inside the calling frame, and the caller here is a
+    request being served by `TestClient` — an event loop is already running. The task body
+    reaches the database through `app/core/event_loop.run`, which starts a *second* loop,
+    and asyncio refuses: `run_until_complete` on one loop while another is running raises
+    before a single query is issued. So every request that produced a notification would
+    fail. `tests/unit/test_email_delivery.py` runs the task body directly instead, from a
+    context that owns its loop, which is both closer to what a worker does and free of
+    this constraint.
+
+    Only `delay` is replaced, not the task object, so the real task is still the thing
+    being asked to enqueue — a renamed attribute or a typo in the call site still fails.
+    The signature `ids.append` matches the task's single positional argument by shape,
+    which is what makes "the id that was queued" and "the id the task would receive" the
+    same string.
+    """
+    from app.workers import email_tasks
+
+    ids: list[str] = []
+    monkeypatch.setattr(email_tasks.send_notification_email, "delay", ids.append)
+    return ids
 
 
 @dataclass

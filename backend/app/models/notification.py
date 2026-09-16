@@ -27,6 +27,15 @@ class Notification(UUIDPrimaryKeyMixin, OrganizationScopedMixin, Base):
     `read_at` doubles as the read flag — a nullable timestamp carries strictly more
     information than a boolean, and there is no state where "read" is true but the
     time is unknown.
+
+    `emailed_at` is the same idiom for a different question. The notification row is
+    written inside the request's transaction; the *email* is sent later, by a worker,
+    and Celery configured with `acks_late` is at-least-once — a worker killed after
+    sending but before acknowledging would be handed the same task again. This column
+    is what the task checks before sending, narrowing "any redelivery duplicates mail"
+    to "a crash between the send and this mark does". It also gives a future backlog
+    sweep a query: `WHERE emailed_at IS NULL` is exactly the set of notifications whose
+    delivery never happened.
     """
 
     __tablename__ = "notifications"
@@ -69,6 +78,11 @@ class Notification(UUIDPrimaryKeyMixin, OrganizationScopedMixin, Base):
 
     # NULL means unread.
     read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # NULL means the email has not gone out. Set only *after* a successful send, so a
+    # failed attempt leaves the row indistinguishable from one that was never queued —
+    # which is correct: neither has been delivered, and the retry should pick both up.
+    emailed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False

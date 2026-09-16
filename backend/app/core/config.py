@@ -36,6 +36,45 @@ class Settings(BaseSettings):
     DATABASE_URL: PostgresDsn
     REDIS_URL: RedisDsn
 
+    # --- Celery -----------------------------------------------------------
+    # Read here for the first time in Phase P. Compose and .env.example have carried
+    # these since Phase C, but a setting with no consumer is a guess, so they waited for
+    # the code that uses them — the same rule `S3_*` followed before Phase L.
+    #
+    # db 2, separate from the cache/limits db 0: a `FLUSHDB` run to clear the rate-limit
+    # counters must not be able to discard queued work. ADR-022 records the split.
+    CELERY_BROKER_URL: RedisDsn = RedisDsn("redis://localhost:6379/2")
+    CELERY_RESULT_BACKEND: RedisDsn = RedisDsn("redis://localhost:6379/2")
+
+    # A hung SMTP conversation must not pin a worker slot forever. The hard limit is the
+    # one that matters — Celery's soft limit raises inside the task and can be caught,
+    # the hard one kills the process, which is what a worker stuck in a socket read
+    # actually needs.
+    CELERY_TASK_SOFT_TIME_LIMIT_SECONDS: int = 60
+    CELERY_TASK_TIME_LIMIT_SECONDS: int = 120
+
+    # --- Email ------------------------------------------------------------
+    # Mailpit locally, any SMTP provider in production. Host, port, and sender carry
+    # defaults for the same reason `S3_ENDPOINT` does: none is a secret and each has an
+    # obvious local value. The credentials below do not, so they default to `None`.
+    SMTP_HOST: str = "localhost"
+    SMTP_PORT: int = 1025
+    SMTP_FROM: str = "support@supportflow.local"
+    SMTP_TIMEOUT_SECONDS: int = 10
+
+    # Optional, because Mailpit accepts mail from anyone and a real provider does not.
+    # `None` means "do not authenticate", which is what a local mail catcher wants — an
+    # empty string would be a credential that is present and wrong.
+    SMTP_USERNAME: str | None = None
+    SMTP_PASSWORD: str | None = None
+
+    # Off by default, and explicitly configurable rather than inferred from the port.
+    # Port 1025 is plaintext and port 587 speaks STARTTLS, but the port number is a
+    # convention and this is a security decision: a deployment that leaves it off
+    # against a provider expecting TLS should be a visible configuration, not a guess
+    # the application made on its behalf.
+    SMTP_STARTTLS: bool = False
+
     # --- Auth -------------------------------------------------------------
     # No defaults: see module docstring.
     JWT_SECRET: str
@@ -124,6 +163,20 @@ class Settings(BaseSettings):
         # PyJWT warns below 32 bytes for HS256; treat it as an error instead.
         if len(v) < 32:
             raise ValueError("JWT_SECRET must be at least 32 characters")
+        return v
+
+    @field_validator("SMTP_USERNAME", "SMTP_PASSWORD", mode="before")
+    @classmethod
+    def _blank_credential_is_absent(cls, v: object) -> object:
+        """Treat an empty string as "not set".
+
+        `.env.example` ships both keys with no value, so a developer who copies it has
+        `SMTP_USERNAME=""` in the environment. Without this, the mail layer would try to
+        authenticate with an empty username — a credential that is present and wrong,
+        which fails differently from one that is absent and is harder to read.
+        """
+        if isinstance(v, str) and not v.strip():
+            return None
         return v
 
     @property

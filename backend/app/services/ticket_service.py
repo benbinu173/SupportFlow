@@ -40,6 +40,7 @@ from app.models.enums import (
     TicketStatus,
     can_transition,
 )
+from app.models.notification import Notification
 from app.models.ticket import Ticket
 from app.models.ticket_event import TicketEvent
 from app.repositories.customer_repository import CustomerRepository
@@ -53,7 +54,7 @@ from app.schemas.ticket import (
     TicketSortKey,
     TicketStatusUpdate,
 )
-from app.services import audit_service
+from app.services import audit_service, notification_service
 
 logger = structlog.get_logger(__name__)
 
@@ -296,7 +297,7 @@ async def assign_ticket(
     if assigned_agent_id is not None and ticket.status is TicketStatus.OPEN:
         ticket.status = TicketStatus.ASSIGNED
 
-    record_event(
+    event = record_event(
         session,
         context,
         ticket,
@@ -319,7 +320,13 @@ async def assign_ticket(
         after={"assigned_agent_id": str(assigned_agent_id) if assigned_agent_id else None},
         origin=origin,
     )
+    # Staged into this transaction, delivered after it. The notification is a claim that
+    # the assignment happened, so it has to be written by the same unit of work that made
+    # it true — and the task that emails it reads the row by id, so it cannot be queued
+    # until that row is committed. See `app/services/notification_service.py`.
+    notifications = await notification_service.notify_for_event(session, context, ticket, event)
     await session.commit()
+    notification_service.enqueue_delivery(notifications)
 
     logger.info(
         "ticket_assigned" if assigned_agent_id else "ticket_unassigned",
@@ -408,8 +415,9 @@ async def change_status(
     if hint is not None:
         raise InvalidTicketTransitionError(ticket.status.value, payload.status.value, hint)
 
-    _transition(session, context, ticket, payload.status, origin=origin)
+    notifications = await _transition(session, context, ticket, payload.status, origin=origin)
     await session.commit()
+    notification_service.enqueue_delivery(notifications)
 
     logger.info(
         "ticket_status_changed",
@@ -439,8 +447,9 @@ async def close_ticket(
     """
     ticket = await require_visible_ticket(session, context, ticket_id)
 
-    _transition(session, context, ticket, TicketStatus.CLOSED, origin=origin)
+    notifications = await _transition(session, context, ticket, TicketStatus.CLOSED, origin=origin)
     await session.commit()
+    notification_service.enqueue_delivery(notifications)
 
     logger.info(
         "ticket_closed",
@@ -476,7 +485,7 @@ async def reopen_ticket(
     """
     ticket = await require_visible_ticket(session, context, ticket_id)
 
-    _transition(
+    notifications = await _transition(
         session,
         context,
         ticket,
@@ -491,6 +500,7 @@ async def reopen_ticket(
     ticket.assigned_agent_id = None
 
     await session.commit()
+    notification_service.enqueue_delivery(notifications)
 
     logger.info(
         "ticket_reopened",
@@ -507,7 +517,7 @@ async def reopen_ticket(
 # ---------------------------------------------------------------------------
 
 
-def _transition(
+async def _transition(
     session: AsyncSession,
     context: TenantContext,
     ticket: Ticket,
@@ -515,7 +525,7 @@ def _transition(
     *,
     event_type: TicketEventType = TicketEventType.STATUS_CHANGED,
     origin: RequestOrigin | None = None,
-) -> None:
+) -> list[Notification]:
     """Validate one lifecycle edge and apply it. **The only writer of `Ticket.status`.**
 
     Kept as a plain function that mutates and records without committing, so the caller
@@ -531,6 +541,14 @@ def _transition(
     writer makes this the only place that knows both ends of the change, so it is also
     the only place that can report it without guessing — the property ADR-017 leans on,
     applied to the trail rather than to the lifecycle.
+
+    **Async because a resolution also notifies the customer.** §26's "ticket resolved"
+    has a recipient who is not the person clicking, and resolving that recipient means a
+    lookup. Putting it here rather than in `change_status` follows the same argument as
+    the audit row: hooking the one route that resolves a ticket today would work today
+    and would silently stop the day a second route did.
+
+    Returns the staged notifications; the caller delivers them after its commit.
     """
     current = ticket.status
     if not can_transition(current, target):
@@ -550,7 +568,7 @@ def _transition(
             if ticket.resolved_at is None:
                 ticket.resolved_at = now
 
-    record_event(
+    event = record_event(
         session,
         context,
         ticket,
@@ -581,6 +599,13 @@ def _transition(
         after={"status": target.value},
         origin=origin,
     )
+
+    # Only a resolution produces anything: `notify_for_event` treats `CLOSED` and
+    # `OPEN` as silent, so the two other callers of this function get an empty list back
+    # and their `enqueue_delivery` is a no-op. Calling it unconditionally rather than
+    # behind `if target is RESOLVED` is what keeps the notification a property of the
+    # transition rather than of one of the transitions.
+    return await notification_service.notify_for_event(session, context, ticket, event)
 
 
 def record_event(

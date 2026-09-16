@@ -1092,3 +1092,153 @@ on how much a given desk attaches. Nothing is cached, so every authenticated req
 does its join — which is the cost ADR-013 already accepted, and this ADR declines to pay
 back.
 
+---
+
+## ADR-023 — The notification is written in the request; only the email is queued
+
+**Status:** accepted · Phase P
+
+**Context.** §26 asks for in-app notifications on seven events, records persisted, and a
+read/unread state. §16 lists eight background task categories and §51 says Phase P should
+"start with notification tasks". The obvious implementation is the one Celery's own
+documentation leads you to: the request publishes a task, the task writes the notification
+row and sends the email. It is also wrong here, and the reason is the ordering.
+
+**Decision.** `notification_service.notify_for_event` writes the row inside the *request's*
+transaction and never commits — the shape ADR-020 already established for audit rows. What
+is queued is only the part that leaves the process: SMTP.
+
+**Why the task must not write the row.** A broker is not durable the way a database is. A
+Redis restart without persistence loses queued messages, and if the row only ever existed
+because a task created it, those notifications were never written and nothing anywhere
+records the loss — no row, no badge, no error, just a user who was never told. The other
+direction is worse in a subtler way: a task that both writes the row and sends the mail, run
+twice, produces two rows and two emails, and the retry that causes it is something
+`acks_late` makes routine. Writing in the request's transaction makes the notification and
+the change it describes **one commit**, so a failed assignment cannot leave a notification
+about an assignment that did not happen.
+
+`enqueue_delivery` is therefore called by the caller *after* the commit, and the task is
+handed **an id and nothing else**. Copying the title and body into the broker would create a
+second copy of a stored fact, and the two would disagree the first time either changed. It
+is also why the ordering is load-bearing rather than stylistic: the task's first act is to
+read that row, and a task enqueued before the commit races a transaction it cannot see.
+
+**The task's own measurement, since the claim above is empirical.** With the worker
+**stopped**, assigning a ticket wrote the row and left `emailed_at` NULL, with one message
+sitting in Redis db 2. Starting the worker delivered it 5ms later and stamped the row. The
+record survived a worker that was not running, and the queue held the delivery until one
+was.
+
+**At-least-once, and what `emailed_at` narrows it to.** `task_acks_late=True` is what stops
+a worker killed mid-send from silently losing an email, and its price is that a worker dying
+*after* sending but *before* acknowledging is handed the same task again. Without a guard
+that is a duplicate email. `notifications.emailed_at` — a nullable timestamp, the idiom the
+model already uses for `read_at` — makes the task return early on a row that already carries
+one, which narrows the window from "any redelivery" to "a crash between the send and the
+mark". It is **narrowed, not closed**, and closing it would need the send and the mark in one
+atomic step, which SMTP is not part of. The honest description is "at-least-once, with a
+window one statement wide". Verified rather than asserted: re-queueing a stamped
+notification logged `reason=already-sent` and sent nothing.
+
+**Retry only what retrying can fix.** `autoretry_for=(TransientEmailError,)` — a connection
+refused or a socket timeout is worth another attempt; a refused recipient or a bad
+credential is not, and five attempts with backoff would be five minutes spent re-sending a
+message the server has already rejected. `PermanentEmailError` is outside the tuple, so it
+fails the task on the first attempt and the traceback lands in the worker's log.
+
+**The backoff is in minutes, and the first version was not.** It was written as
+`retry_backoff=True`, which is one second. The reasoning in the comment was about a mail
+server that is *down*, and a server down for a restart is down for longer than a second —
+all six attempts landed inside about fifty seconds and gave up while the server was still
+booting, which is exactly the failure the policy exists to survive. It was caught by running
+it rather than by reading it: pointed at a closed port, the observed countdowns were 1s, 1s,
+3s, 8s, 10s. `retry_backoff=60` gives nominal countdowns of 1, 2, 4, 8 and 10 minutes (the
+last capped by `retry_backoff_max`), each drawn uniformly below its nominal by
+`retry_jitter`. A failed delivery leaves the row looking exactly like one never queued —
+`emailed_at` NULL, which is the query a backlog sweep would use.
+
+**`smtplib`, and no new dependency.** There is no mail library in `pyproject.toml` and none
+is needed: Celery tasks are synchronous by design and `smtplib` is. `app/core/mail.py` is
+the only module that imports it, the same boundary role `app/core/storage.py` plays for S3,
+and it is where the library's exceptions become `TransientEmailError` /
+`PermanentEmailError`. `EmailMessage` composes the message.
+
+**No pickle, ever.** `task_serializer` and `result_serializer` are `json` and
+`accept_content` is `["json"]`. This is not the default-was-fine case. Pickle is remote code
+execution by design — a worker unpickling a message from the broker runs whatever the
+payload's `__reduce__` says — and the broker here is Redis, which anything on the network
+can sometimes reach. §4 does not allow that one configuration typo away, so the allowlist
+makes it impossible rather than discouraged.
+
+**The worker runs its own loop, and therefore its own engine.** A task body reaches the
+database through `app/core/event_loop.run` (ADR-011), which builds a new loop per call. That
+is fine for the connection and fatal for a *pooled* one: a psycopg connection is bound to
+the loop that opened it, so the second task would be handed a connection belonging to a loop
+that has since closed. `email_tasks.py` therefore builds its own engine with `NullPool`.
+`app/core/database.py` warns against a second engine, and the warning is about multiplying
+connections; this does not, because the worker never imports that module — the API's pooled
+engine does not merely go unused there, it does not exist.
+
+**One queue, and `task_always_eager` deliberately absent.** §51 asks for task routing, and a
+route table with one entry is the honest amount of it for one task type: it makes the
+destination explicit instead of relying on the default queue's name. The `ai` (T–W),
+`reports` (S) and `knowledge` (X) queues are not pre-declared, because a queue nothing
+publishes to is a worker process waiting for work that does not exist. Eager mode is left
+off here *and* in the test suite, which is the opposite of the usual instinct: eager makes
+`.delay()` run the task inline, inside the request that produced the notification, and the
+task body would then start a second event loop inside the one already serving that request.
+`asyncio` refuses, so turning it on would fail every request that produced a notification
+rather than merely testing differently. The suite records the enqueue instead and exercises
+the task body from a context that owns its loop.
+
+**No Celery beat.** §48 says "celery beat where needed", and Phase P needs it nowhere: every
+task here is event-driven, because a notification exists exactly when a request created one.
+The first thing that needs a schedule is SLA monitoring in Phase Q, and the beat service
+arrives with it. Same restraint as ADR-022's Pub/Sub.
+
+**A "ticket resolved" notification goes to the customer's portal login, and a customer
+without one gets nothing.** `notifications.user_id` is NOT NULL, so the recipient is always
+a *user*. §26's recipient for a resolution is the customer, and the only user who is that
+customer is the portal account linked by `users.customer_id`. A customer record with no
+login has nobody to notify, so **no row is written** — not a row addressed to the agent who
+resolved it, which would be telling someone about their own action. This is a real
+limitation, stated in the README rather than papered over by inventing a second recipient
+model §26 does not describe.
+
+**And it goes to *every* portal login, which was a bug first.** Resolution originally used
+`scalar_one_or_none` on `users.customer_id` and relied on the link being unique. Nothing
+enforces that, and the second login turned a resolution into `MultipleResultsFound` — a 500,
+on the happy path, for a customer an admin had given two accounts. The fix is not a
+tie-break: the list-returning shape of `notify_for_event` was already built for
+multi-recipient events, and no product rule forbids a second login, so all of them are
+notified. `list_by_customer_id` returns a list and the repository method's name says so. It
+is worth recording that the first version's docstring argued the raise was "a better failure
+than picking one arbitrarily" — which was rationalizing a 500, and is now corrected in the
+code.
+
+**Manager mentions are deferred, deliberately.** The phrase "manager mention" occurs exactly
+once in the 2730-line specification — in §26's bullet list — with no syntax, no resolution
+rule, and no UI anywhere else. `NotificationType.MENTION` stays in the enum, unreachable,
+and this paragraph is the record of it. The events that produce a notification today are the
+four with producers: assignment (and reassignment, distinguished by `TicketEvent.from_value`
+being non-null), a customer reply, and a resolution. `CREATED`, `UNASSIGNED`,
+`PRIORITY_CHANGED`, `INTERNAL_NOTE_ADDED`, `ATTACHMENT_ADDED` and `REOPENED` produce none,
+because §26 does not list them — stated explicitly rather than left to omission, and pinned
+by a test.
+
+**Authorship is read from `message.sender_type`, not from the caller's role.** `MESSAGE_ADDED`
+records that the thread grew, not who grew it, and §26's distinction — "new customer reply" —
+is exactly the sender type. Reading it off the role instead would misfile an `AI_DRAFT`,
+which has no role and must never be mistaken for the customer writing in (§41).
+
+**Cost.** Three explicit calls now sit at each mutating call site (`record_event`,
+`audit_service.record_for`, `notification_service`), which is the established shape here and
+a thing to forget. That is what `tests/security/test_route_protection.py`-style sweeps are
+for, and `tests/unit/test_notification_policy.py` pins every `TicketEventType` to a
+recipient or to explicitly nothing, so a new event type that nobody decided about fails
+there rather than going quietly unnotified. The delivery is at-least-once, and the window is
+one statement wide. A notification written while the worker is down is delivered when one
+starts, but a notification whose five retries are exhausted is **not** retried again — the
+row stays unstamped for a sweep that Phase Q or later will have to write.
+

@@ -37,6 +37,30 @@ class UserRepository(TenantScopedRepository[User]):
     async def email_taken(self, email: str) -> bool:
         return await self.exists(User.email == email)
 
+    async def list_by_customer_id(self, customer_id: uuid.UUID) -> Sequence[User]:
+        """Every portal account linked to a customer, oldest first.
+
+        `users.customer_id` is set only for a portal caller, and it is what makes
+        `RowScope.OWN` resolvable — so this is the same link, read from the other side:
+        "which logins may act as this customer". A `Customer` with no portal account has
+        no rows here, and an empty list is a real answer rather than an error.
+
+        **A list, because the link is not unique.** Nothing prevents a customer record
+        from having two logins — two contacts at one company, or one person with a work
+        and a personal address — and `POST /users` accepts both. An earlier version of
+        this method used `scalar_one_or_none` and relied on that never happening; the
+        second login turned a resolution into a `MultipleResultsFound` and a 500.
+        Returning all of them is the answer that needs no tie-break, because picking one
+        would mean choosing which of the customer's addresses misses the notification.
+
+        Ordered so the result is stable across calls: row order is what a log line and a
+        test both read.
+        """
+        result = await self.session.execute(
+            self._select(User.customer_id == customer_id).order_by(User.created_at, User.id)
+        )
+        return result.scalars().all()
+
     async def count_admins(self, *, excluding: uuid.UUID | None = None) -> int:
         """How many administrators this organization has.
 

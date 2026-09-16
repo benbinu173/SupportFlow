@@ -189,6 +189,9 @@ def test_there_are_routes_to_check(api: FastAPI) -> None:
     `include_router` calls is ever dropped. The capability map below names the routes
     themselves, so a quietly missing router would otherwise only show up as an absent
     line in a dict.
+
+    Phase P added four: the notification collection, the unread count, and the two ways
+    of marking read.
     """
     assert len(_entries(api)) >= 28
 
@@ -489,4 +492,18 @@ def test_every_route_declares_the_capability_the_matrix_assigns(api: FastAPI) ->
         # trail a client can write is not an audit trail; every row is written from
         # inside the transaction of the action it describes.
         ("GET", "/api/v1/audit-logs"): {Permission.AUDIT_VIEW},
+        # --- Notifications ------------------------------------------------
+        # All four carry the same capability, because §3's matrix gives notifications to
+        # every role: a notification is addressed to a person rather than to a job, so
+        # there is nothing for a role to widen or narrow. The restriction is per-row and
+        # lives in the repository — every query is filtered to `user_id == the caller`,
+        # which is why four routes can share one capability without sharing one audience.
+        #
+        # Two of the four are the same idea at different scopes: `/read` clears one,
+        # `/read-all` clears the badge. `unread-count` exists as its own route rather than
+        # being derived from the list, so the cheapest question costs a `COUNT`.
+        ("GET", "/api/v1/notifications"): {Permission.NOTIFICATION_LIST},
+        ("GET", "/api/v1/notifications/unread-count"): {Permission.NOTIFICATION_LIST},
+        ("POST", "/api/v1/notifications/read-all"): {Permission.NOTIFICATION_LIST},
+        ("POST", "/api/v1/notifications/{notification_id}/read"): {Permission.NOTIFICATION_LIST},
     }

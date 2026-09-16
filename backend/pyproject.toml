@@ -112,6 +112,21 @@ disallow_untyped_defs = false
 module = ["boto3.*", "botocore.*"]
 ignore_missing_imports = true
 
+# Celery ships no `py.typed` marker either, and unlike boto3 there is no stub package in
+# the ecosystem — `celery-types` exists but lags the releases this project pins. The
+# consequence is narrow and confined to `app/workers/celery_app.py`, where the app object
+# is configured with keyword arguments mypy cannot check and would not have checked
+# anyway: Celery's settings are a loose string-keyed namespace at runtime. Everything the
+# application actually does with a task — `send_notification_email.delay(...)` — is
+# reached through `app/workers/email_tasks.py`, whose own function is fully annotated.
+#
+# `app/workers/email_tasks.py` carries a per-line `untyped-decorator` suppression rather
+# than an exemption here: that module's body is typed, and only the decorator that turns
+# its function into a task is not.
+[[tool.mypy.overrides]]
+module = ["celery", "celery.*", "kombu", "kombu.*", "billiard", "billiard.*"]
+ignore_missing_imports = true
+
 # ---------------------------------------------------------------------------
 # pytest
 # ---------------------------------------------------------------------------

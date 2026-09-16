@@ -222,6 +222,9 @@ def test_upgrade_is_repeatable_after_a_downgrade(upgraded_database: tuple[str, E
 # The revision that adds `ix_messages_fts`, Phase N's index over the message body.
 MESSAGE_FTS_REVISION = "e672102955a8"
 
+# The revision that adds `notifications.emailed_at`, Phase P's delivery marker.
+EMAILED_AT_REVISION = "a49a5939bf77"
+
 
 def _index_exists(engine: Engine, name: str) -> bool:
     with engine.connect() as connection:
@@ -234,6 +237,43 @@ def _index_exists(engine: Engine, name: str) -> bool:
         )
 
 
+def _column_exists(engine: Engine, table: str, column: str) -> bool:
+    with engine.connect() as connection:
+        return (
+            connection.execute(
+                text(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_schema = 'public' "
+                    "AND table_name = :table AND column_name = :column"
+                ),
+                {"table": table, "column": column},
+            ).one_or_none()
+            is not None
+        )
+
+
+def _walk_down_to(config: Config, revision: str) -> str:
+    """Take the database to `revision` and return its parent, for a one-step descent.
+
+    Walks *down* to the revision instead of requiring it to be head. The previous version
+    of this file pinned `head` and failed loudly when a newer migration landed, with a
+    message telling the next person to repoint the test at the new head. That is the wrong
+    arc: the property under test is "this revision's `downgrade()` undoes this revision",
+    and it is true no matter how many migrations come after it. Pinning the head meant
+    every phase broke a test about an older phase's index, and the suggested repair would
+    have quietly moved the test off the thing it was written to check.
+
+    Descending from wherever the database is also means the assertions below run against a
+    database that reached this revision the normal way, with everything underneath already
+    applied.
+    """
+    script = ScriptDirectory.from_config(config)
+    command.downgrade(config, revision)
+    previous = script.get_revision(revision).down_revision
+    assert isinstance(previous, str), "this revision is expected to have a single parent"
+    return previous
+
+
 def test_the_message_fts_migration_downgrades_on_its_own(
     upgraded_database: tuple[str, Engine],
 ) -> None:
@@ -243,28 +283,43 @@ def test_the_message_fts_migration_downgrades_on_its_own(
     `downgrade()` that forgets its `drop_index`: dropping the table takes its indexes
     with it, so every per-revision downgrade bug is invisible from `base`. A single
     step is the only place that assertion can be made.
-
-    Guarded against the head moving. The revision is pinned by id, and the guard fails
-    loudly rather than letting this quietly start testing a different migration.
     """
     db_url, engine = upgraded_database
     config = _alembic_config(db_url)
+    previous = _walk_down_to(config, MESSAGE_FTS_REVISION)
 
-    script = ScriptDirectory.from_config(config)
-    head = script.get_current_head()
-    if head != MESSAGE_FTS_REVISION:
-        pytest.fail(
-            f"head is {head!r}, not the message-FTS revision {MESSAGE_FTS_REVISION!r}. "
-            "A newer migration has landed on top: repoint this test at the migration "
-            "it means to exercise instead of letting `head - 1` drift to another one."
-        )
-
-    previous = script.get_revision(MESSAGE_FTS_REVISION).down_revision
-    assert isinstance(previous, str), "this revision is expected to have a single parent"
-    assert _index_exists(engine, "ix_messages_fts"), "the upgrade did not create the index"
+    assert _index_exists(engine, "ix_messages_fts"), "the revision did not create the index"
 
     command.downgrade(config, previous)
     assert not _index_exists(engine, "ix_messages_fts"), "the downgrade left the index behind"
 
     command.upgrade(config, "head")
     assert _index_exists(engine, "ix_messages_fts"), "the re-upgrade did not restore the index"
+
+
+def test_the_emailed_at_migration_downgrades_on_its_own(
+    upgraded_database: tuple[str, Engine],
+) -> None:
+    """Phase P's migration, held to the same single-step property.
+
+    A nullable column is the easiest possible thing to add and the easiest to forget to
+    remove: `downgrade()` with no `drop_column` in it leaves the column on the table, and
+    because it is nullable nothing breaks — the schema simply stops matching the revision
+    it claims to be at, and the next `upgrade` fails on "column already exists". Going to
+    `base` and back cannot see it, for the same reason the index test above gives.
+    """
+    db_url, engine = upgraded_database
+    config = _alembic_config(db_url)
+    previous = _walk_down_to(config, EMAILED_AT_REVISION)
+
+    assert _column_exists(engine, "notifications", "emailed_at"), "the revision added no column"
+
+    command.downgrade(config, previous)
+    assert not _column_exists(engine, "notifications", "emailed_at"), (
+        "the downgrade left the column behind"
+    )
+
+    command.upgrade(config, "head")
+    assert _column_exists(engine, "notifications", "emailed_at"), (
+        "the re-upgrade did not restore it"
+    )

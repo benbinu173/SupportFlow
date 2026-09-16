@@ -122,8 +122,16 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    # Placeholder until Phase P introduces the Celery app.
-    command: python -c "print('worker placeholder — implemented in Phase P')"
+    # The worker. One queue (`notifications`), and no `beat` service: every task Phase P
+    # defines is event-driven, and a scheduler with nothing to schedule is a process
+    # waiting for work that does not exist. SLAs (Phase Q) are the first thing that needs
+    # one, and it arrives with them (ADR-023).
+    #
+    # The default prefork pool, unlike the host's `--pool=solo`: forking a process per
+    # core is what Linux is good at, and the solo pool exists on Windows only because
+    # psycopg's async mode needs a selector loop the Proactor default does not provide
+    # (ADR-011).
+    command: celery -A app.workers.celery_app worker --loglevel=info
 
 volumes:
   postgres_data:

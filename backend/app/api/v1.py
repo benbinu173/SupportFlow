@@ -13,6 +13,7 @@ from app.api.audit import router as audit_router
 from app.api.auth import router as auth_router
 from app.api.customers import router as customers_router
 from app.api.messages import router as messages_router
+from app.api.notifications import router as notifications_router
 from app.api.tickets import router as tickets_router
 from app.api.users import router as users_router
 
@@ -32,3 +33,7 @@ router.include_router(messages_router, prefix="/tickets", tags=["messages"])
 # an id, so it cannot live under `/tickets`.
 router.include_router(attachments_router, tags=["attachments"])
 router.include_router(audit_router, tags=["audit"])
+# No prefix, because the paths are written in full inside the router: the collection is
+# `/notifications` and the per-row action is `/notifications/{id}/read`. Both are needed,
+# and a prefix would only be re-stated.
+router.include_router(notifications_router, tags=["notifications"])

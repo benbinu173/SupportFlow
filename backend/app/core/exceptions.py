@@ -62,6 +62,9 @@ class ErrorCode(StrEnum):
     CUSTOMER_NOT_FOUND = "CUSTOMER_NOT_FOUND"
     TICKET_NOT_FOUND = "TICKET_NOT_FOUND"
     ATTACHMENT_NOT_FOUND = "ATTACHMENT_NOT_FOUND"
+    # Carries a second meaning beyond "absent": a notification addressed to a colleague
+    # is as unreachable as one that was never written, and this is the code both return.
+    NOTIFICATION_NOT_FOUND = "NOTIFICATION_NOT_FOUND"
 
     # --- Transport-level ---------------------------------------------------
     # Raised by the framework, not by domain code: the *route* does not exist, or the
@@ -193,6 +196,7 @@ _NOT_FOUND_MESSAGES: dict[ErrorCode, str] = {
     ErrorCode.CUSTOMER_NOT_FOUND: "Customer not found.",
     ErrorCode.TICKET_NOT_FOUND: "Ticket not found.",
     ErrorCode.ATTACHMENT_NOT_FOUND: "Attachment not found.",
+    ErrorCode.NOTIFICATION_NOT_FOUND: "Notification not found.",
 }
 
 
