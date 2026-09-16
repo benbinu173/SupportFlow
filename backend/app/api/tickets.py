@@ -24,6 +24,7 @@ from app.api.deps import Context, DbSession, Origin, require_permission
 from app.core.exceptions import ValidationError
 from app.core.permissions import Permission
 from app.models.enums import TicketPriority, TicketStatus
+from app.models.ticket import Ticket
 from app.schemas.fields import SortOrder
 from app.schemas.ticket import (
     TicketAssign,
@@ -34,9 +35,33 @@ from app.schemas.ticket import (
     TicketSortKey,
     TicketStatusUpdate,
 )
-from app.services import ticket_service
+from app.services import sla_service, ticket_service
 
 router = APIRouter()
+
+
+async def _read(db: DbSession, context: Context, ticket: Ticket) -> TicketRead:
+    """One ticket as a response, with its SLA position attached. **Every route uses this.**
+
+    Decoration happens at the route rather than inside `ticket_service`, so the service
+    does not grow a dependency on the SLA module for a field only its routes want, and the
+    `SLA_VIEW` check sits where the `TenantContext` already is.
+
+    **All eight ticket-returning routes use it, not just the two that read.** The first
+    draft decorated `GET /tickets` and `GET /tickets/{id}` only, on the reasoning that the
+    mutation routes echo the ticket back rather than reporting it. The flaw is that
+    `TicketRead.sla` has a default of `None`, so an undecorated response does not omit the
+    field — it serializes `"sla": null`, which is the same payload a customer gets.
+    A client that does the obvious thing, `setTicket(await assign(...))`, would therefore
+    watch the countdown disappear off the screen the moment somebody assigned the ticket,
+    and have no way to tell that from the authorization case. One helper makes "a ticket
+    response carries its clock" a property of the module rather than of eight call sites.
+
+    The list route keeps its own version, because it batches: one pair of queries for the
+    page rather than one per ticket (`sla_service.decorate`).
+    """
+    sla = await sla_service.decorate(db, context, [ticket])
+    return TicketRead.model_validate(ticket).with_sla(sla.get(ticket.id))
 
 
 @router.get(
@@ -122,7 +147,10 @@ async def list_tickets(
         limit=limit,
         offset=offset,
     )
-    return [TicketRead.model_validate(ticket) for ticket in tickets]
+    # One extra pair of queries for the whole page, not per ticket — see
+    # `sla_service.decorate`. Empty for a portal caller, which makes `sla` null.
+    sla = await sla_service.decorate(db, context, tickets)
+    return [TicketRead.model_validate(ticket).with_sla(sla.get(ticket.id)) for ticket in tickets]
 
 
 @router.post(
@@ -145,7 +173,7 @@ async def create_ticket(
     customer raising an urgent ticket does not get to decide that it is urgent.
     """
     ticket = await ticket_service.create_ticket(db, context, payload, origin=origin)
-    return TicketRead.model_validate(ticket)
+    return await _read(db, context, ticket)
 
 
 @router.get(
@@ -162,7 +190,8 @@ async def get_ticket(ticket_id: uuid.UUID, context: Context, db: DbSession) -> T
     watching which ids are refused (ADR-009).
     """
     ticket = await ticket_service.get_ticket(db, context, ticket_id)
-    return TicketRead.model_validate(ticket)
+    sla = await sla_service.decorate(db, context, [ticket])
+    return TicketRead.model_validate(ticket).with_sla(sla.get(ticket.id))
 
 
 @router.get(
@@ -182,7 +211,11 @@ async def list_events(
     reading a timeline: it is part of seeing the ticket.
 
     Internal-note entries appear only for a caller holding `MESSAGE_READ_INTERNAL`, so
-    the timeline and the thread agree about who knows a note exists.
+    the timeline and the thread agree about who knows a note exists. SLA warning and
+    breach entries appear only for a caller holding `SLA_VIEW`, for the matching reason:
+    they name a deadline, and a deadline is the policy. A portal caller therefore sees
+    neither — the same two capabilities that decide the thread's internal notes and the
+    ticket's `sla` object decide this list.
     """
     events = await ticket_service.list_events(db, context, ticket_id)
     return [TicketEventRead.model_validate(event) for event in events]
@@ -211,7 +244,7 @@ async def assign_ticket(
         assigned_agent_id=payload.assigned_agent_id,
         origin=origin,
     )
-    return TicketRead.model_validate(ticket)
+    return await _read(db, context, ticket)
 
 
 @router.post(
@@ -234,7 +267,7 @@ async def change_priority(
     measurable over time (spec §6).
     """
     ticket = await ticket_service.change_priority(db, context, ticket_id, payload, origin=origin)
-    return TicketRead.model_validate(ticket)
+    return await _read(db, context, ticket)
 
 
 @router.post(
@@ -257,7 +290,7 @@ async def change_status(
     request needs is always a property of where it was sent.
     """
     ticket = await ticket_service.change_status(db, context, ticket_id, payload, origin=origin)
-    return TicketRead.model_validate(ticket)
+    return await _read(db, context, ticket)
 
 
 @router.post(
@@ -277,7 +310,7 @@ async def close_ticket(
     through two transitions that would skip the confirmation entirely.
     """
     ticket = await ticket_service.close_ticket(db, context, ticket_id, origin=origin)
-    return TicketRead.model_validate(ticket)
+    return await _read(db, context, ticket)
 
 
 @router.post(
@@ -297,4 +330,4 @@ async def reopen_ticket(
     `ticket_events` still shows who worked it, not just the fields they left behind.
     """
     ticket = await ticket_service.reopen_ticket(db, context, ticket_id, origin=origin)
-    return TicketRead.model_validate(ticket)
+    return await _read(db, context, ticket)

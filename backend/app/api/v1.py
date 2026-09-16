@@ -14,6 +14,7 @@ from app.api.auth import router as auth_router
 from app.api.customers import router as customers_router
 from app.api.messages import router as messages_router
 from app.api.notifications import router as notifications_router
+from app.api.sla import router as sla_router
 from app.api.tickets import router as tickets_router
 from app.api.users import router as users_router
 
@@ -37,3 +38,7 @@ router.include_router(audit_router, tags=["audit"])
 # `/notifications` and the per-row action is `/notifications/{id}/read`. Both are needed,
 # and a prefix would only be re-stated.
 router.include_router(notifications_router, tags=["notifications"])
+# `/sla/policies` and `/sla/policies/{priority}` — spec §6 lists `/api/v1/sla/*`. A prefix
+# here rather than full paths inside the module, because unlike notifications this router
+# has exactly one resource under it and no second shape to accommodate.
+router.include_router(sla_router, prefix="/sla", tags=["sla"])

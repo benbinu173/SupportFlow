@@ -141,11 +141,19 @@ async def list_events(
     everywhere else. The timeline is one more place they would otherwise be disclosed:
     a customer who can see that a note was written at 14:02, and not what it said, has
     still learned something the thread filter is at pains to hide.
+
+    `SLA_WARNING` and `SLA_BREACHED` entries are included only for a caller holding
+    `SLA_VIEW` — the same capability that decides whether `TicketRead.sla` is populated
+    at all. Two filters for two capabilities, and the second closes a door the first
+    one's argument opens: a timeline entry naming a deadline hands a portal caller the
+    target that a null `sla` object was withholding. See `list_for_ticket`.
     """
     await require_visible_ticket(session, context, ticket_id)
     return list(
         await TicketEventRepository(session, context).list_for_ticket(
-            ticket_id, include_internal=context.has(Permission.MESSAGE_READ_INTERNAL)
+            ticket_id,
+            include_internal=context.has(Permission.MESSAGE_READ_INTERNAL),
+            include_sla_alerts=context.has(Permission.SLA_VIEW),
         )
     )
 

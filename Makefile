@@ -16,6 +16,7 @@ help:
 	@echo "  make api            Run the FastAPI dev server"
 	@echo "  make web            Run the Vite dev server"
 	@echo "  make worker         Run the Celery worker (solo pool, Windows)"
+	@echo "  make beat           Run the Celery scheduler, which drives the SLA sweep"
 	@echo ""
 	@echo "Database"
 	@echo "  make migrate        Apply all pending migrations"
@@ -61,9 +62,21 @@ api:
 web:
 	cd frontend && npm run dev
 
+# `-Q notifications,sla` and not just `-Q notifications`: a worker consumes precisely the
+# queues it names, so omitting the second one leaves SLA tasks sitting in Redis forever
+# with no error on either side. The wiring test asserts this list equals `task_routes`.
 .PHONY: worker
 worker:
-	cd backend && .venv/Scripts/python.exe -m celery -A app.workers.celery_app worker --pool=solo --loglevel=info
+	cd backend && .venv/Scripts/python.exe -m celery -A app.workers.celery_app worker --pool=solo --loglevel=info -Q notifications,sla
+
+# A second process, and there must be exactly one of it. Beat publishes on a schedule; it
+# consumes nothing, so it takes no pool flag and no `-Q`. Two beats each fire every entry,
+# which would run the sweep twice per interval. The `-s` path is explicit because the
+# default writes into the working directory and a beat that cannot write it fails at
+# startup with a message about the file rather than about the cause.
+.PHONY: beat
+beat:
+	cd backend && .venv/Scripts/python.exe -m celery -A app.workers.celery_app beat --loglevel=info -s .celerybeat-schedule
 
 # --- database --------------------------------------------------------------
 # Alembic reads DATABASE_URL from .env via app.core.config, so there is no URL in

@@ -26,32 +26,43 @@ Email is the delivery mechanism, not the record. The row is the source of truth,
 is why a broker outage degrades the *email* and never the notification — see
 `enqueue_delivery`.
 
-The events that notify nobody
------------------------------
-§26 names seven triggers. The ticket timeline has twelve event types, and the nine that
-are not §26 triggers split into two groups that mean different things:
+The events that notify nobody, and the ones that notify on a schedule
+--------------------------------------------------------------------
+§26 names seven triggers. The ticket timeline has twelve event types, and the ten that are
+not "handled here" split into three groups that mean different things:
 
-**Named by §26, with no producer yet** — `AI_ANALYSIS_COMPLETED` and `SLA_WARNING`. These
-are *deferred*, not declined, and each carries the phase that brings it.
+**Named by §26, produced on a schedule rather than by a request** — `SLA_WARNING` and
+`SLA_BREACHED`. `app/workers/sla_tasks.py` writes these from a beat task; no inbound
+request can produce one. They are the reason this module has a second entry point.
+
+**Named by §26, with no producer yet** — `AI_ANALYSIS_COMPLETED`. *Deferred*, not
+declined, and it carries the phase that brings it.
 
 **Not named by §26 at all** — `CREATED`, `UNASSIGNED`, `PRIORITY_CHANGED`,
-`INTERNAL_NOTE_ADDED`, `ATTACHMENT_ADDED`, `REOPENED`, and `SLA_BREACHED`. Each is a
-deliberate no: a creator knows they created it, an unassignment notifies nobody because
-the agent losing the ticket is not the one who needs to act, a priority change is visible
-on the ticket, an internal note is for the desk rather than the customer, and a reopened
-ticket goes back on the queue where assignment notifies whoever picks it up. None of that
-is in §26, and inventing triggers the specification does not ask for is how a
-notification centre becomes something users mute.
+`INTERNAL_NOTE_ADDED`, `ATTACHMENT_ADDED`, and `REOPENED`. Each is a deliberate no: a
+creator knows they created it, an unassignment notifies nobody because the agent losing
+the ticket is not the one who needs to act, a priority change is visible on the ticket, an
+internal note is for the desk rather than the customer, and a reopened ticket goes back on
+the queue where assignment notifies whoever picks it up. None of that is in §26, and
+inventing triggers the specification does not ask for is how a notification centre becomes
+something users mute.
 
-Keeping the two groups apart matters, because "we chose not to" and "we have not yet" are
-different answers to a reader asking why nothing was sent.
-`tests/unit/test_notification_policy.py` walks every member of the enum and fails if one
-is in neither group — which is how the division below was found to be wrong the first
-time it was written.
+Keeping the groups apart matters, because "we chose not to", "we have not yet", and "the
+scheduler will" are three different answers to a reader asking why nothing was sent.
+`tests/unit/test_notification_policy.py` walks every member of the enum and fails if one is
+in none of them or in two — which is how the division below was found to be wrong the first
+time it was written, and how Phase Q found the two entries it was holding open.
+
+**Phase Q is the answer to the two comments this module used to carry.** `SILENT_EVENT_TYPES`
+held `SLA_BREACHED` with a note saying Phase Q "will know whether the breach is a second
+alert or a correction of the first", and `DEFERRED_EVENT_TYPES` held `SLA_WARNING` naming
+this phase as its producer. Both now have one, and the decision on the breach is recorded
+on `notify_sla_alert` below.
 """
 
 import uuid
 from collections.abc import Sequence
+from datetime import UTC, datetime
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -65,12 +76,14 @@ from app.models.ticket import Ticket
 from app.models.ticket_event import TicketEvent
 from app.repositories.notification_repository import NotificationRepository
 from app.repositories.user_repository import UserRepository
+from app.schemas.sla import SLATimer
+from app.services.sla_service import SLAAlert
 
 logger = structlog.get_logger(__name__)
 
-# Every event type that notifies nobody, and why. Membership in one of these two sets is
+# Every event type that notifies nobody, and why. Membership in one of these three sets is
 # the only alternative to being handled, so a new `TicketEventType` cannot arrive without
-# a decision — `tests/unit/test_notification_policy.py` asserts the three sets partition
+# a decision — `tests/unit/test_notification_policy.py` asserts the four sets partition
 # the enum.
 
 # §26 does not name these, so nothing is owed. See the module docstring for each.
@@ -82,11 +95,6 @@ SILENT_EVENT_TYPES: frozenset[TicketEventType] = frozenset(
         TicketEventType.INTERNAL_NOTE_ADDED,
         TicketEventType.ATTACHMENT_ADDED,
         TicketEventType.REOPENED,
-        # §26 names "SLA warning" and not "SLA breach". A breach notification is a
-        # reasonable thing to want and is not something to add silently: Phase Q builds
-        # the SLA clock and will know whether the breach is a second alert or a
-        # correction of the first.
-        TicketEventType.SLA_BREACHED,
     }
 )
 
@@ -95,14 +103,25 @@ SILENT_EVENT_TYPES: frozenset[TicketEventType] = frozenset(
 # distinguishable when someone asks why an event was quiet.
 DEFERRED_EVENT_TYPES: frozenset[TicketEventType] = frozenset(
     {
-        # Phase Q, whose entire subject is the SLA clock and the job that watches it.
-        TicketEventType.SLA_WARNING,
         # Phases T-W, which build the analysis this would announce. Note it is the
         # *completion* §26 asks about: §41 requires AI output be reviewed by a person
         # before a customer sees it, so announcing that it is ready is an alert to the
         # agent, not to the customer.
         TicketEventType.AI_ANALYSIS_COMPLETED,
     }
+)
+
+# Produced by `app/workers/sla_tasks.py` on a schedule, never by an inbound request. Kept
+# separate from `_HANDLED_EVENT_TYPES` because `notify_for_event` is the *request* policy
+# and an SLA alert has no request — the division says which code path sends it, not whether
+# it is sent.
+#
+# The two members were the last entries of the two sets above, each with a comment naming
+# this phase. `SLA_BREACHED` sat in `SILENT_EVENT_TYPES` because §26 names the warning and
+# not the breach, and the question was whether a breach is a second alert or a correction
+# of the first. It is a second alert: see `notify_sla_alert`.
+SCHEDULED_EVENT_TYPES: frozenset[TicketEventType] = frozenset(
+    {TicketEventType.SLA_WARNING, TicketEventType.SLA_BREACHED}
 )
 
 
@@ -142,6 +161,14 @@ async def notify_for_event(
     who the caller is: an agent's reply and an `AI_DRAFT` are both staff-side, and §41
     requires the draft never be mistaken for the customer having written in.
     """
+    if event.event_type in SCHEDULED_EVENT_TYPES:
+        # Unreachable from any route today — `app/workers/sla_tasks.py` is the only writer
+        # of these two event types, and it calls `notify_sla_alert` rather than this. The
+        # guard is here anyway because "unreachable" is a claim about today, and if a
+        # request ever did produce one, staging zero rows is right and alerting twice is
+        # not.
+        return []
+
     if event.event_type in SILENT_EVENT_TYPES or event.event_type in DEFERRED_EVENT_TYPES:
         return []
 
@@ -345,6 +372,132 @@ def enqueue_delivery(notifications: Sequence[Notification]) -> int:
             continue
         queued += 1
     return queued
+
+
+# The two scheduled event types and the notification each produces. A mapping rather than
+# a derived name, so a change to one enum cannot silently change what the other means —
+# and the same shape as `_notification_type_for`, which is the request path's version of
+# this decision.
+_SCHEDULED_NOTIFICATION_TYPES: dict[TicketEventType, NotificationType] = {
+    TicketEventType.SLA_WARNING: NotificationType.SLA_WARNING,
+    TicketEventType.SLA_BREACHED: NotificationType.SLA_BREACHED,
+}
+
+# The two timers, in the words a person uses for them. Kept here rather than derived from
+# the enum member's name so the sentence reads as English and stays under `title`'s 200
+# characters without anyone having to count.
+_TIMER_LABELS: dict[SLATimer, str] = {
+    SLATimer.RESPONSE: "first response",
+    SLATimer.RESOLUTION: "resolution",
+}
+
+
+async def notify_sla_alert(
+    session: AsyncSession,
+    *,
+    organization_id: uuid.UUID,
+    ticket: Ticket,
+    alert: SLAAlert,
+) -> list[Notification]:
+    """Stage the notifications for one alert the sweep found due. **Never commits.**
+
+    The second entry point into staging, and the only one that runs without a request. Why
+    it is a function here rather than a branch of `notify_for_event`: that one is addressed
+    from a `TicketEvent` a caller just produced, filters the actor out of their own alert,
+    and assumes a `TenantContext`. This has no event to read — the sweep is *producing* it —
+    no actor to filter, and no context, since `app/workers/sla_tasks.py` runs with no
+    authenticated identity. Passing a fabricated `TenantContext` to reuse the other
+    function would mean inventing a user id that is not a user (ADR-009, spec §4).
+
+    `alert` comes from `sla_service.due_alerts`, which owns the judgement of *what* is due;
+    this function owns only *who* hears about it. The split is why the sweep's rule can be
+    unit-tested without a database, and why the two enums meet in exactly one place.
+
+    **A breach is a second alert, not a correction of the first.** §26 names only the
+    warning; the breach is this phase's addition, because "you have 20 minutes" and "you are
+    40 minutes late" were both true when they were sent and are different facts about the
+    world. Nothing is retracted when the second goes out.
+
+    **The assignee and every active manager**, which is §27's "agents/managers when
+    appropriate" read as a fan-out. The manager owns the queue, so a deadline on a ticket
+    nobody picked up is their business rather than nobody's — which is why an unassigned
+    ticket still produces alerts, addressed to the managers alone. A system alert with no
+    recipient is the exact failure the feature exists to prevent.
+
+    The assignee comes off the typed `ticket.assigned_agent_id` and is not re-checked for
+    activity, unlike the managers. There is nothing to correct if it turns out to be a
+    deactivated account: the managers are on the alert either way, and a ticket still
+    assigned to someone who has left is one they need to know about.
+
+    `due_at` is carried into the title *and* stored on the timeline entry by the caller,
+    both deliberately. A policy edited next month must not rewrite what the alert said
+    happened, and the recipient's question is "what was I racing", which only the deadline
+    at the time answers.
+
+    Never commits. `app/workers/sla_tasks.py` commits once per organization, after staging
+    every alert for every ticket in it.
+    """
+    from app.repositories import sla_repository
+
+    # The one place the timeline's vocabulary and the notification's meet. Above the
+    # recipient loop because it is a property of the alert, not of who receives it.
+    notification_type = _SCHEDULED_NOTIFICATION_TYPES[alert.event_type]
+
+    # Order matters and so does the dedupe: a manager working a ticket they are also
+    # assigned to is one person owed one alert, not two, and `dict.fromkeys` keeps the
+    # assignee first — the person with the most direct claim to it.
+    recipient_ids = dict.fromkeys(
+        [
+            *([ticket.assigned_agent_id] if ticket.assigned_agent_id is not None else []),
+            *await sla_repository.find_manager_ids(session, organization_id),
+        ]
+    )
+
+    notifications: list[Notification] = []
+    for recipient_id in recipient_ids:
+        notification = Notification(
+            organization_id=organization_id,
+            user_id=recipient_id,
+            notification_type=notification_type,
+            title=_sla_title(notification_type, alert.timer, alert.due_at),
+            # The same two bounded columns as every other notification, so the length
+            # argument in `notify_for_event` holds here unchanged: `number` is an integer
+            # and `subject` is `String(500)`.
+            body=f"#{ticket.number} - {ticket.subject}",
+            ticket_id=ticket.id,
+        )
+        # `session.add` rather than a repository, for the reason `audit_service.record`
+        # gives: `NotificationRepository` is tenant-scoped, and constructing one from a
+        # context that does not exist would add a constructor argument and nothing else.
+        session.add(notification)
+        notifications.append(notification)
+
+        logger.info(
+            "notification_staged",
+            notification_type=str(notification_type),
+            organization_id=str(organization_id),
+            recipient_id=str(recipient_id),
+            ticket_id=str(ticket.id),
+            timer=str(alert.timer),
+        )
+
+    return notifications
+
+
+def _sla_title(notification_type: NotificationType, timer: SLATimer, due_at: datetime) -> str:
+    """ "SLA warning: first response is due 2026-09-16 14:32 UTC", in the reader's voice.
+
+    The deadline is in the title rather than the body because it is the one fact the
+    recipient has to act on, and it is rendered in UTC with the zone spelled out — an alert
+    that says "14:32" to someone in another timezone is worse than one that says nothing.
+    `astimezone` rather than trusting the value's own zone, since a `timestamptz` column
+    is only UTC by convention and the render should not depend on that holding.
+    """
+    label = _TIMER_LABELS[timer]
+    deadline = due_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+    if notification_type is NotificationType.SLA_BREACHED:
+        return f"SLA breach: {label} was due {deadline}"
+    return f"SLA warning: {label} is due {deadline}"
 
 
 # ---------------------------------------------------------------------------

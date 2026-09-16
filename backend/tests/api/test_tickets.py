@@ -126,6 +126,12 @@ def test_a_ticket_is_returned_with_the_documented_fields(
         "closed_at",
         "created_at",
         "updated_at",
+        # Phase Q. Present on *every* ticket payload, not only the two read routes, and
+        # populated for a staff caller — `POST /tickets` returns the ticket's clock
+        # alongside the ticket, so a client that renders straight from the creation
+        # response shows the countdown without a second request. Null for a portal caller,
+        # which `tests/api/test_ticket_sla.py` asserts directly.
+        "sla",
     }
     # The tenant is implied by the caller's token, never a field.
     assert "organization_id" not in response.text

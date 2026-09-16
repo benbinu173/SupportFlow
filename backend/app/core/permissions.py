@@ -267,6 +267,22 @@ SENDER_TYPE_BY_ROLE: Mapping[UserRole, SenderType] = {
     UserRole.CUSTOMER: SenderType.CUSTOMER,
 }
 
+# Roles that own the queue, and are therefore told when one of its tickets is racing a
+# deadline. §27 says "notify agents/managers when appropriate"; this is the manager half.
+# The assignee half is not a role at all — it is the `assigned_agent_id` column, read off
+# the ticket itself, which is why it is not here.
+#
+# **Managers and not admins, and §3 is what draws that line.** An admin holds every
+# capability a manager holds, so "who may act on this ticket" cannot tell the two apart —
+# and fanning out to everyone who could act would make an SLA alert indistinguishable
+# from the notification centre. The queue is the manager's job in the matrix, and an admin
+# who wants the alerts is one `PATCH /users/{id}/role` away from being told.
+#
+# A set rather than a `UserRole.MANAGER` comparison at the query site: "who owns the
+# queue" belongs beside the matrix that decides what owning it means, and
+# `tests/unit/test_permissions.py` rejects the comparison form anywhere else.
+SLA_ALERT_ROLES: frozenset[UserRole] = frozenset({UserRole.MANAGER})
+
 
 # ---------------------------------------------------------------------------
 # Lookups

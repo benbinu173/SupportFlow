@@ -53,6 +53,23 @@ class Settings(BaseSettings):
     CELERY_TASK_SOFT_TIME_LIMIT_SECONDS: int = 60
     CELERY_TASK_TIME_LIMIT_SECONDS: int = 120
 
+    # --- SLA ---------------------------------------------------------------
+    # How often beat runs the deadline sweep, and how many tickets one priority's pass
+    # looks at. Both arrived with their consumer in Phase Q, per the rule above.
+    #
+    # The interval is the knob that decides how late an alert can be, and the shortest
+    # §27 target is the one that sets the requirement: URGENT's response target is 30
+    # minutes with the warning at 80%, so a warning is due 24 minutes after creation and
+    # a 300-second sweep bounds how late it fires. At the other end — LOW, 24 hours to
+    # response, 19.2 hours to the warning — the same sweep is noise.
+    SLA_SWEEP_INTERVAL_SECONDS: int = 300
+
+    # A bound rather than an expectation: one organization's backlog must not make a
+    # single task run unbounded. 500 covers any realistic tenant, and the timeline guard
+    # means the work per ticket shrinks as the sweep catches up — a warning fires once,
+    # so a ticket already alerted costs a `NOT EXISTS` and nothing more.
+    SLA_SWEEP_BATCH_SIZE: int = 500
+
     # --- Email ------------------------------------------------------------
     # Mailpit locally, any SMTP provider in production. Host, port, and sender carry
     # defaults for the same reason `S3_ENDPOINT` does: none is a secret and each has an

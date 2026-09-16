@@ -506,4 +506,19 @@ def test_every_route_declares_the_capability_the_matrix_assigns(api: FastAPI) ->
         ("GET", "/api/v1/notifications/unread-count"): {Permission.NOTIFICATION_LIST},
         ("POST", "/api/v1/notifications/read-all"): {Permission.NOTIFICATION_LIST},
         ("POST", "/api/v1/notifications/{notification_id}/read"): {Permission.NOTIFICATION_LIST},
+        # --- SLA ----------------------------------------------------------
+        # Two routes with two different capabilities, and the asymmetry is §3's matrix
+        # rather than a choice made here. Reading the targets is `SLA_VIEW`, which admin,
+        # manager, and agent all hold — an agent working to a deadline needs to know what
+        # the deadline is. Setting them is `SLA_CONFIGURE`, admin alone: the targets are a
+        # business commitment, and a manager who wants the operational ceiling raised asks
+        # rather than grants it.
+        #
+        # Addressed by priority rather than by id, so there is no `GET
+        # /sla/policies/{policy_id}` to list: a policy *is* its priority within a tenant.
+        # A ticket's own position is not here at all — it is `TicketRead.sla`, computed at
+        # read time, because a second path to one number is a second place for the
+        # authorization decision to be got wrong.
+        ("GET", "/api/v1/sla/policies"): {Permission.SLA_VIEW},
+        ("PATCH", "/api/v1/sla/policies/{priority}"): {Permission.SLA_CONFIGURE},
     }

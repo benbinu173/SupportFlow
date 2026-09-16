@@ -151,6 +151,13 @@ class NotificationType(StrEnum):
     NEW_CUSTOMER_REPLY = "new_customer_reply"
     MENTION = "mention"
     SLA_WARNING = "sla_warning"
+    # §26 names "SLA warning" and not "SLA breach", so this member is an addition rather
+    # than a transcription. Phase Q decided it, and `notification_service` records the
+    # reasoning: a warning and a breach are two true statements about the same ticket at
+    # two different times, so the second is a second alert rather than a correction of
+    # the first. The alternative — reusing `SLA_WARNING` for both — would leave a client
+    # unable to tell "you have 20 minutes" from "you are 40 minutes late".
+    SLA_BREACHED = "sla_breached"
     AI_ANALYSIS_COMPLETED = "ai_analysis_completed"
     TICKET_RESOLVED = "ticket_resolved"
 

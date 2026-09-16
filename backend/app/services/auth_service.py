@@ -48,7 +48,7 @@ from app.repositories.organization_repository import OrganizationRepository
 from app.repositories.refresh_token_repository import RefreshTokenRepository
 from app.repositories.user_repository import find_users_by_email_across_tenants
 from app.schemas.auth import LoginRequest, RegisterRequest
-from app.services import audit_service
+from app.services import audit_service, sla_service
 
 logger = structlog.get_logger(__name__)
 
@@ -152,6 +152,15 @@ async def register(
         # is more machinery than the race is worth.
         await session.rollback()
         raise ConflictError("That organization name is already taken.") from exc
+
+    # The four SLA policies §27 gives as sample values, written here rather than left for
+    # an admin to configure. A tenant whose SLA is inert until somebody visits a settings
+    # screen is a product decision the specification does not make, and §27 prints the
+    # numbers — which reads as "this is what you start with". Every ticket's clock works
+    # from the first one raised, and the admin can change or deactivate any of the four
+    # afterwards. In this transaction with the organization and its admin, for the reason
+    # the docstring gives about those two: a tenant must not be able to exist half-built.
+    session.add_all(sla_service.build_default_policies(organization.id))
 
     # The one call site with no `TenantContext`: the organization and its admin are
     # being created by this call, so there is no authenticated identity to read an actor

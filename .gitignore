@@ -21,6 +21,12 @@ venv/
 coverage.xml
 htmlcov/
 
+# Celery beat's schedule file, written by `make beat`. It records the last time each entry
+# ran — per-machine state, not configuration — and a stale one committed by accident would
+# make somebody else's beat skip its first sweep.
+.celerybeat-schedule
+celerybeat-schedule*
+
 # --- Node ------------------------------------------------------------------
 node_modules/
 dist/

@@ -10,7 +10,9 @@
 #   docker compose --profile full up --build
 #
 # On Windows the native Celery worker needs the solo pool:
-#   celery -A app.workers.celery_app worker --pool=solo --loglevel=info
+#   celery -A app.workers.celery_app worker --pool=solo --loglevel=info -Q notifications,sla
+# and the scheduler is a second process, which runs without the pool flag:
+#   celery -A app.workers.celery_app beat --loglevel=info -s /tmp/celerybeat-schedule
 
 name: supportflow
 
@@ -122,16 +124,49 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    # The worker. One queue (`notifications`), and no `beat` service: every task Phase P
-    # defines is event-driven, and a scheduler with nothing to schedule is a process
-    # waiting for work that does not exist. SLAs (Phase Q) are the first thing that needs
-    # one, and it arrives with them (ADR-023).
+    # The worker, and it consumes *both* queues. `-Q` is not optional: a worker started
+    # without it takes the default queue only, so SLA tasks would pile up in Redis with
+    # nothing consuming them and no error anywhere — the classic Celery deployment trap.
+    # `tests/integration/test_celery_wiring.py` reads this line and the Makefile and
+    # asserts the list matches `task_routes`, so the two cannot drift.
     #
     # The default prefork pool, unlike the host's `--pool=solo`: forking a process per
     # core is what Linux is good at, and the solo pool exists on Windows only because
     # psycopg's async mode needs a selector loop the Proactor default does not provide
     # (ADR-011).
-    command: celery -A app.workers.celery_app worker --loglevel=info
+    command: celery -A app.workers.celery_app worker --loglevel=info -Q notifications,sla
+
+  beat:
+    profiles: ["full"]
+    build:
+      context: ./backend
+      target: development
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-supportflow}:${POSTGRES_PASSWORD:-supportflow}@postgres:5432/${POSTGRES_DB:-supportflow}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/2
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      S3_ENDPOINT: http://minio:9000
+      SMTP_HOST: mailpit
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # The scheduler. It publishes; it never consumes, so it needs no `-Q` and no pool
+    # choice. It is the only beat process in the system and must stay that way: beat keeps
+    # its own schedule state and two instances each fire every entry, which would run the
+    # sweep twice per interval and stage every alert twice. Do not scale this service.
+    #
+    # `-s` gives the schedule file an explicit path. The default is
+    # `celerybeat-schedule` in the working directory, and a beat that cannot write it
+    # fails at startup with a message about the file rather than about the cause.
+    # `/tmp` is writable in the container and needs no volume: the file records the last
+    # run time, and losing it on restart costs one extra sweep, not correctness.
+    command: celery -A app.workers.celery_app beat --loglevel=info -s /tmp/celerybeat-schedule
 
 volumes:
   postgres_data:

@@ -1242,3 +1242,177 @@ one statement wide. A notification written while the worker is down is delivered
 starts, but a notification whose five retries are exhausted is **not** retried again — the
 row stays unstamped for a sweep that Phase Q or later will have to write.
 
+
+
+## ADR-024 — The SLA clock is derived on every read; only the alert is stored
+
+**Status:** accepted · Phase Q
+
+**Context.** §27 gives four priorities a first-response and a resolution target, on a sample
+table whose closing paragraph asks that the numbers not be presented as industry standards.
+§26 names "SLA warning" as an event worth a notification. §48 says "celery beat where
+needed". Phase Q is the first phase with work whose trigger is *the passage of time* — no
+request causes it and no user is waiting for it — and it is the phase five earlier places
+were left waiting for, each in writing: `SILENT_EVENT_TYPES` held `SLA_BREACHED` with a
+comment saying Phase Q would know whether a breach is a second alert or a correction of the
+first; `DEFERRED_EVENT_TYPES` held `SLA_WARNING`; the notification-policy test said of its
+own deferred case "this is the test that will need changing"; `test_celery_wiring.py`
+asserted an empty beat schedule with a comment naming SLA monitoring as the first thing that
+would need one; and ADR-023's own "No Celery beat" paragraph said the same. This decision is
+the answer to all five, and closing them is part of the work rather than a side effect of it.
+
+**Decision 1 — the position is computed, never stored.** Every input already exists as a
+column: `tickets.created_at` starts both clocks, `first_response_at` and `resolved_at` stop
+them, `tickets.status` decides which, and the organization's `SLAPolicy` for
+`tickets.priority` supplies the targets. `sla_service.resolve_position` is a pure function of
+those facts, and **the API and the scheduled sweep call the same one**. A stored `sla_due_at`
+would be a second copy of a derivable fact, and it would go stale the moment a ticket was
+reprioritised — the specific bug `notification_service` already warns about when it refuses
+to parse `from_value` back into structured data. The mechanical proof that nothing was stored
+is `alembic check` after this phase: **no new upgrade operations** at all, against a phase
+that touched five files and added a background job.
+
+**Decision 2 — the alert record is a `TicketEvent`, and the cost is an extra read.** What is
+*not* derivable is "have we already told somebody", and that has to be written down. The
+timeline is where it belongs — "SLA warning fired at 14:32" is what an agent wants to read on
+the ticket — and the schema was built for it: both `TicketEventType` members already existed
+with no producer, and `TicketEvent.actor_user_id` is already nullable and already commented
+*"NULL when the system acted rather than a person — SLA breaches and completed AI analyses
+have no actor."* The alternative was four nullable columns (`sla_response_warned_at`,
+`sla_resolution_warned_at`, and two for breaches) whose only reader is one query and whose
+content duplicates the timeline. The cost of the choice is real and is named here: the sweep's
+"already warned?" guard is a query against `ticket_events` rather than a null check on the
+ticket row. **It is not a `NOT EXISTS` per ticket** — that was the first shape and it is a
+worse one, because the same rows are also what the API reports as `warned_at` and
+`breached_at`, so a `NOT EXISTS` would answer the guard's question and then require a second
+query to answer the display's. `sla_repository.find_alerts` fetches the page's SLA entries in
+one `IN (…)` and `sla_service.index_alerts` turns them into "already warned, already
+breached": one query serving both, and therefore no way for them to disagree about what has
+been said. It is affordable because the candidate set is narrowed first by
+`tickets.ix_tickets_sla_pending` — the partial index whose comment reads *"SLA sweep: scans
+unresolved tickets only"*, written in Phase D for this query — and because
+`ix_ticket_events_ticket_created` leads with `ticket_id`, so the `IN` is one index probe per
+candidate. **No new index was added.**
+
+**At most four alerts per ticket, ever.** Two timers, two states, each behind its own guard.
+A ticket nobody touches for a week on URGENT produces one warning and one breach for its
+response timer and one of each for its resolution timer, and is silent forever after. It is a
+bounded, checkable property and it is checked by *running the sweep twice*: the second pass
+returns all zeros and writes nothing.
+
+**Decision 3 — the sweep has no `TenantContext`, and fabricating one is the failure the
+context exists to prevent.** `check_organization_sla` runs with no request, no token, and no
+authenticated identity. `TenantContext.user_id` is a required `uuid.UUID` and the module's
+whole argument is that every field is derived from an identity — so a synthesized context
+would carry a user id that is not a user and a role that decides permissions and describes
+nobody, which is the class of thing ADR-009 and §4 forbid. The answer is the precedent
+already in the codebase: `audit_service.record` exists beside `record_for` for exactly this
+reason, and `user_repository.find_users_by_email_across_tenants` is a module-level *function*
+rather than a method *"so it cannot be reached for by accident while holding a scoped
+repository."* `app/repositories/sla_repository.py` follows that shape — no class, module-level
+functions taking `organization_id` explicitly — and its docstring enumerates every function,
+because the value of the precedent is that the set of context-free queries stays countable
+and auditable. The notification rows are built with `session.add` for the reason
+`audit_service.record` gives: a repository constructed from a context that does not exist
+"would add a constructor requirement and nothing else".
+
+This is the first code in the project that reads tenant data with no caller, so it is also
+the first where a missing `organization_id` clause is a cross-tenant leak that no API test
+can reach — the endpoints never call these functions. `tests/security/test_sla_isolation.py`
+drives the sweep once per tenant for that reason, and asserts the rows the *other* tenant
+never got.
+
+**Decision 4 — a breach is a second alert, not a correction of the first.** §26 names only
+the warning; the breach is this phase's addition, on the grounds that "you have 20 minutes"
+and "you are 40 minutes late" were both true when they were sent and call for different
+responses. Nothing is retracted when the second goes out. This needed one new
+`NotificationType`, and the migration that adds it is **hand-written**: Alembic's autogenerate
+does not detect enum member additions, so a phase that added the member, ran `alembic
+revision --autogenerate`, and got an empty revision would discover the gap in production the
+first time an SLA breach was written — in a scheduled code path nobody is watching.
+
+**That migration's downgrade is a no-op, and the upgrade had to become idempotent because of
+it.** PostgreSQL has no `ALTER TYPE … DROP VALUE`; removing an enum member means recreating
+the type and rewriting every column that uses it, and the alternative — deleting the
+`'sla_breached'` rows first — destroys data to undo a schema change. So there is genuinely
+nothing for `downgrade()` to do. It **raised** in the first draft, on the reasoning that a
+sentence is more honest than a silent no-op, and that was wrong: the effect was that
+`downgrade base` — the command `tests/integration/test_migrations.py` runs to prove the schema
+can be torn down and rebuilt — stopped working for every migration in the chain in order to
+report a fact about one value. A downgrade that cannot run is not a more honest downgrade.
+The honesty belongs in the docstring. The second half is the consequence: a downgrade that
+leaves the label behind means a later `upgrade` re-runs `ADD VALUE` and finds it there, so
+the statement is `ADD VALUE IF NOT EXISTS`. The suite caught exactly that, as `DuplicateObject:
+enum label "sla_breached" already exists` on the round-trip — which is why the two decisions
+have to be made together, and why the reasoning is recorded rather than the one-word fix.
+
+**Decision 5 — wall-clock UTC, from `created_at`, with no pause.** The specification mentions
+business hours, calendars and timezones nowhere (checked case-insensitively across all 2730
+lines); §27's figures are bare durations. So both timers run continuously from creation.
+`WAITING_FOR_CUSTOMER` does **not** pause the resolution clock: pausing means storing elapsed
+pause time, which is a schema change and a rule the specification does not state. This is a
+limitation and is listed as one in the README, not left as a silent default.
+
+**Decision 6 — the assignee and every active manager, which §27 does not specify.** §27's
+"notify agents/managers when appropriate" is a fan-out it leaves open. The manager owns the
+queue, so a deadline on a ticket nobody picked up is their business rather than nobody's —
+which is why an unassigned ticket alerts the managers alone and **never alerts nobody**. A
+system alert with no recipient is the exact failure the feature exists to prevent. Admins are
+excluded: §3 gives them every capability, so "who may act" cannot separate them from a
+manager, and an alert set that included everyone who could act would be indistinguishable
+from the notification centre. Deactivated managers are skipped, for the reason
+`_portal_users_for` drops inactive portal logins: a row addressed to an account that cannot
+sign in is one nobody reads. **Which roles those are lives in `core/permissions.py` as
+`SLA_ALERT_ROLES`**, not as a `UserRole.MANAGER` comparison at the query site — the
+role-comparison guard in `tests/unit/test_permissions.py` rejected the first version, and it
+was right to: "who owns the queue" is a decision that belongs beside the matrix that decides
+what owning it means.
+
+**Decision 7 — two Celery tasks and a second queue.** `check_sla_deadlines` is beat's entry
+point: it reads the active organization ids and dispatches one `check_organization_sla` each.
+Two tasks rather than one loop over the fleet, so that one tenant's pathological backlog
+cannot delay every other tenant's alerts and a failure is logged against the tenant that
+caused it. It is also the fan-out shape the report and knowledge phases reuse.
+
+The sweep runs on its own `sla` queue. The `notifications` worker holds a slot for up to the
+full SMTP timeout; the sweep touches no SMTP and wants to finish in seconds, so sharing one
+queue would mean a mail server outage delays every alert and a slow sweep delays every email.
+**This revises ADR-023's "one queue"**, which was the honest amount for one task type and is
+not for two. The price of two queues is the classic Celery deployment trap: a worker started
+without `-Q sla` consumes nothing at all while looking perfectly healthy — it connects,
+reports ready, and leaves every SLA task sitting in Redis forever, with no error, no metric
+and no log line, because from Celery's point of view nothing is wrong. That cannot be reached
+by a test that starts no worker, so it is checked where it is decided:
+`tests/integration/test_celery_wiring.py` parses `docker-compose.yml` and the `Makefile` and
+asserts the worker command names **every** queue in `task_routes`, so the two cannot drift.
+
+**Decision 8 — every route that returns a ticket returns its clock.** The first draft
+decorated `GET /tickets` and `GET /tickets/{id}` only, reasoning that the six mutation routes
+echo the ticket back rather than reporting it. That was wrong, and the reason is a Pydantic
+default: `TicketRead.sla` is `TicketSLARead | None = None`, so an undecorated response does
+not *omit* the field — it serializes `"sla": null`, which is the identical payload a portal
+caller receives. A client doing `setTicket(await assign(...))` would watch the countdown
+disappear the moment somebody assigned the ticket, with no way to tell that from the
+authorization case. One module-level helper in `app/api/tickets.py` now serves all eight
+routes, which makes "a ticket response carries its clock" a property of the module rather
+than of eight call sites. `tests/api/test_ticket_sla.py` exercises every one of them, because
+a call site that forgot the helper is precisely what a test of the read routes cannot see.
+
+**What Phase Q deliberately does not do.** §31's "SLA risks" and §28's `GET /analytics/sla`
+are Phase S's: both need the deadline arithmetic expressed in SQL to sort and paginate by it,
+and a second implementation of the clock that agrees with the pure function until one of them
+is edited is the failure this whole design is arranged to avoid. §3's matrix gives `SLA_VIEW`
+to admin, manager and agent and not to customer, so a portal caller's `sla` is `null` and the
+timeline hides its SLA entries — two absences a client cannot distinguish from "this priority
+has no active policy", which is deliberate. And ADR-023's closing debt is **still open**: a
+notification whose five delivery attempts are exhausted leaves its row unstamped, and Phase Q
+did not write the sweep that picks those up. It is a smaller debt than it was — the row and
+the badge are the feature, and the email is a second way to learn about one — but it is not
+closed, and this paragraph is where that is admitted.
+
+**Cost.** A scheduled job is a new class of thing to operate: exactly one beat process (two
+would double every sweep), a queue that a worker must be told about, and a judgement — the
+sweep does not alert on a terminal ticket even when it is overdue — that lives in
+`sla_repository.find_pending`'s `status` filter rather than in the clock. Five code comments
+that named this phase are now paid, and the two enums that were waiting for producers have
+them.

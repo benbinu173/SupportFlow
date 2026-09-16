@@ -2,7 +2,8 @@
 
 Phase C added `celery` to `pyproject.toml` and Phase P is where a consumer arrived, the
 same way Redis sat unused until Phase O. This module is the app object; the tasks live
-in `app.workers.email_tasks`, imported below so that starting a worker with
+in `app.workers.email_tasks` and `app.workers.sla_tasks`, both named in `include` below so
+that starting a worker with
 
     celery -A app.workers.celery_app worker
 
@@ -23,6 +24,11 @@ services that queue tasks (`notification_service.enqueue_delivery`), and those o
 reaches the API stays small, and the module that configures the worker is not the module
 that defines the work.
 
+**`include` is a list rather than imports, so the API process does not build a worker.**
+A task module reaches the database through `app/core/event_loop.run` and creates an engine
+at import time; importing one from the app object would do that inside every API process
+too. Celery imports them in the *worker*, which is the only process that should have them.
+
 Every setting below is a decision with a reason, because Celery's defaults are tuned for
 a different kind of deployment — a large, trusted, tasks-internal one. This is an
 internet-facing multi-tenant API whose worker sends email outbound, and the defaults are
@@ -35,20 +41,29 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
-# One queue, named for its purpose. §51's Phase P asks for "task routing", and a route
-# table with one entry in it is the honest amount of routing for one task type: it makes
-# the destination explicit instead of relying on the default queue's name, and it is the
-# line that changes when the next producer arrives. The queues that will join it are
-# `ai` (Phases T-W), `reports` (S), and `knowledge` (X) — none of which is declared here,
-# because declaring a queue nothing publishes to is a worker process waiting for work
-# that does not exist.
+# Two queues now, each named for its purpose. §51's Phase P asks for "task routing", and
+# the route table's entries are what makes each destination explicit instead of relying on
+# the default queue's name — and the line that changes when the next producer arrives. The
+# queues that will join them are `ai` (Phases T-W), `reports` (S), and `knowledge` (X) —
+# none of which is declared here, because declaring a queue nothing publishes to is a
+# worker process waiting for work that does not exist.
 NOTIFICATIONS_QUEUE = "notifications"
+
+# Phase Q. Separate from `notifications` because the two have nothing in common: one holds
+# a worker slot for up to the SMTP timeout and talks to a mail server, the other finishes
+# in seconds and talks only to PostgreSQL. On one queue, a mail server outage delays every
+# SLA alert and a slow sweep delays every email — two unrelated failure modes made each
+# other's problem.
+SLA_QUEUE = "sla"
 
 celery_app = Celery(
     "supportflow",
     broker=str(settings.CELERY_BROKER_URL),
     backend=str(settings.CELERY_RESULT_BACKEND),
-    include=["app.workers.email_tasks"],
+    # Both task modules, for the reason the docstring gives: a module that is not imported
+    # is not in the registry, and every message for it fails as `Received unregistered
+    # task`, which reads like a broker fault.
+    include=["app.workers.email_tasks", "app.workers.sla_tasks"],
 )
 
 celery_app.conf.update(
@@ -101,7 +116,30 @@ celery_app.conf.update(
     task_time_limit=settings.CELERY_TASK_TIME_LIMIT_SECONDS,
     # --- Routing ------------------------------------------------------------
     task_default_queue=NOTIFICATIONS_QUEUE,
-    task_routes={"app.workers.email_tasks.*": {"queue": NOTIFICATIONS_QUEUE}},
+    task_routes={
+        "app.workers.email_tasks.*": {"queue": NOTIFICATIONS_QUEUE},
+        "app.workers.sla_tasks.*": {"queue": SLA_QUEUE},
+    },
+    # --- Schedule -----------------------------------------------------------
+    # Beat's whole configuration, and the first entry this project has ever had: Phase P
+    # built the worker but nothing needed a clock, which is why the wiring test asserted
+    # this was empty until Phase Q filled it.
+    #
+    # The interval is a setting because it is the knob that decides how late an alert can
+    # be — see `app/core/config.py`. The task name is spelled out rather than referenced,
+    # matching the route table above: both are strings the worker and beat must agree on
+    # with the decorator, and `tests/integration/test_celery_wiring.py` checks that they do.
+    #
+    # **Exactly one beat process.** Beat is a singleton by construction — two of them each
+    # fire every entry on their own schedule, so the sweep runs twice per interval and
+    # every alert is staged twice. Nothing in this file can prevent that; compose runs one
+    # `beat` service and the README says not to scale it.
+    beat_schedule={
+        "sla-deadline-sweep": {
+            "task": "app.workers.sla_tasks.check_sla_deadlines",
+            "schedule": float(settings.SLA_SWEEP_INTERVAL_SECONDS),
+        }
+    },
     # --- Worker lifecycle ---------------------------------------------------
     # Do not let Celery replace the root logger's handlers. The application logs through
     # structlog to stdout, and a worker that reconfigures the root logger logs in a

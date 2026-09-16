@@ -101,6 +101,8 @@ rather than falling back to something insecure.
 | `REDIS_URL` | Rate limiting today; db 0. The Celery broker uses db 2 (required) |
 | `CELERY_BROKER_URL` / `CELERY_RESULT_BACKEND` | Redis db 2 — a separate database from the cache, so a `FLUSHDB` cannot take out a queue |
 | `SMTP_*` | Mail server. Defaults to Mailpit on `localhost:1025`; `SMTP_USERNAME`/`SMTP_PASSWORD`/`SMTP_STARTTLS` for a real provider |
+| `SLA_SWEEP_INTERVAL_SECONDS` | How often beat runs the deadline sweep (default 300). It is the knob that decides how late a warning can be: at URGENT's 24-minute warning band it bounds the delay at 5 minutes |
+| `SLA_SWEEP_BATCH_SIZE` | Tickets per priority per sweep (default 500) |
 | `RATE_LIMIT_*` | Per-address login/registration limits and the per-user upload limit |
 | `JWT_SECRET` | Access-token signing; minimum 32 characters (required) |
 | `CORS_ORIGINS` | Comma-separated allowlist. No wildcard — the refresh cookie needs credentials |
@@ -116,9 +118,15 @@ pytest -m security          # tenant-isolation and authz tests only
 ruff check . && ruff format --check .
 mypy app alembic
 
-# The notification worker, needed for any email to actually be sent. Separate from
-# the API process and from the tests, which record the enqueue rather than sending.
-celery -A app.workers.celery_app worker --loglevel=info --pool=solo
+# The worker, needed for any email to actually be sent and for SLA alerts to fire.
+# `-Q` must name *every* queue in `task_routes` — see the SLA section for why a worker
+# that misses one looks perfectly healthy and silently consumes nothing.
+celery -A app.workers.celery_app worker --loglevel=info --pool=solo -Q notifications,sla
+
+# Beat, which is the clock the SLA sweep runs on. Exactly one process: two would
+# double every sweep. The explicit schedule path is not optional — the default writes
+# into the working directory, and a beat that cannot write it fails at startup.
+celery -A app.workers.celery_app beat --loglevel=info -s /tmp/celerybeat-schedule
 
 # End-to-end against a running server, including the parts TestClient cannot show
 # (real multipart, real streaming, real headers). Needs the API on :8000.
@@ -126,8 +134,13 @@ python scripts/phase_ln_walkthrough.py
 
 # The same, for notifications: needs the API on :8000, the worker above, and Mailpit.
 # Reads the delivered message back out of Mailpit's API at :8025 — see the Notifications
-# section for the full three-process setup.
+# section for the full process list.
 python scripts/phase_p_walkthrough.py
+
+# And for SLAs: the same setup plus beat. A ticket is aged in SQL — the one thing no
+# endpoint exposes — the sweep is invoked the way beat invokes it, and the alert email
+# is read back out of Mailpit. Running the sweep twice is part of the script.
+python scripts/phase_q_walkthrough.py
 
 # Frontend (from frontend/)
 npm test
@@ -652,7 +665,8 @@ The slow, fallible, external part — SMTP — is what goes to Celery, and the t
 id and nothing else. That ordering is load-bearing: the task's first act is to read the row,
 so it must be enqueued *after* the commit. ADR-023 has the reasoning and the measurement.
 
-**What notifies whom**, from §26's list of seven. Four have producers today:
+**What notifies whom**, from §26's list of seven. Four have producers on the request path,
+and Phase Q added two that have no request at all:
 
 | Event | Recipient |
 |---|---|
@@ -660,18 +674,26 @@ so it must be enqueued *after* the commit. ADR-023 has the reasoning and the mea
 | Ticket reassigned | the new assignee (distinguished by `from_value`) |
 | New customer reply | the assigned agent |
 | Ticket resolved | every portal login of the ticket's customer |
+| SLA warning (scheduled) | the assignee, if there is one, **and** every active manager |
+| SLA breach (scheduled) | the same |
 
 `CREATED`, `UNASSIGNED`, `PRIORITY_CHANGED`, `INTERNAL_NOTE_ADDED`, `ATTACHMENT_ADDED` and
 `REOPENED` notify nobody, because §26 does not list them — stated explicitly rather than
-left to omission, and pinned by a test. SLA warnings arrive with Phase Q, AI-analysis
-completions with T–W, and **manager mentions are deferred**: the phrase occurs exactly once
-in the specification, with no syntax, no resolution rule, and no UI, so
-`NotificationType.MENTION` stays in the enum unreachable.
+left to omission, and pinned by a test. AI-analysis completions arrive with T–W, and
+**manager mentions are deferred**: the phrase occurs exactly once in the specification, with
+no syntax, no resolution rule, and no UI, so `NotificationType.MENTION` stays in the enum
+unreachable.
+
+The two scheduled rows are the ones a request cannot produce, and they are kept in a set of
+their own (`SCHEDULED_EVENT_TYPES`) rather than folded in with the request path's — the
+division says which code path sends them, not whether they are sent. There is also no actor
+to filter out of their own alert, because a system alert has no actor: that is the one
+branch of `notify_for_event` `notify_sla_alert` does not share. See the SLA section.
 
 Authorship of a reply is read from `message.sender_type`, not from the caller's role. An
 `AI_DRAFT` has no role and must never be mistaken for the customer writing in (§41).
 
-### Three processes, and why
+### Four processes, and why
 
 Nothing sends email unless a worker is running, and the tests deliberately do not start one.
 The suite replaces the *enqueue* with a recorder rather than turning on `task_always_eager`,
@@ -685,10 +707,16 @@ notification rather than merely testing differently.
 python -m uvicorn app.main:app --loop app.core.event_loop:loop_factory --port 8000
 
 # 2. the worker, from backend/ — --pool=solo because fork is not available on Windows
-celery -A app.workers.celery_app worker --loglevel=info --pool=solo
+#    The -Q list is not optional: a worker that does not name every routed queue consumes
+#    nothing from the ones it omits, silently. See the SLA section.
+celery -A app.workers.celery_app worker --loglevel=info --pool=solo -Q notifications,sla
 
-# 3. the walkthrough: drives the API, then reads the message back out of Mailpit's API
-python scripts/phase_p_walkthrough.py
+# 3. beat, from backend/ — exactly one process, and it needs no API and no worker
+celery -A app.workers.celery_app beat --loglevel=info -s /tmp/celerybeat-schedule
+
+# 4. the walkthrough: drives the API, then reads the message back out of Mailpit's API
+python scripts/phase_p_walkthrough.py    # notifications
+python scripts/phase_q_walkthrough.py    # SLA: the clock, the sweep, and the alerts
 ```
 
 Mailpit is the local mail server, on SMTP `1025` with an HTTP UI and API on `8025`. The
@@ -715,6 +743,137 @@ NULL`, which is the query a backlog sweep would use.
 Two settings are not defaults and both matter: `task_serializer`/`accept_content` are
 JSON-only, because a worker unpickling from a broker runs whatever the payload says, and
 `worker_prefetch_multiplier=1`, because a task here can block for a full SMTP timeout.
+
+## SLA
+
+Every organization is seeded with §27's four policies at registration, in the same
+transaction as the organization and its founding admin, so a new tenant's clock works from
+its first ticket rather than being inert until somebody opens a settings screen. The
+numbers are §27's sample configuration and the code says so: its closing paragraph asks
+that they not be presented as industry standards, and they are all editable.
+
+| Priority | First response | Resolution | Warning at |
+|---|---|---|---|
+| `low` | 24 h | 72 h | 80% |
+| `medium` | 8 h | 24 h | 80% |
+| `high` | 2 h | 8 h | 80% |
+| `urgent` | 30 min | 4 h | 80% |
+
+```
+GET   /api/v1/sla/policies              all four, in LOW…URGENT order   SLA_VIEW
+PATCH /api/v1/sla/policies/{priority}   a partial edit                  SLA_CONFIGURE (admin)
+```
+
+Reading the targets is `SLA_VIEW` — admin, manager, and agent all hold it, because an agent
+working to a deadline needs to know what the deadline is. Setting them is `SLA_CONFIGURE`,
+admin alone. Inactive policies are still listed, since a settings screen has to show a
+target in order to offer switching it back on; the clock ignores them. A `PATCH` is
+validated against the **merged** row, so raising the response target past an untouched
+resolution target is a `422` with a sentence rather than a `CheckViolationError` at commit.
+Every edit writes an `SLA_POLICY_UPDATED` audit row carrying the before and the after —
+both, because "what was the policy when this ticket breached" is the question an incident
+review asks.
+
+**There is no `/sla/tickets/{id}`.** A ticket's position is a field on the ticket:
+
+```json
+"sla": {
+  "response":   {"timer": "response", "state": "warning", "due_at": "…",
+                 "remaining_seconds": 293, "stopped_at": null,
+                 "warned_at": "…", "breached_at": null},
+  "resolution": {"timer": "resolution", "state": "on_track", "due_at": "…",
+                 "remaining_seconds": 14180, "stopped_at": null,
+                 "warned_at": null, "breached_at": null},
+  "policy":     {"id": "…", "priority": "urgent", "response_time_minutes": 30,
+                 "resolution_time_minutes": 240, "warning_threshold_percent": 80,
+                 "is_active": true}
+}
+```
+
+`state` is one of `on_track`, `warning`, `breached`, `met`. `remaining_seconds` is signed
+and relative to `stopped_at` when the timer has stopped — "resolved with two hours to
+spare", "resolved forty minutes late" — and to now when it has not. A stopped timer that
+landed late reads `breached` and not `met`: §28's compliance metric counts a late
+resolution as a miss, and `stopped_at` is what tells a client the work did happen.
+
+**The clock is derived on every read and stored nowhere.** Every input is already a column
+— `created_at` starts both timers, `first_response_at` and `resolved_at` stop them, and the
+priority's policy supplies the targets — and `resolve_position` is a pure function of those
+facts. It does not read `status` at all: whether an overdue resolution is worth *alerting*
+about is the sweep's judgement, and a clock that consulted status would be a clock with a
+policy in it. The API and the sweep call the same function, so they cannot disagree. A
+stored `sla_due_at` would be a second copy of a fact that follows from the columns above,
+and it would go stale the moment a ticket was reprioritised. `alembic check` reporting no new
+tables, columns, or indexes is the mechanical proof that nothing was stored — and the one
+migration this phase does ship adds an enum value, which is not a place a position could hide.
+
+**Every route that returns a ticket returns its clock**, not only the two read routes — a
+`TicketRead` carries `"sla": null` when it is not decorated, which is the same payload a
+portal caller gets, so a client rendering from a mutation response would watch the
+countdown vanish on assign. All eight routes share one helper.
+
+### Two clocks, four alerts, and a guard
+
+`POST /tickets/{id}/messages` by staff sets `first_response_at`; a resolution sets
+`resolved_at`, and reopening clears it. Neither is written by this phase — both were
+already written by the right code, with the right semantics.
+
+The sweep turns a state into an alert **once per timer per state**. Each of the four is
+behind its own guard, so a ticket nobody touches for a week on URGENT produces one warning
+and one breach for its response clock and one of each for its resolution clock, and is then
+silent forever. The guard reads the ticket's own timeline: the alert record *is* a
+`TicketEventType.SLA_WARNING` or `SLA_BREACHED` entry with `actor_user_id IS NULL`, which is
+exactly what that nullable column was documented for. One query fetches the page's SLA
+entries and serves both the judgement and the display, because the row the API reports as
+`warned_at` / `breached_at` is the row the guard reads — so the two cannot disagree about
+what has already been said. The entry records the deadline it fired against, so editing the
+policy next month does not rewrite what the timeline says happened.
+
+A **breach is a second alert, not a correction of the first**: §26 names only the warning,
+and "you have 20 minutes" and "you are 40 minutes late" were both true when they were sent.
+Nothing is retracted when the second goes out. A timer that was already past its deadline
+the first time the sweep looked at it sends the breach and never the warning — "you have 20
+minutes" arriving after the deadline would be worse than the miss it describes.
+
+### The sweep, and the queue it runs on
+
+```bash
+# both, from backend/ — the API is not needed for beat
+celery -A app.workers.celery_app worker --loglevel=info --pool=solo -Q notifications,sla
+celery -A app.workers.celery_app beat   --loglevel=info -s /tmp/celerybeat-schedule
+```
+
+`beat` fires `check_sla_deadlines` every `SLA_SWEEP_INTERVAL_SECONDS`, which reads the
+active organization ids and dispatches one `check_organization_sla` per tenant. Two tasks
+rather than one loop over the fleet, so one tenant's backlog cannot delay every other
+tenant's alerts and a failure is logged against the tenant that caused it. Each sweep
+commits once: every timeline entry and every notification row for that tenant lands
+together, so an alert can never be recorded with nobody notified — which would be
+permanent, since the guard reads the timeline.
+
+**The sweep runs on its own `sla` queue, and that makes `-Q` load-bearing.** With one queue
+a missing `-Q` is invisible, because the default is the only queue that exists. With two, a
+worker started without `-Q sla` **consumes nothing at all** while looking perfectly healthy:
+it connects, reports ready, and leaves every SLA task in Redis forever, with no error, no
+metric and no log line. That is not a prediction — a worker started with `-Q notifications`
+alone sat for twenty seconds with four sweep tasks queued behind it (`LLEN sla` steady at 4),
+having logged nothing beyond `ready`, and drained all four the moment the same worker was
+started with `-Q notifications,sla`. Nothing in the application can notice, because from
+Celery's point of view nothing is wrong — so
+[tests/integration/test_celery_wiring.py](backend/tests/integration/test_celery_wiring.py)
+parses `docker-compose.yml` and the `Makefile` and asserts the worker command names every
+queue in `task_routes`. The two cannot drift.
+
+**Exactly one beat process.** Two would double every sweep; the guard would stop the second
+one from double-alerting, but the waste would be silent.
+
+### What the portal sees
+
+`TicketRead` is shared by all four roles, and §3 withholds `SLA_VIEW` from the customer, so
+a portal caller's `"sla"` is `null` and its timeline hides the SLA entries. That null is
+deliberately indistinguishable from "this priority has no active policy" — the second is a
+fact about the tenant's configuration, and telling a customer which priorities their
+provider has targets for is the disclosure the null exists to prevent.
 
 ## Security posture
 
@@ -804,17 +963,17 @@ instead; see [Rate limiting](#rate-limiting).
 | L–N | Attachments, audit logging, search | ✅ |
 | O | Redis: shared client, rate-limit consolidation | ✅ |
 | P | Celery, notifications, email delivery | ✅ |
-| Q | SLA monitoring, beat | next |
-| R–S | WebSockets, analytics | |
+| Q | SLA monitoring, beat | ✅ |
+| R–S | WebSockets, analytics | next |
 | T–W | AI foundation, analysis, summaries, drafts | |
 | X | Knowledge base and RAG | |
 | Y–Z | Hardening, deployment | |
 
 ## Known limitations
 
-- Three migrations exist: the baseline, Phase N's message full-text index, and Phase P's
-  `notifications.emailed_at`. The baseline is still the first revision, so there is no
-  upgrade path from an older schema.
+- Four migrations exist: the baseline, Phase N's message full-text index, Phase P's
+  `notifications.emailed_at`, and Phase Q's `notification_type` enum value. The baseline is
+  still the first revision, so there is no upgrade path from an older schema.
 - The test suite builds its schema with `Base.metadata.create_all` rather than by
   applying migrations. That keeps tests fast, and the drift check in
   [tests/integration/test_migrations.py](backend/tests/integration/test_migrations.py)
@@ -836,8 +995,30 @@ instead; see [Rate limiting](#rate-limiting).
   resolution rule. `NotificationType.MENTION` is in the enum and unreachable.
 - **No WebSocket push.** The notification is persisted so that Phase R has something to
   push, but clients poll today.
-- **No Celery beat service.** Every task is event-driven; the first scheduled one is SLA
-  monitoring in Phase Q (ADR-023).
+- **SLA timers run on wall-clock UTC, with no business calendars and no pause.** §27's
+  figures are bare durations, and the spec mentions business hours, calendars, or timezones
+  nowhere. A ticket raised at 23:50 on Friday against a 2-hour target warns at 00:10 on
+  Saturday. `WAITING_FOR_CUSTOMER` does **not** stop the resolution clock: pausing means
+  storing elapsed pause time, which is a schema change for a rule the spec does not state.
+- **Four policies are seeded rather than configured.** A new organization gets §27's sample
+  numbers, which is a product decision the spec does not make — §27 gives values, which
+  reads as defaults, and "an admin must configure the SLA before anything works" is not a
+  reasonable first run. They are editable from the first request.
+- **A lost SLA email is not retried past the five attempts.** The `ticket_events` row is the
+  record and the notification is its delivery; a missing email narrows the alert but does
+  not erase it, and the timeline entry is still there when the agent opens the ticket. This
+  is different from a notification whose subject has no other record, which is why the
+  policy is stated rather than assumed.
+- **The SLA alert is not pushed.** Like every other notification it is persisted for Phase R
+  and polled today, so a warning's latency is the poll interval plus the sweep interval.
+- **One beat process, and two would double every sweep.** The timeline guard stops the
+  duplicate from double-alerting, so the failure is invisible rather than loud — the only
+  thing standing between it and silence is that beat is a single service in the compose file.
+- **The sweep is bounded at `SLA_SWEEP_BATCH_SIZE` tickets per priority per tenant**, served
+  oldest first. A tenant with more overdue tickets than that has the remainder picked up by
+  the next sweep, so the bound delays alerts rather than dropping them — but on a backlog
+  large enough to matter it is the *newest* tickets at that priority whose warnings arrive
+  late, and nothing reports that they did.
 - The deployment target is undecided; nothing in the architecture depends on a
   specific cloud.
 - On Windows, the API must be started with
@@ -899,6 +1080,6 @@ instead; see [Rate limiting](#rate-limiting).
   to whoever had it. That is a deliberate reading of `OPEN` as "nobody owns this", and
   the history is not lost: it is in `ticket_events`.
 - **The frontend has no screens for any of this.** Every phase since C has been
-  backend-only; the routes are exercised by 735 tests, and the SPA still shows the Phase
+  backend-only; the routes are exercised by 930 tests, and the SPA still shows the Phase
   C scaffolding.
 

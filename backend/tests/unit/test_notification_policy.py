@@ -27,7 +27,11 @@ from app.models.message import Message
 from app.models.ticket import Ticket
 from app.models.ticket_event import TicketEvent
 from app.services import notification_service
-from app.services.notification_service import DEFERRED_EVENT_TYPES, SILENT_EVENT_TYPES
+from app.services.notification_service import (
+    DEFERRED_EVENT_TYPES,
+    SCHEDULED_EVENT_TYPES,
+    SILENT_EVENT_TYPES,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -152,32 +156,40 @@ _HANDLED_EVENT_TYPES = frozenset(
 )
 
 
-def test_every_event_type_is_notified_deliberately_silent_or_deferred() -> None:
+def test_every_event_type_is_notified_deliberately_silent_deferred_or_scheduled() -> None:
     """No event type may be undecided.
 
-    The failure this catches is a future phase adding a `TicketEventType` — a real one is
-    coming for SLA breaches in Phase Q — and nobody asking whether it should notify
-    anybody. An unhandled type falls through the policy's `if` chain and produces nothing,
-    which is the correct behaviour by accident rather than by decision, and is
-    indistinguishable from a bug.
+    The failure this catches is a future phase adding a `TicketEventType` and nobody asking
+    whether it should notify anybody. An unhandled type falls through the policy's `if`
+    chain and produces nothing, which is the correct behaviour by accident rather than by
+    decision, and is indistinguishable from a bug.
 
-    This test is not hypothetical: written against a two-way split it failed, and the
-    three types it named — `SLA_WARNING`, `SLA_BREACHED`, and `AI_ANALYSIS_COMPLETED` —
-    were exactly the ones the policy had left undecided.
+    This test is not hypothetical. Written against a two-way split it failed, and the three
+    types it named — `SLA_WARNING`, `SLA_BREACHED`, and `AI_ANALYSIS_COMPLETED` — were
+    exactly the ones the policy had left undecided. Two of those three were Phase Q's, and
+    this is the test Phase Q came back to: `SCHEDULED_EVENT_TYPES` is the fourth set, and
+    it exists because "a request produces this" and "a clock produces this" are different
+    answers to "who sends it" even though both send.
 
-    Three sets, not two, because "we chose not to notify" and "we cannot yet" are
-    different answers. Equality in both directions, like the route allowlists: a type
-    removed from the enum leaves a stale entry, which would excuse a new type reusing the
-    name.
+    Four sets, not two, because "we chose not to notify", "we cannot yet", and "the
+    scheduler will" are three different things to find in the code six months from now.
+    Equality in both directions, like the route allowlists: a type removed from the enum
+    leaves a stale entry, which would excuse a new type reusing the name.
     """
     handled = _HANDLED_EVENT_TYPES
     silent = SILENT_EVENT_TYPES
     deferred = DEFERRED_EVENT_TYPES
+    scheduled = SCHEDULED_EVENT_TYPES
 
-    assert handled | silent | deferred == set(TicketEventType)
+    assert handled | silent | deferred | scheduled == set(TicketEventType)
+    # Pairwise disjoint, so no type is in two sets and the union above is a partition
+    # rather than a cover that happens to add up.
     assert not handled & silent
     assert not handled & deferred
+    assert not handled & scheduled
     assert not silent & deferred
+    assert not silent & scheduled
+    assert not deferred & scheduled
 
 
 @pytest.mark.parametrize("event_type", sorted(SILENT_EVENT_TYPES))
@@ -194,12 +206,35 @@ async def test_a_silent_event_notifies_nobody(event_type: TicketEventType) -> No
 
 @pytest.mark.parametrize("event_type", sorted(DEFERRED_EVENT_TYPES))
 async def test_a_deferred_event_notifies_nobody_yet(event_type: TicketEventType) -> None:
-    """The deferred types are quiet today, and this is the test that will need changing.
+    """The deferred types are quiet today, and this is the test that keeps needing changing.
 
-    When Phase Q or T-W gives one of them a producer, the type moves out of
-    `DEFERRED_EVENT_TYPES` and into `_HANDLED_EVENT_TYPES` below — at which point this
-    test stops running for it and a case has to be written for its recipient. That is the
-    intended friction: the recipient of an SLA warning is a decision, not a default.
+    Phase Q moved `SLA_WARNING` out of this parametrization and into the scheduled set
+    below; `AI_ANALYSIS_COMPLETED` is what remains, and Phases T-W will move it the same
+    way — at which point a case has to be written for its recipient. That is the intended
+    friction: the recipient of an event nobody produces yet is a decision, not a default.
+    """
+    ticket = _ticket(assigned_agent_id=uuid.uuid4())
+
+    assert await _notify(ticket, _event(event_type)) == []
+
+
+@pytest.mark.parametrize("event_type", sorted(SCHEDULED_EVENT_TYPES))
+async def test_a_scheduled_event_notifies_nobody_from_a_request(
+    event_type: TicketEventType,
+) -> None:
+    """An SLA alert is sent by the sweep, never by a request that produced the event.
+
+    The early return in `notify_for_event` is unreachable today — `sla_tasks` is the only
+    writer of these two event types and it calls `notify_sla_alert` — and this asserts the
+    behaviour that makes it safe if that ever stops being true. Without it, a request that
+    somehow produced an SLA event would stage a second set of alerts alongside the sweep's:
+    duplicate notifications are the failure that makes people stop reading them, and the
+    guard is one line.
+
+    **The absence of a producer here is also the assertion**, which is why this is
+    parametrized over the set and asserts against `_NoDatabase`: a request path that
+    reached staging for one of these would have to resolve a recipient, and there is no
+    recipient of an SLA alert inside a request that could be resolved from a loaded column.
     """
     ticket = _ticket(assigned_agent_id=uuid.uuid4())
 

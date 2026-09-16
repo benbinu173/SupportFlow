@@ -16,6 +16,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.enums import Sentiment, TicketEventType, TicketPriority, TicketStatus
+from app.schemas.sla import TicketSLARead
 
 
 class TicketSortKey(StrEnum):
@@ -71,6 +72,27 @@ class TicketRead(BaseModel):
     closed_at: datetime | None
     created_at: datetime
     updated_at: datetime
+
+    # The SLA position, computed on read and stored nowhere. `None` for a portal caller,
+    # who does not hold `SLA_VIEW`, and `None` for a ticket whose priority has no active
+    # policy — a client cannot tell the two apart, which is deliberate; see
+    # `TicketSLARead`.
+    #
+    # Populated by the two read routes through `with_sla` below, not by `model_validate`,
+    # which can only read attributes the ORM row actually has.
+    sla: TicketSLARead | None = None
+
+    def with_sla(self, sla: TicketSLARead | None) -> "TicketRead":
+        """Return a copy carrying the SLA position.
+
+        `model_copy(update=...)` rather than a second `model_validate`: the ticket half is
+        already validated, and the update writes a value that is itself a validated model,
+        so re-validating would be a round trip through the ORM row to reach the same
+        object. The alternative — a required `sla` constructor argument — would mean every
+        one of the six mutating routes passes `None` explicitly or grows a call to
+        `sla_service`, and a mutation response has no reason to report a countdown.
+        """
+        return self.model_copy(update={"sla": sla})
 
 
 class TicketCreate(BaseModel):

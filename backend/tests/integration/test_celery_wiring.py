@@ -18,13 +18,14 @@ why the marker says `integration` (the subject is the broker's configuration) wh
 suite's `integration` tests that need a live Postgres are in other files.
 """
 
+import re
 from pathlib import Path
 
 import pytest
 from sqlalchemy.engine import make_url
 
 from app.core.config import get_settings
-from app.workers.celery_app import NOTIFICATIONS_QUEUE, celery_app
+from app.workers.celery_app import NOTIFICATIONS_QUEUE, SLA_QUEUE, celery_app
 
 pytestmark = pytest.mark.integration
 
@@ -189,18 +190,69 @@ def test_one_worker_process_takes_one_task_at_a_time() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_every_task_route_names_the_one_queue_that_exists() -> None:
-    """§51's Phase P asks for task routing, and one route is the honest amount of it.
+def test_every_task_route_names_a_queue_that_exists() -> None:
+    """§51's Phase P asks for task routing, and Phase Q adds the second queue.
 
-    The queues that will join this one are `ai` (Phases T-W), `reports` (S), and
-    `knowledge` (X). None is declared yet, and this asserts that: a queue nothing
-    publishes to is a worker process waiting for work that does not exist.
+    Two queues, each named for its purpose, and the route table's entries are what make each
+    destination explicit instead of relying on the default queue's name. The queues that
+    will join them are `ai` (Phases T-W), `reports` (S), and `knowledge` (X) — none of which
+    is declared here, because declaring a queue nothing publishes to is a worker process
+    waiting for work that does not exist.
+
+    Asserted as an exact table rather than as "the expected entries are present", so a route
+    added without a queue to serve it — or a queue added without a route publishing to it —
+    fails here. The second is the more expensive mistake: an empty queue looks identical to
+    a busy one from the outside.
     """
     assert celery_app.conf.task_default_queue == NOTIFICATIONS_QUEUE
 
     routes = celery_app.conf.task_routes
-    assert routes == {"app.workers.email_tasks.*": {"queue": NOTIFICATIONS_QUEUE}}
-    assert {route["queue"] for route in routes.values()} == {NOTIFICATIONS_QUEUE}
+    assert routes == {
+        "app.workers.email_tasks.*": {"queue": NOTIFICATIONS_QUEUE},
+        "app.workers.sla_tasks.*": {"queue": SLA_QUEUE},
+    }
+    assert {route["queue"] for route in routes.values()} == {NOTIFICATIONS_QUEUE, SLA_QUEUE}
+
+
+def test_the_worker_command_names_every_routed_queue() -> None:
+    """The two-queue trap, closed by reading the two files that start a worker.
+
+    A Celery worker consumes the queues it is told to and nothing else. With one queue that
+    is invisible — the default is the only queue that exists, so a missing `-Q` still
+    works. With two, a worker started without `-Q sla` **consumes nothing at all** while
+    looking perfectly healthy: it connects, reports ready, and leaves every SLA task sitting
+    in Redis forever. There is no error, no metric, and no log line, because from Celery's
+    point of view nothing is wrong.
+
+    That is a deployment failure this suite cannot reach — it starts no worker — so it is
+    checked where it is decided instead. Both files are parsed rather than grepped for a
+    literal string: the claim is "the command names every queue in `task_routes`", and a
+    future phase adding a third queue has to be answered in both places. Comments are
+    skipped, so this is the command and not a sentence about it.
+    """
+    routed = {route["queue"] for route in celery_app.conf.task_routes.values()}
+
+    compose = _declared_queues(REPOSITORY_ROOT / "docker-compose.yml")
+    makefile = _declared_queues(REPOSITORY_ROOT / "Makefile")
+
+    assert routed == compose, "docker-compose.yml's worker does not consume every queue"
+    assert routed == makefile, "the Makefile's worker does not consume every queue"
+
+
+def _declared_queues(path: Path) -> set[str]:
+    """Every queue name given to a `-Q` flag in a file, ignoring commented-out lines.
+
+    A set rather than a list, because the same command appears in more than one place — the
+    Makefile's `worker` and `beat`-adjacent targets, compose's `worker` service — and what
+    matters is that each of them names all of them. Duplicates are the expected case.
+    """
+    declared: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        for value in re.findall(r"-Q\s+([\w,]+)", line):
+            declared.update(value.split(","))
+    return declared
 
 
 def test_the_email_task_is_in_the_registry_under_the_routed_name() -> None:
@@ -249,16 +301,85 @@ def test_the_task_module_is_imported_so_the_worker_can_find_it() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_there_is_no_beat_schedule() -> None:
-    """§48 says "celery beat where needed", and Phase P needs it nowhere.
+def test_the_beat_schedule_is_exactly_the_sla_sweep() -> None:
+    """§48's "celery beat where needed", and Phase Q is where it is needed.
 
-    Every task here is event-driven — a notification exists because a request created one.
-    The first thing that needs a schedule is SLA monitoring in Phase Q, and the beat
-    service arrives with it. Asserted rather than left implicit so that a schedule added
-    without a beat container to run it fails here instead of in a deployment where nothing
-    ever fires.
+    Phase P had no schedule and this file asserted the emptiness; the comment on the old
+    test said the first thing needing a clock was SLA monitoring and that the beat service
+    would arrive with it. Both halves of that are now true, so the assertion flips from "no
+    schedule" to "this schedule and no other" — an exact dict rather than a membership
+    check, because an entry added without a beat container to run it is a feature that
+    silently never fires.
+
+    The task name is a string in the schedule and a string in the decorator, and nothing in
+    the application relates the two: Celery resolves the name at fire time and fails on a
+    typo by logging a `NotRegistered` error into beat's output, where nobody is looking. The
+    lookup below closes that.
+
+    **The import is what a worker's `include` does**, and it is here rather than at module
+    scope for the reason this whole file gives — importing a task module builds an engine,
+    and only the test that needs the registry should do it. `include` itself is asserted by
+    the test further down; this one is about the *name* in the schedule matching a task the
+    module actually registered.
     """
-    assert celery_app.conf.beat_schedule == {}
+    from app.workers import sla_tasks  # noqa: F401  (registers the tasks, as `include` does)
+
+    schedule = celery_app.conf.beat_schedule
+
+    assert list(schedule) == ["sla-deadline-sweep"]
+    entry = schedule["sla-deadline-sweep"]
+    assert entry["task"] == "app.workers.sla_tasks.check_sla_deadlines"
+    assert entry["task"] in celery_app.tasks, "beat would fire a task nobody registered"
+
+
+def test_the_sweep_runs_on_the_configured_interval() -> None:
+    """The interval comes from settings, because it is the knob that decides how late a
+    warning can be.
+
+    At the shortest §27 target — URGENT, 30 minutes, warning at 80% = 24 minutes — a
+    5-minute sweep bounds the delay at 5 minutes; at the longest (LOW, 24 hours = 19.2 hours
+    to its warning) the same interval is noise. Read through `float()` because Celery
+    accepts a number of seconds or a `timedelta`, and a setting changed to the latter would
+    otherwise pass by not being compared at all.
+    """
+    settings = get_settings()
+
+    entry = celery_app.conf.beat_schedule["sla-deadline-sweep"]
+    assert float(entry["schedule"]) == float(settings.SLA_SWEEP_INTERVAL_SECONDS)
+
+
+def test_the_sla_tasks_are_registered_under_their_routed_names() -> None:
+    """Two tasks, both matching the route pattern, both in the registry.
+
+    The same argument the email task's registry test makes: a task left with Celery's
+    generated name would still be routed here by accident — the generated name starts with
+    the module path — so the point of the explicit `name=` is that it is routed by intent.
+    A rename that stopped matching the pattern would send the task to the default queue, and
+    the worker listening on `sla` would never see it.
+
+    `==` rather than `is`, for the reason the email task's test spells out: the module
+    attribute is a `celery.local.PromiseProxy`.
+    """
+    from app.workers import sla_tasks
+
+    for task, short_name in (
+        (sla_tasks.check_sla_deadlines, "check_sla_deadlines"),
+        (sla_tasks.check_organization_sla, "check_organization_sla"),
+    ):
+        registered = celery_app.tasks[task.name]
+        assert registered == task
+        assert task.name == f"app.workers.sla_tasks.{short_name}"
+        assert task.name.startswith("app.workers.sla_tasks."), "the route would not match"
+
+
+def test_the_sla_task_module_is_imported_so_the_worker_can_find_it() -> None:
+    """Without this, every SLA task fails as `Received unregistered task`.
+
+    Which reads like a broker fault and is a missing import: `include` is a list of module
+    paths rather than imports, so a module that is not named there is never imported in the
+    worker and never registers its tasks.
+    """
+    assert "app.workers.sla_tasks" in celery_app.conf.include
 
 
 def test_the_worker_does_not_replace_the_root_logger() -> None:

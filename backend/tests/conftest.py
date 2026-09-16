@@ -96,6 +96,7 @@ USERS = f"{API}/users"
 CUSTOMERS = f"{API}/customers"
 TICKETS = f"{API}/tickets"
 NOTIFICATIONS = f"{API}/notifications"
+SLA = f"{API}/sla"
 
 # Comfortably past the configured 12-character minimum, and not a credential anyone
 # would mistake for a real one.
