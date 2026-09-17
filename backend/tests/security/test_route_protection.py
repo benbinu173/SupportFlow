@@ -260,8 +260,15 @@ def test_there_are_routes_to_check(api: FastAPI) -> None:
     number to look like the surface grew would make this floor measure something it does
     not measure. The socket is counted by
     `test_the_walk_finds_the_websocket_routes` instead.
+
+    **Phase S is the first phase to move it in a while**, and it earns the move the same
+    way the router mounts above did: five routes, one whole resource area, every one of
+    them guarded by a capability this file does not have to name because the walk finds
+    it. Raised to 33, keeping the ten-route margin below the real total that makes a
+    failure here mean "the walk stopped finding things" rather than "a phase added a
+    route".
     """
-    assert len(_entries(api)) >= 28
+    assert len(_entries(api)) >= 33
 
 
 def test_the_walk_finds_every_documented_route(api: FastAPI) -> None:
@@ -639,4 +646,24 @@ def test_every_route_declares_the_capability_the_matrix_assigns(api: FastAPI) ->
         # authorization decision to be got wrong.
         ("GET", "/api/v1/sla/policies"): {Permission.SLA_VIEW},
         ("PATCH", "/api/v1/sla/policies/{priority}"): {Permission.SLA_CONFIGURE},
+        # --- Analytics ----------------------------------------------------
+        # Five routes and two capabilities, and the split is §3's matrix rather than a
+        # choice made here. `ANALYTICS_OWN` is "own performance only", which admin,
+        # manager, and agent all hold; what differs between them is how many rows it
+        # reaches, and that is row scope applied inside every query — the same
+        # `TICKET_SCOPE_BY_ROLE` predicate `GET /tickets` uses. So these four routes
+        # answer differently by role without a per-role capability, which is precisely
+        # the pattern `GET /api/v1/tickets` above already establishes.
+        #
+        # `/agents` is `ANALYTICS_ORG` because a per-agent breakdown is a comparison
+        # between people, which is the other §3 row. An agent's own figures are on the
+        # four routes they can reach, so nothing is hidden from them by this.
+        #
+        # All five are GETs. There is no analytics write route, and there is nothing for
+        # one to do: every number is computed at read time from tickets.
+        ("GET", "/api/v1/analytics/overview"): {Permission.ANALYTICS_OWN},
+        ("GET", "/api/v1/analytics/tickets"): {Permission.ANALYTICS_OWN},
+        ("GET", "/api/v1/analytics/agents"): {Permission.ANALYTICS_ORG},
+        ("GET", "/api/v1/analytics/sla"): {Permission.ANALYTICS_OWN},
+        ("GET", "/api/v1/analytics/sentiment"): {Permission.ANALYTICS_OWN},
     }

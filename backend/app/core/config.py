@@ -170,6 +170,23 @@ class Settings(BaseSettings):
     # the slot indefinitely.
     WS_SEND_TIMEOUT_SECONDS: float = 10.0
 
+    # --- Analytics ---------------------------------------------------------
+    # One setting, and it arrived with its consumer per the rule the Celery, S3, and
+    # WebSockets blocks above follow: §15 asks for cached dashboard results and this is how
+    # long one lives.
+    #
+    # 300 seconds is chosen against what makes an analytics number *wrong* rather than
+    # against how expensive the queries are. Five minutes is a refresh nobody notices while
+    # flipping between screens, and it is short enough that a dashboard left open all day is
+    # never more than five minutes behind — which matters only in the one case the version
+    # counter cannot cover: a Redis outage during a write, where the version does not move
+    # and the old entry survives until this expires (ADR-026).
+    #
+    # The window default and the window ceiling are **not** settings. They are route
+    # literals, like `limit`'s bounds — no deployment has a reason to change them, and a
+    # setting for something nothing sets is a guess with a name.
+    ANALYTICS_CACHE_TTL_SECONDS: int = 300
+
     # --- CORS -------------------------------------------------------------
     # Explicit allowlist. Required because the refresh cookie is sent with
     # credentials, which forbids a wildcard origin.

@@ -142,6 +142,15 @@ python scripts/phase_p_walkthrough.py
 # is read back out of Mailpit. Running the sweep twice is part of the script.
 python scripts/phase_q_walkthrough.py
 
+# And for real-time: the same setup, plus a real websocket client. It drives the frame
+# handshake, an internal note, another tenant's event, and a worker-dispatched alert.
+python scripts/phase_r_walkthrough.py
+
+# And for analytics: only the API. Nine tickets built through the API, aged in SQL, and
+# every endpoint checked against numbers derived from that fixture and the tenant's own
+# policies — plus a cache hit proved by an entry's TTL counting down rather than resetting.
+python scripts/phase_s_walkthrough.py
+
 # Frontend (from frontend/)
 npm test
 npm run typecheck
@@ -1013,6 +1022,126 @@ claim a restart would hide.
 Both scripts need the API running with
 `--loop app.core.event_loop:loop_factory`; the walkthrough also needs the worker.
 
+## Analytics
+
+Five read-only routes under `/api/v1/analytics`, each an aggregation over the indexes Phase D
+built for its exact predicates, and each narrowed by the same row scope every ticket read uses.
+
+| Route | Capability | Cached | Returns |
+|---|---|---|---|
+| `GET /analytics/overview` | `ANALYTICS_OWN` | yes | status totals, a daily volume series, both duration averages, AI usage |
+| `GET /analytics/tickets` | `ANALYTICS_OWN` | no | by priority, by category |
+| `GET /analytics/agents` | `ANALYTICS_ORG` | yes | per-agent workload and resolution averages, plus an unassigned row |
+| `GET /analytics/sla` | `ANALYTICS_OWN` | partly | compliance, the past-due count, and a live ranked risk list |
+| `GET /analytics/sentiment` | `ANALYTICS_OWN` | no | the distribution, including "not analysed yet" |
+
+**Same URL, different answer by role.** `ANALYTICS_OWN` is the capability all three staff roles
+hold, and what differs between them is how many rows it reaches: `TICKET_SCOPE_BY_ROLE` gives an
+administrator or a manager the organization and an agent their assigned work — the rule
+[Row scope](#row-scope-is-applied-where-the-query-is-built) already states, applied to an
+aggregate instead of a list, with no second scope map to disagree with the first. A customer
+holds neither analytics capability and is refused with `403` on all five.
+
+`/analytics/agents` is the exception and requires `ANALYTICS_ORG`, because comparing agents
+against each other is org-wide analytics (§3); an agent's own performance is what the other four
+routes already return for them. It is also the only route that pages (`limit`, `offset`, and a
+`total` for the unpaged list), and its rows include an **unassigned bucket** — `agent_id` null —
+so "how much work has nobody picked up" is on the screen rather than missing from a total that
+does not add up.
+
+### The window
+
+All five take `start` (inclusive, default thirty days before `end`) and `end` (exclusive, default
+now), and every response echoes the window it actually used in `range` — a client that sent no
+parameters learns what it got, rather than inferring it from a chart.
+
+The ranges are half-open for the reason
+[TicketRepository.list_tickets](backend/app/repositories/ticket_repository.py) records: adjacent
+windows have to tile without a ticket appearing in both. A range longer than 366 days is a `422`
+rather than a silently shortened window, because a truncated range makes a chart lie about its own
+x-axis, and a bound with no timezone is a `422` too. `volume` has one point per UTC day that has
+tickets; days with none are absent rather than zero, because filling them in means generating a
+calendar series in the database on every request.
+
+An average with nothing behind it is `null`, never `0` — an average of no rows does not exist, and
+zero would put "answered instantly" on a dashboard for a desk that has answered nothing. The same
+applies to an SLA rate with no stopped timers.
+
+### Compliance is the cohort; the past-due count is the queue
+
+`GET /analytics/sla` answers two different questions, and the response says which is which.
+`compliance` describes tickets **created in `range`** — the cohort reading, so the rate and the
+volume chart describe the same tickets. `overdue` and `open_tickets` describe the queue **as it
+stands**, whatever the window says, with `open_tickets` as the denominator `overdue` is read
+against. A ticket raised before the window and still past due appears in the second pair and not
+the first: hiding the worst tickets because they are old would be the worst omission a dashboard
+can make.
+
+Both halves count each timer separately and then pool them by summing counts rather than averaging
+rates — a tenant with 100 resolutions and 2 responses has a pooled rate near the resolution
+figure, not the midpoint of the two.
+
+### The risk list is a ranking, not a page
+
+`risks` ranks the non-terminal tickets nearest an outstanding deadline, worst first. `limit`
+defaults to 10 and caps at 50, and there is deliberately no `offset`: the eleventh-worst ticket is
+not a dashboard's business. Every value on every row — `timer`, `state`, `due_at`,
+`remaining_seconds` — comes from the same `resolve_position` call the ticket detail screen makes,
+so a countdown here and a countdown there cannot disagree. The **order** comes from one SQL
+expression for the due instant, which is the seam ADR-026 is about; a wrong comparison operator
+there would cost a position in a list, never a wrong number on a screen, and
+[tests/integration/test_analytics_sla_agreement.py](backend/tests/integration/test_analytics_sla_agreement.py)
+pins the two together at every boundary.
+
+A ticket whose priority has no active policy has no clock and is absent from both halves — the
+same absence `GET /tickets/{id}` reports as a `null` `sla`.
+
+### The cache
+
+`/overview` and `/agents` are cached whole, `/sla` is cached in its aggregate half, and
+`/tickets` and `/sentiment` are not cached at all — both are single grouped queries over an index,
+and a cache with no measured cost behind it is staleness risk that buys nothing.
+
+A key carries four things, and leaving out any one would serve a caller something that is not
+theirs: the tenant, the row scope (`org`, or `user:{id}` for a caller whose scope is their assigned
+work), a version integer, and a digest of the query parameters. The scope token is the one worth
+naming — a key of `(tenant, metric, range)` would pass every cross-tenant test and still serve an
+administrator's organization-wide payload to an agent who asked the same route in the same second.
+
+Invalidation is a **version integer, not a key sweep**: a write `INCR`s
+`analytics:version:{organization_id}` and every key embeds that number, so one increment makes
+every existing entry unreachable at once. The old entries are orphaned and expire with their TTL,
+because Redis cannot delete a pattern of keys without `SCAN` and `KEYS` is banned in production.
+Eight writers invalidate — the seven ticket actions that move an aggregate, and an SLA policy edit,
+which moves every SLA number by changing a join condition rather than a ticket column
+(ADR-026).
+
+The cached payload is validated on the way back out. `redis` is not a trusted store: a value that
+does not parse as the response model is a **miss** and is recomputed, which is what makes a deploy
+that changes a response shape safe rather than a source of `500`s. And every path **fails open** —
+a Redis outage means "compute it", never a failed request.
+
+### Verifying it by hand
+
+`scripts/phase_s_walkthrough.py` runs 58 assertions against a running server: it registers a
+tenant, builds a fixture of nine tickets through the API, ages them with one direct write so they
+land inside and past the SLA bands, and then checks every endpoint against numbers **derived from
+that fixture and the tenant's own policies** rather than from stored constants. It also shows the
+cohort-versus-queue distinction directly — a window with no tickets in it empties `compliance` and
+leaves `overdue` and `open_tickets` untouched — and proves a cache hit by watching an entry's TTL
+count down rather than being reset.
+
+    # the API, from backend/
+    .venv/Scripts/python.exe -m uvicorn app.main:app \
+        --loop app.core.event_loop:loop_factory --port 8000
+    # then
+    .venv/Scripts/python.exe scripts/phase_s_walkthrough.py
+
+The fail-open path needs Redis stopped, which a script cannot do to itself: stop it with
+`docker compose stop redis`, read `/analytics/overview` again, and it answers correctly. The API's
+stdout carries `analytics_cache_unavailable` with an **error type and no message** — a connection
+error's message embeds `REDIS_URL`, which carries a password in production.
+
 ## Security posture
 
 Implemented in Phase C:
@@ -1105,6 +1234,27 @@ Implemented in Phases L–R:
   `NOTIFICATION_LIST` — which is the only mechanism that would catch a future role that lost
   either.
 
+Implemented in Phase S:
+
+- **§54's authorization on the aggregates**, which is a different problem from a row: a
+  row-scope bug on `GET /tickets` hands back a ticket somebody should not see, and the same bug in
+  an aggregate hands back a **number** — a total that is too large, a risk list with a stranger's
+  ticket at the top — with nothing on the response saying which rows it counted. So every count in
+  [tests/security/test_analytics_isolation.py](backend/tests/security/test_analytics_isolation.py)
+  is asserted against a fixture whose size each tenant chose for itself, and the risk list is
+  compared by ticket **id** rather than by position.
+- **The cache key is an isolation boundary, asserted directly in Redis** and not only through the
+  numbers. An administrator's organization-wide payload served to an agent in the same tenant is
+  invisible to every cross-tenant test — both callers are in the same organization, and the query
+  that filled the entry was correctly scoped when it ran — so the suite shows the two callers
+  cached under two keys, and shows that a refused customer never produces a key at all.
+- **The five routes declare their capabilities next to the route**, so the routing-table walk in
+  [tests/security/test_route_protection.py](backend/tests/security/test_route_protection.py) covers
+  them without an allowlist edit.
+- **A countdown cannot be cached into a lie.** The one field that is a function of now
+  (`remaining_seconds`) is computed per request from the same clock the ticket detail screen uses,
+  and only the aggregate half of `/analytics/sla` is shared.
+
 Two trade-offs are deliberate and recorded in ADR-014: the login limiter **fails open**
 when Redis is unreachable (it is an abuse control, not an authentication control, and
 failing closed would turn a Redis blip into a total login outage), and it is keyed on
@@ -1129,8 +1279,8 @@ instead; see [Rate limiting](#rate-limiting).
 | P | Celery, notifications, email delivery | ✅ |
 | Q | SLA monitoring, beat | ✅ |
 | R | WebSockets, real-time fan-out | ✅ |
-| S | Analytics | next |
-| T–W | AI foundation, analysis, summaries, drafts | |
+| S | Analytics | ✅ |
+| T–W | AI foundation, analysis, summaries, drafts | next |
 | X | Knowledge base and RAG | |
 | Y–Z | Hardening, deployment | |
 
@@ -1144,9 +1294,30 @@ instead; see [Rate limiting](#rate-limiting).
   [tests/integration/test_migrations.py](backend/tests/integration/test_migrations.py)
   is what stops the two from diverging.
 - The embedding provider is deliberately undecided until Phase X (ADR-008).
-- Redis carries rate limiting, the Celery broker, and real-time pub/sub. Caching is
-  assigned to the phase that gives it a consumer (S) rather than built ahead of one
-  (ADR-022, ADR-025).
+- Redis carries rate limiting, the Celery broker, real-time pub/sub, and the analytics read-through
+  cache (ADR-022, ADR-025, ADR-026).
+- **A stale aggregate can outlive a Redis outage by up to one TTL.** A write during an outage
+  cannot bump the version integer, so entries written before it stay reachable and are served
+  until they expire — measured, not estimated: with Redis stopped, the endpoint answered correctly
+  and a ticket written during the outage landed, but the same window reported 2 where the truth was
+  3 until the entry expired 31 seconds later. The alternative is failing the write, which trades a
+  data-loss bug for a fresher dashboard.
+- **Analytics buckets are UTC days.** No organization carries a timezone in the schema, so a
+  local-midnight bucket is not available; a tenant west of UTC sees its "day" start mid-afternoon
+  on the chart. Fixing it needs a per-organization timezone and a `date_trunc` in that zone.
+- **The risk list is a ranking, not a page.** `limit` caps at 50 and there is no `offset`, so a
+  tenant with more than 50 tickets past due sees the 50 nearest their deadline and nothing reports
+  the rest. Surviving a genuinely large backlog is what a rollup or a paged view would be for.
+- **The AI metrics read empty tables until Phases T–W.** `ai_usage` is zeros and the sentiment
+  distribution puts every ticket in the `null` bucket, which is a real aggregation over rows that
+  do not exist yet rather than a placeholder — the response shapes are final, so Phase U fills them
+  without an API change.
+- **`cost_usd` renders as a decimal string**, and a zero sum renders as `"0"` rather than
+  `"0.000000"`, because Postgres renders the scale from the value. A client parsing it as a float
+  loses the reason it is a string.
+- **`/analytics/tickets` and `/analytics/sentiment` are deliberately uncached**, and the `risks`
+  half of `/analytics/sla` is recomputed on every request, so the phase's safest query is not its
+  cheapest. That is the trade §15's "do not cache everything blindly" asks for.
 - **A "ticket resolved" notification reaches the customer's *portal login*, so a customer
   record with no login gets no notification at all** — no row is written, rather than a row
   addressed to the agent who resolved it. `notifications.user_id` is NOT NULL and §26
@@ -1265,6 +1436,9 @@ instead; see [Rate limiting](#rate-limiting).
   to whoever had it. That is a deliberate reading of `OPEN` as "nobody owns this", and
   the history is not lost: it is in `ticket_events`.
 - **The frontend has no screens for any of this.** Every phase since C has been
-  backend-only; the routes are exercised by 1008 tests, and the SPA still shows the Phase
-  C scaffolding.
+  backend-only; the routes are exercised by 1092 tests and by a walkthrough script per phase, and
+  the SPA still shows the Phase C scaffolding. Dashboards were the one screen the specification
+  assigned to a phase and that phase (S) built the API and not the UI — §8's first success
+  criterion is that the backend is exercisable without it, which is what
+  `scripts/phase_s_walkthrough.py` demonstrates (ADR-026).
 

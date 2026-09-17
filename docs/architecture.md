@@ -261,6 +261,40 @@ with TTLs plus explicit invalidation when underlying ticket data changes. Cheap
 queries are not cached — a cache with no measured cost behind it adds staleness risk
 and buys nothing.
 
+Five read-only routes under `/api/v1/analytics` are what that serves: `overview` and
+`agents` wholly, `sla` in its aggregate half, and `tickets` and `sentiment` not at all — each one
+grouped over the indexes Phase D built for its predicates, over the same row scope every ticket read
+uses, so an administrator gets the organization's numbers and an agent gets their own from the same
+URL.
+
+**A key carries four things**, because leaving out any one of them would serve a caller something
+that is not theirs: the tenant, the row scope (`org`, or `user:{id}` for a caller whose scope is
+their assigned work), the version integer, and a digest of the query parameters. The scope token is
+the one worth naming — a key of `(tenant, metric, range)` would pass every cross-tenant test and
+still hand one caller another's numbers *inside* a tenant, which is why it is derived from
+`TICKET_SCOPE_BY_ROLE` rather than from a role name.
+
+**Invalidation is a version integer, not a key sweep.** A ticket write `INCR`s
+`analytics:version:{organization_id}` and every key embeds that number, so one increment makes every
+existing entry unreachable at once; the entries themselves are orphaned and expire with their TTL.
+Redis cannot delete a pattern of keys without `SCAN`, and `KEYS` is banned in production. There are
+eight writers — the seven ticket actions, and an SLA policy edit, which moves every SLA aggregate by
+changing a join condition rather than a ticket column.
+
+**The payload is validated on the way back out.** Redis is not a trusted store: a value that does not
+parse as the response model is a **miss** and is recomputed, which is what makes a deploy that
+changes a response shape safe rather than a source of `500`s. Every path fails open — a Redis outage
+means "compute it", never a failed request — at the cost that a stale entry can survive the outage
+until its TTL expires, which is a cost the README records rather than hides.
+
+**`GET /analytics/sla` is cached in one half and not the other.** Compliance and the past-due count
+are aggregates and are shared for a few minutes; the risk list is computed per request, because
+`remaining_seconds` is a function of now and a cached countdown is a wrong countdown. ADR-026 has the
+full argument, including the one SQL expression for the deadline instant — the seam where the query
+language meets the pure clock — and
+`tests/integration/test_analytics_sla_agreement.py`, the differential test that keeps the two in
+step.
+
 ## 11. Deployment shape
 
 Local development runs infrastructure (Postgres, Redis, MinIO, Mailpit) in Docker

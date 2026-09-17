@@ -39,6 +39,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import cache
 from app.core.exceptions import ValidationError
 from app.core.permissions import Permission
 from app.core.tenancy import RequestOrigin, TenantContext
@@ -521,6 +522,13 @@ async def update_policy(
         origin=origin,
     )
     await session.commit()
+    # **The eighth invalidation site, and the only one that is not a ticket.** Every SLA
+    # number in the analytics cache is computed by joining `tickets` to this row: a target
+    # moved, or `is_active` switched off, changes which tickets have a deadline at all —
+    # arithmetic that lives in the join condition rather than on any ticket column, so no
+    # ticket write would ever move it. Without this line a manager could widen a target
+    # and watch the compliance rate stay wrong for a full TTL.
+    await cache.invalidate(context.organization_id)
     return policy
 
 

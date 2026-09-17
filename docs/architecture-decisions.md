@@ -1624,3 +1624,184 @@ failure is a log line naming the error type and not the URL (a broker URL can ca
 clients that do not reconnect never learn anything changed. And the subscriber reconnects with a
 bounded backoff, so a Redis restart costs real-time delivery for the duration rather than for the
 life of the process — a distinction that is invisible until the day it matters.
+
+## ADR-026 — Analytics are read-through aggregates, and one SQL fragment is pinned by a differential test
+
+**Status:** accepted · Phase S
+
+**Context.** §28 lists the metrics, §31 asks for "SLA risks", §15 asks for dashboard caching and
+requirements.md §7 restates it: *"Cache expensive dashboard results in Redis. Invalidate or expire
+caches appropriately."* Phase S is the phase **four earlier places wrote down and deliberately did
+not build**, each in writing. The SLA router's own docstring names it: *"The queue-wide view —
+§31's 'SLA risks' and §28's `GET /analytics/sla` — is not here either. Both need the deadline
+arithmetic expressed in SQL to sort and paginate by it, and a second implementation of the clock
+that agrees with the pure one until one of them is edited is the specific failure this phase is
+arranged to avoid. **Both arrive in Phase S**."* ADR-022's Redis responsibilities list carries
+*"**Cache → Phase S.** §15's own example is dashboard analytics."* `docs/architecture.md` §10 has
+described the caching design in the present tense since Phase B while nothing cached. And
+`Permission.ANALYTICS_ORG` and `Permission.ANALYTICS_OWN` have sat in the matrix unused since Phase
+G, transcribing §3's two Analytics rows.
+
+**Decision 1 — the deadline arithmetic is one SQL fragment, and the differential test is what keeps
+it honest.** Ranking "which open tickets are nearest a deadline" cannot be done in Python without
+either reading every open ticket (§7 forbids an unbounded query) or discarding the ranking. So
+`analytics_repository` gains one expression — the due instant of each *unstopped* timer, as
+`created_at + make_interval(0, 0, 0, 0, 0, target_minutes)` joined to the ticket's active policy —
+used for ordering, for the past-due count, and for compliance.
+
+**Every number a client sees still comes from `resolve_position`.** The SQL decides *which* tickets
+and *in what order*; the clock decides *what is true about them*. The failure mode of a disagreement
+is therefore a wrong position in a list and never a wrong number on a screen. The test that replaces
+"one implementation" is `tests/integration/test_analytics_sla_agreement.py`, which builds tickets
+straddling every boundary — a second either side of the warning instant and of the due instant, both
+timers, met and breached and unstopped, plus a ticket whose priority has no active policy — and
+asserts the SQL classification and the clock agree **row for row**, in both directions. It runs
+against a fixed `NOW` rather than the wall clock, and it earned its keep on its first run by catching
+a real defect: `overdue_count` compared `< now` while `resolve_timer`'s second branch is
+`now >= due_at`, so a ticket the countdown calls breached was one instant short of counting as past
+due. **That is the class of defect the file exists to catch, and it was found before anyone saw it.**
+
+Two details are decisions in their own right:
+
+* **`LEAST` is what lets one expression serve both timers.** PostgreSQL's `LEAST` ignores NULLs, so
+  `LEAST(response_due_at IF first_response_at IS NULL, resolution_due_at IF resolved_at IS NULL)` is
+  the soonest deadline that has not been met, and NULL — and therefore excluded — when both have. The
+  three-valued-logic trap `scoping.py` warns about does not arise because the NULL case is not
+  matched, and the differential test asserts that rather than assuming it.
+* **The warning instant is deliberately *not* in SQL.** `_warning_offset` multiplies a `timedelta` by
+  a float, so expressing it in SQL means integer minutes and a possible few-seconds disagreement at
+  the band edge — the exact class of near-miss the differential test exists to catch, introduced on
+  purpose would be worse. So the cached half counts what needs only `due_at` and `now`, and anything
+  depending on the warning band comes from the clock, in the un-cached risk list.
+
+**Decision 2 — the cache key carries the row scope, and that is the phase's second isolation
+boundary.** Analytics are tenant-scoped *and* row-scoped: the same endpoint answers a manager with
+the organization's totals and an agent with their own. A key of `(organization, metric, range)` would
+be correct in every cross-tenant test and would still serve an administrator's organization-wide
+payload to an agent who asked the same route in the same second — a leak **inside** one tenant, which
+no cross-tenant assertion can see, because both callers are in the same organization and the query
+that filled the entry was correctly scoped when it ran. So `cache_key` embeds `scope_token(context)`:
+`org`, or `user:{id}` for an `ASSIGNED` caller, derived from `TICKET_SCOPE_BY_ROLE` rather than from
+a role name so a key cannot disagree with the query that fills it.
+`tests/security/test_analytics_isolation.py` asserts the consequence three ways — the second
+caller's number is their own, Redis holds an entry under the organization token, and it holds a
+*different* entry under the agent's — and the `customer:` branch is asserted unreachable rather than
+left as a comment somebody later decides is dead code.
+
+**Decision 3 — invalidation is a version integer, and the orphan is its cost.** Redis has no way to
+delete a pattern of keys without `SCAN`, and `KEYS` blocks the server and is banned in production. So
+a write does not chase the entries it invalidated: it `INCR`s `analytics:version:{organization_id}`,
+and every key embeds that number, so one increment makes every existing entry unreachable at once.
+The old entries are **orphaned rather than deleted** — they sit until their TTL expires, bounded by
+it, at one `INCR` per write and no scanning.
+
+**The version key deliberately has no expiry.** A version that could expire would reset to zero, and
+a `...:0:...` key written after the reset could collide with a version-0 entry that had not yet
+expired, resurrecting a stale payload. Without a TTL the version only ever moves forward. It is one
+small integer per tenant.
+
+**There are eight call sites, and the eighth is not a ticket.** Seven are the ticket writers, each
+one line beside the existing post-commit realtime publish — the same place and the same moment:
+`create_ticket`, `assign_ticket`, `change_priority`, `change_status`, `close_ticket`,
+`reopen_ticket`, and `post_reply` (the first public reply stops the response timer, which moves the
+compliance number). The eighth is `sla_service.update_policy`, and it is the only one that is not a
+ticket write. **Every SLA number in the cache is computed by joining `tickets` to that row:** a
+target moved, or `is_active` switched off, changes which tickets have a deadline at all — arithmetic
+that lives in the join condition rather than on any ticket column, so no ticket write would ever move
+it. Without that line a manager could widen a target and watch the compliance rate stay wrong for a
+full TTL. The plan listed seven; the eighth was added because the join is an input to every
+aggregate, and it is named here so a reader can see it was a decision rather than a stray edit.
+
+**Decision 4 — every path fails open, and only the error's *type* is logged.** Like
+`realtime.publish` and `notification_service.enqueue_delivery`, a Redis outage means "compute it",
+never a failed request: §15's cache is an optimization, and an optimization that can take a dashboard
+down is a regression. `invalidate` failing open means the version does not move and a stale entry can
+outlive the outage by up to one TTL — **stated in the README rather than hidden, and since
+measured**: with Redis stopped, the endpoint answered correctly and a ticket written during the
+outage landed, but the version stayed where it was, so a pre-outage entry was served — total 2 where
+the truth was 3 — until it expired 31 seconds later, at which point the same window read the truth.
+The log line names the error type and never the message, because a `ConnectionError`'s message embeds
+the address it failed to reach and `REDIS_URL` carries a password in production — the reasoning
+`app/core/redis.py` already records.
+
+**Decision 5 — the cached payload is validated on the way back out, and a payload that does not parse
+is a *miss*.** The same stance `app/websocket/events.py` takes on a broker message: "validate all
+input" applies to a Redis value as much as to a request body. `redis` is not a trusted store — a
+value could have been written by a deploy with a different response shape, by a hand-run `redis-cli`,
+or by an older version of the process. Treating it as a miss rather than an error is what makes a
+deploy that changes a response shape safe instead of a source of `500`s.
+
+**Decision 6 — the SLA aggregate is cached; the risk list is not.** A cached countdown would be a
+wrong countdown: `remaining_seconds` is a function of `now`, and a manager reading "40 minutes left"
+an hour after a breach is worse than no dashboard. So `/analytics/sla` composes a cached aggregate
+block with a live ranked list, and `SLAStanding` is a model of its own precisely because it is the
+unit that gets cached — caching an `AnalyticsSLA` with `risks` empty and patching the list in
+afterwards would be an entry that says it is a response and is not one. §15's "do not cache
+everything blindly" is asking for exactly this distinction. The two halves also answer about
+different populations, which is worth knowing before comparing them: compliance describes tickets
+**created in `range`** — the cohort reading, so the rate and the volume chart describe the same
+tickets — while `overdue` and `open_tickets` describe the queue **as it stands**, whatever the
+window says. A ticket raised before the window and still past due appears in the second pair and not
+the first, which is the reading a manager wants; hiding the worst tickets because they are old would
+be the worst possible omission.
+
+**Decision 7 — row scope does the work, and `ANALYTICS_ORG` guards exactly one route.** §3 has two
+Analytics rows and `ROLE_PERMISSIONS` already transcribes them. So `/overview`, `/tickets`, `/sla`,
+and `/sentiment` require `ANALYTICS_OWN` — the capability all three staff roles hold — and narrow by
+`row_scope_for(role, TICKET_SCOPE_BY_ROLE)`, the same map every ticket read uses. **The same endpoint
+answers differently by role, exactly like `GET /tickets`, and no second scope map exists** to agree
+with the first until one of them is edited. `/agents` alone requires `ANALYTICS_ORG`, because a
+per-agent breakdown is a comparison between people, which is §3's "org-wide analytics"; an agent's
+own performance is what the other four routes already return for them. A customer holds neither
+capability and is refused with a `403` before the service is reached, so no cache key is built under
+a customer's scope.
+
+**Decision 8 — the AI metrics are real queries over columns Phase U will fill.**
+`/analytics/sentiment` and `ai_usage` return zeros and one `None` bucket, truthfully. §8's eleventh
+criterion is that analytics come from real aggregation queries and never hardcoded values, and a real
+`COUNT` over a table nothing writes yet is a real query answering the question actually asked. The
+response shapes are final, so Phase U populates them with no API change — the same reasoning
+`app/schemas/ticket.py` already records for the ticket AI fields. `cost_usd` is a `Decimal` and
+renders as a decimal string, for the reason `app/models/ai_usage.py` gives about its own column: it
+is money and it gets summed, and a float would put binary rounding into an invoice. A zero sum
+renders as `"0"` rather than `"0.000000"`, because Postgres renders the scale from the value.
+
+**Decision 9 — no new index, therefore no migration, and no rollup table.** The aggregates group by
+`status`, `priority`, `category`, and `assigned_agent_id` and filter by `organization_id` and
+`created_at` — every one of which Phase D already indexed for these exact predicates — and `ai_usage`
+carries its own pair. **`alembic check` reporting "no new upgrade operations" is the mechanical proof
+that Phase S adds no table, no column, and no index.** No materialized view or rollup was built: a
+rollup is a schema change plus a staleness rule, and nothing has measured these queries as slow. §53's
+instruction is *"Do not prematurely optimize everything."*
+
+**What Phase S deliberately does not do.** No frontend dashboards. The spec's Phase S line says
+"Build frontend dashboards", and the frontend stays at Phase C scaffolding as it has for every phase
+— §8's first success criterion is that *"the backend runs and is fully exercisable without the
+frontend"*, which `scripts/phase_s_walkthrough.py` demonstrates. This is a deliberate deferral,
+recorded here rather than left implicit. No `report_tasks.py` and no scheduled or exported reports:
+§16's "report generation" is not a phase assignment, and a scheduled report needs a schedule, a
+delivery path, and an artifact store, none of which this phase has. No Celery task, because the
+caching §15 asks for is read-through rather than a rollup. No `EXPLAIN`-driven index work: if the
+walkthrough's numbers look wrong the index question reopens, and the indexes Phase D built for these
+predicates are the reason to expect it will not. And no per-tenant timezone: buckets are UTC days
+because no organization carries a timezone, and inventing a setting nothing sets would be worse than
+the documented limitation.
+
+**Cost.** One setting to operate (`ANALYTICS_CACHE_TTL_SECONDS`, 300 by default), one Redis keyspace
+that grows with the number of distinct windows queried, and orphaned entries that live out a TTL —
+bounded, but present in every `KEYS` a developer runs. The risk list is a **ranking, not a page**:
+`limit` defaults to 10 and caps at 50, with no `offset`, because the eleventh-worst ticket is not a
+dashboard's business — which means a tenant with 400 tickets past due sees 50. The `risks` half of
+`/analytics/sla` is computed on every request, so the safest query in the phase is not the cheapest.
+And `/analytics/tickets` and `/analytics/sentiment` are deliberately uncached, which trades a little
+CPU for not showing a stale count on the one chart somebody refreshes the moment they assign work.
+
+**Verification.** Three comparisons in `analytics_repository.py` were each inverted in turn —
+compliance's `<=` on `stopped_at <= due_at`, `overdue_count`'s `<=` on the deadline, and the NULL
+guard that keeps `LEAST` from seeing a stopped timer's deadline — and the differential test failed on
+the comparison it pins and on no other: "2 failed, 9 passed", "1 failed, 10 passed", and "2 failed,
+9 passed". A test that pins two implementations together and cannot fail is not pinning them. The
+whole suite is 1092 tests; `scripts/phase_s_walkthrough.py` runs 58 assertions live against a fixture
+built through the API, every expectation derived from the fixture's own ages and the tenant's own
+policies; and the fail-open path was checked with Redis actually stopped, which is also how the
+stale-window cost above was measured rather than estimated.

@@ -24,6 +24,7 @@ from typing import Any
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import cache
 from app.core.exceptions import (
     ErrorCode,
     InvalidTicketTransitionError,
@@ -252,6 +253,10 @@ async def create_ticket(
     # a ticket that could still roll back has been told something untrue, and unlike a
     # notification row there is nothing later that would correct it.
     await realtime.publish(ticket, event)
+    # A new ticket moves every total, volume point, and average this tenant can read, so
+    # the cached analytics entries are invalidated in the same post-commit position. The
+    # invalidation is a counter rather than a deletion — see `app/core/cache.py`.
+    await cache.invalidate(context.organization_id)
 
     logger.info(
         "ticket_created",
@@ -343,6 +348,8 @@ async def assign_ticket(
     # The ticket event and its notification events in one pipelined round trip, so an
     # assignment and the toast announcing it cannot arrive out of order.
     await realtime.publish(ticket, event, notifications)
+    # The per-agent breakdown moved: one agent gained work, or the unassigned bucket did.
+    await cache.invalidate(context.organization_id)
 
     logger.info(
         "ticket_assigned" if assigned_agent_id else "ticket_unassigned",
@@ -397,6 +404,9 @@ async def change_priority(
     )
     await session.commit()
     await realtime.publish(ticket, event)
+    # Priority moves the by-priority breakdown, and it moves the ticket's own deadline: the
+    # clock is measured against the policy for whatever priority the ticket now has.
+    await cache.invalidate(context.organization_id)
 
     logger.info(
         "ticket_priority_changed",
@@ -438,6 +448,9 @@ async def change_status(
     await session.commit()
     notification_service.enqueue_delivery(notifications)
     await realtime.publish(ticket, event, notifications)
+    # Status moves the totals, and a resolution or a reopen starts or ends the resolution
+    # timer — which is what the compliance half of `/analytics/sla` counts.
+    await cache.invalidate(context.organization_id)
 
     logger.info(
         "ticket_status_changed",
@@ -473,6 +486,8 @@ async def close_ticket(
     await session.commit()
     notification_service.enqueue_delivery(notifications)
     await realtime.publish(ticket, event, notifications)
+    # A close moves the totals and shrinks the open count.
+    await cache.invalidate(context.organization_id)
 
     logger.info(
         "ticket_closed",
@@ -530,6 +545,9 @@ async def reopen_ticket(
     # must not be shown a reopen of a ticket that is no longer theirs, and reading
     # `assigned_agent_id` before this line would have shown it to exactly them.
     await realtime.publish(ticket, event, notifications)
+    # A reopen clears `resolved_at`, so a resolution that was counted as met becomes a
+    # running timer again — which takes a ticket *off* the compliance tally it was on.
+    await cache.invalidate(context.organization_id)
 
     logger.info(
         "ticket_reopened",

@@ -8,6 +8,7 @@ environment can move it without touching the routes.
 
 from fastapi import APIRouter
 
+from app.api.analytics import router as analytics_router
 from app.api.attachments import router as attachments_router
 from app.api.audit import router as audit_router
 from app.api.auth import router as auth_router
@@ -42,3 +43,7 @@ router.include_router(notifications_router, tags=["notifications"])
 # here rather than full paths inside the module, because unlike notifications this router
 # has exactly one resource under it and no second shape to accommodate.
 router.include_router(sla_router, prefix="/sla", tags=["sla"])
+# `/analytics/overview`, `/analytics/tickets`, `/analytics/agents`, `/analytics/sla`, and
+# `/analytics/sentiment` — spec §6 lists `/api/v1/analytics/*` and §36 names all five. A
+# prefix here, like `/sla`: one resource area, every path under it.
+router.include_router(analytics_router, prefix="/analytics", tags=["analytics"])

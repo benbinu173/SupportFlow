@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import cache
 from app.core.exceptions import ValidationError
 from app.core.permissions import SENDER_TYPE_BY_ROLE, Permission
 from app.core.tenancy import TenantContext
@@ -111,6 +112,11 @@ async def post_reply(
     # `internal` is False because `_post` wrote `is_internal=False` above — this is the
     # customer-facing half of the thread, so row scope alone decides the audience.
     await realtime.publish(ticket, event, notifications)
+    # A public reply may have stopped the response timer, which moves the compliance
+    # number and the response-time average — so a *public* reply invalidates and an
+    # internal note below does not. A note never sets `first_response_at` (see the module
+    # docstring), so nothing an aggregate reads has changed.
+    await cache.invalidate(context.organization_id)
 
     logger.info(
         "message_posted",
@@ -159,6 +165,9 @@ async def post_note(
     # No notifications: `notify_for_event` has never had a recipient for a note, so there is
     # no `notification.created` to send alongside it and no `enqueue_delivery` above it.
     await realtime.publish(ticket, event, internal=True)
+    # No `cache.invalidate` here, deliberately. `post_reply` above invalidates because a
+    # public reply can stop the response timer; a note cannot, and no aggregate reads
+    # anything else this writes. Invalidating anyway would be a habit rather than a reason.
 
     logger.info(
         "message_posted",
