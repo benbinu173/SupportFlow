@@ -53,3 +53,15 @@ Thumbs.db
 
 # --- Local infra volumes ---------------------------------------------------
 docker/volumes/
+
+# --- Tooling state ---------------------------------------------------------
+# Claude Code's `.claude/` uses the same two-file convention as the editors above:
+# a project file meant to be shared and a `.local` one that never is. Only the
+# second is true here — both files are permission allowlists accumulated on one
+# machine, full of absolute Windows paths and scratch junit filenames. Nothing in
+# either is a statement about the project, so the whole directory is local.
+#
+# This is the rule the `.env` block at the top makes: committed config is config
+# another checkout needs. If a genuinely shared setting ever appears here, force-add
+# that one file.
+.claude/
