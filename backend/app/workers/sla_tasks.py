@@ -48,7 +48,7 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from app.core import event_loop
+from app.core import event_loop, redis
 from app.core.config import get_settings
 from app.models.enums import TicketEventType
 from app.models.notification import Notification
@@ -57,6 +57,7 @@ from app.models.ticket_event import TicketEvent
 from app.repositories import sla_repository
 from app.repositories.organization_repository import OrganizationRepository
 from app.services import notification_service, sla_service
+from app.websocket import manager as realtime
 from app.workers.celery_app import celery_app
 
 logger = structlog.get_logger(__name__)
@@ -245,6 +246,22 @@ async def _sweep(organization_id: uuid.UUID) -> dict[str, int]:
     # tasks are handed readable. See `enqueue_delivery`'s docstring for why this order is
     # not negotiable.
     counts["queued"] = notification_service.enqueue_delivery(notifications)
+
+    # **The worker publishes to the same Redis the API subscribes to, and this is the whole
+    # point of Phase R's design.** An SLA alert has no request behind it, so it can reach a
+    # browser only by crossing a process boundary — and the envelope carries only the
+    # notification, because a clock changing is not a ticket change a client is rendering.
+    #
+    # `scoped_client` and not `get_client`: `event_loop.run` builds *and closes* a loop per
+    # task invocation, so a client cached on the shared module would be bound to a loop that
+    # no longer exists by the next sweep, and would fail with an error naming neither the
+    # task nor Redis. See `app/core/redis.py`.
+    #
+    # After the commit, like every other producer. `publish_notifications` never raises, so
+    # a Redis outage cannot turn a completed sweep into a failed task that beat retries —
+    # the notification rows are the durable record and the sweep's result is already written.
+    async with redis.scoped_client() as client:
+        counts["published"] = await realtime.publish_notifications(notifications, client=client)
 
     logger.info("sla_sweep_complete", organization_id=str(organization_id), **counts)
     return counts

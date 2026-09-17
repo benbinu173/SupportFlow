@@ -190,22 +190,54 @@ stored chunks.
 
 ## 8. Real-time flow
 
+Implemented in Phase R (ADR-025). This section was written in Phase B as a plan; it is now a
+description of what runs.
+
 ```
-Agent A resolves a ticket
-   → API commits the transaction
-   → publish to Redis channel  org:{organization_id}
-   → every API instance subscribed receives it
-   → each fans out to its local WebSocket connections for that org
-   → Agent B's UI updates without refresh
+A committed change
+   → the service publishes after session.commit()
+   → app/websocket/manager.py pipelines the ticket event and one envelope per notification
+   → to Redis channel  org:{organization_id}
+   → every API instance's subscriber task receives it
+   → app/websocket/events.py decides, per local connection, whether it may see it
+   → the client is told what changed and re-reads the ticket over HTTP
 ```
 
-Connections authenticate before joining, and subscription is bound to the
-organization in the verified token — a client cannot subscribe to another
-organization's channel. Because fan-out goes through Redis rather than process
-memory, any API instance can serve any client, which keeps horizontal scaling intact.
+**Where each piece lives.** `app/websocket/events.py` is the vocabulary and the boundary: the
+envelope models, `channel_for`, the `REALTIME_FOR_EVENT` mapping from the timeline's event types
+onto the wire's, and one pure predicate. `app/websocket/manager.py` is the transport: the
+per-organization registry of connections, `publish`, and `subscribe_forever`, which is started as
+a task in `app/main.py`'s lifespan so that it has exactly one lifetime. `app/api/websocket.py`
+owns the single route, `/ws`, mounted at the application root because `vite.config.ts` proxies
+that path unchanged.
 
-Publication happens after commit, so clients are never notified of a change that
-later rolls back.
+Connections authenticate before joining, and subscription is bound to the organization in the
+verified token — a client cannot subscribe to another organization's channel. Because fan-out goes
+through Redis rather than process memory, any API instance can serve any client, which keeps
+horizontal scaling intact.
+
+Publication happens after commit, so clients are never notified of a change that later rolls back.
+
+**Two corrections to the plan as written above.** "Subscription" was the sketch, and it implied a
+client may name a channel. It may not: the protocol has exactly one client-to-server message, the
+auth frame, and the server places the connection on its own organization's channel. The second is
+the audience for a notification. This section originally left room for a channel per user; the
+implementation filters **per user on the organization's channel** instead, because
+`notify_for_event` and `notify_sla_alert` already decided who each notification is for and that
+decision is durable in the row. A channel per person would multiply the subscription set by the
+tenant's headcount to buy one comparison, and it would move an authorization decision into a
+connection's channel list, where it becomes a second surface to get right.
+`notification_visible_to` compares the addressee and deliberately does not re-derive the audience.
+
+**The boundary is one predicate with two axes**, and the second is the one worth naming here: an
+envelope carrying `internal: true` requires `MESSAGE_READ_INTERNAL`, because row scope alone would
+have pushed a customer the internal note written about them. The publisher states the fact and the
+predicate decides the audience — the division `notification_service` already follows.
+
+**A slow client is dropped, not queued.** The subscriber never awaits a socket: each connection
+owns a bounded queue and its own writer task, and overflow closes that connection with `1013`.
+Without it, one stalled TCP connection would delay every tenant on the instance. No application
+heartbeat is sent; uvicorn's protocol-level ping already answers that.
 
 ## 9. Background job flow
 

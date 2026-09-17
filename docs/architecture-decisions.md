@@ -1416,3 +1416,211 @@ sweep does not alert on a terminal ticket even when it is overdue — that lives
 `sla_repository.find_pending`'s `status` filter rather than in the clock. Five code comments
 that named this phase are now paid, and the two enums that were waiting for producers have
 them.
+
+---
+
+## ADR-025 — The socket authenticates in a frame, and the audience is decided by one predicate
+
+**Status:** accepted · Phase R
+
+**Context.** §25 gives real-time updates as a requirement: "ticket updates, new messages,
+assignment changes, SLA warnings, AI analysis completion". §7 says "no critical state in local
+process memory" and that "WebSocket fan-out [is] designed for multi-instance deployment from the
+start". §54's checklist asks for "WebSocket subscriptions" among the cross-tenant probes. Phase R
+is the phase five earlier places were left waiting for, each in writing: `Notification`'s
+docstring says *"the websocket is the delivery optimization; this table is the source of truth"*;
+the README carried "No WebSocket push" as a known limitation with the note that the row is
+persisted "so that Phase R has something to push"; `docs/architecture.md` §8 was titled
+**Real-time flow** and written as a plan, naming the channel, the ordering rule, and the reason
+for Redis; and the frontend already held up its end — `vite.config.ts` proxies `/ws` to
+`ws://localhost:8000` and rewrites nothing, and `App.tsx` sets `refetchOnWindowFocus: false` with
+the comment *"WebSocket events drive invalidation"*. The path and the thin-envelope contract were
+agreed before this backend existed on the other side of them.
+
+**Decision 1 — the credential arrives in a first-message frame.** A browser cannot set an
+`Authorization` header on a WebSocket handshake, so the three candidates were a query string,
+`Sec-WebSocket-Protocol`, and a frame sent after `accept()`. The query string is the one every
+tutorial uses and it is the wrong one here: uvicorn logs the full request line, so a live access
+token would reach stdout on **every connect and every reconnect**, and
+`tests/security/test_log_hygiene.py` **would not have caught it** — that suite records structlog
+calls, so a token printed by the ASGI server's own logger is outside everything it can see. §4's
+"no tokens in logs" is a requirement about logs, not about structlog, and a mechanism whose
+compliance depends on a logger we do not control is not compliance. The subprotocol alternative
+loses for a smaller reason: it abuses a negotiation header to carry a credential, and a server
+that echoed the chosen protocol back would be putting the token in a response header. The frame
+wins because it puts the credential in a message body — the one place a request line never
+carries — and `docs/architecture.md:202` already said "connections authenticate **before
+joining**", so this is the code matching a document written eight phases earlier.
+
+The frame costs a handshake that completes before the caller is known, and that has consequences
+which are decisions in their own right:
+
+* **The refusal path is `close(code)`, not the §42 envelope.** `app/main.py`'s four exception
+  handlers render `JSONResponse`, and a WebSocket scope has no response to render into. So the
+  handler catches `AppError` itself and closes with a code the client can act on, defined in
+  `app/websocket/events.py`: **4401** unauthenticated (also the answer to a malformed frame),
+  **4403** authenticated but not permitted, **4408** nothing sent within `WS_AUTH_TIMEOUT_SECONDS`,
+  and **1013** slow consumer — the one standard code in the list, with the other three following
+  the convention every WebSocket library documents rather than claiming a meaning RFC 6455 already
+  assigned.
+
+* **`WS_AUTH_TIMEOUT_SECONDS` exists because an unauthenticated socket is a resource.** A peer that
+  connects and says nothing holds a file descriptor and a task indefinitely. The timeout is the
+  bound, and the test suite sets it to one second, which is the pattern the rate-limit ceilings
+  already use.
+
+**Decision 2 — the five checks are extracted, not copied.** `app/api/deps.py` already had the
+authorization order written down in prose: decode, check the token type, load the user, check they
+are active, and check their organization is not suspended. A socket must apply the same five in
+the same order, and the tempting move is a second function beside the first — which would be two
+implementations of "is this caller who they claim" that agree until one of them is edited.
+`authenticate_token(db, token) -> User` is that sequence over a raw string, and `get_current_user`
+becomes a two-line wrapper that extracts the bearer token and calls it. `tenant_context_for(user)
+-> TenantContext` is the second extraction, kept here so that this module remains the only place a
+`TenantContext` is constructed — a property the code already relied on and which a socket building
+its own would have quietly broken. Behaviour is unchanged, and the evidence is that **the existing
+auth suites were not edited**.
+
+**Decision 3 — the envelope is thin, and the client re-reads.** A `ticket.*` envelope carries
+`type`, `ticket_id`, `ticket_number`, the field that changed with both of its ends, and the three
+facts the audience decision needs. It never carries a rendered `TicketRead`. Pushing one would
+make `app/websocket/events.py` a second serializer of the same row, with its own row-scope and
+permission decisions to keep in step with `app/api/tickets.py` — and the failure mode is a socket
+whose payload disagrees with `GET /tickets/{id}`, which no client can detect and no test would
+think to look for. This is the stand Phase Q took when it refused to re-express the SLA clock in
+SQL, and the one `notification_service` takes when it refuses to parse `from_value` back into
+structured data. The **one** exception is `NotificationEnvelope.title`, carried because a toast
+wants something to render and its only alternative read is fetching a page; it is server-written,
+immutable, and already exposed by `GET /notifications`.
+
+**Decision 4 — one channel per organization, and a channel is not a key.** The channel name is
+`org:{organization_id}`, which is not invented here: `docs/architecture.md` §8 writes the flow out
+that way, and the code matches the document rather than the document being edited to match the
+code. **Redis does not namespace pub/sub channels by database.** Keys are separated across db 0/1/2
+(ADR-022), but a `PUBLISH` on db 0 reaches a `SUBSCRIBE` on db 1, so a running development server
+and the test suite, pointed at the same Redis, share one channel space. That is worth stating
+plainly because it looks like a bug the first time someone meets it, and because of what follows
+from it: **isolation does not rest on the database number.** It rests on the envelope's
+`organization_id` and on the registry being keyed by organization, which is a stronger arrangement
+— a mechanism that holds regardless of how a client reached Redis is one that cannot be defeated by
+a connection string.
+
+**Decision 5 — the audience is one pure predicate with two axes, and the second axis is a bug that
+would have shipped.** `visible_to(envelope, context)` takes no session, no `await`, and no socket.
+The first axis is `TICKET_SCOPE_BY_ROLE` through `row_scope_for` — the same table that governs every
+HTTP read, so the socket cannot drift from the routes because there is one table. The second axis is
+internal content, and **row scope alone is not sufficient**: a customer owns their own ticket, so
+scope alone would have pushed them `ticket.note_added` for the internal note written *about them*.
+`MESSAGE_READ_INTERNAL` already answers this — it is held by staff and not by customers, and it is
+applied in the service on the HTTP side precisely because a route cannot express "this field, for
+this audience". So the envelope carries `internal: bool`, set by the producer from
+`message.is_internal`, and the predicate requires the capability when it is set. The division is the
+one `notify_for_event` already follows: **the publisher states the fact and the boundary decides the
+audience.** Organization equality is checked a third time inside the predicate even though the
+channel already guaranteed it, so that the boundary is fail-closed on its own rather than depending
+on the transport having done its job — a boundary that only holds because of something else moves
+the day that something else changes.
+
+**Decision 6 — one slow socket must not delay anyone else.** The subscriber task is the only thing
+on the instance turning Redis messages into socket writes, for every tenant on it. If it could block
+on one socket — a suspended browser tab, a laptop that went to sleep, a peer that has stopped
+acknowledging — then every other tenant's events would queue behind it. That is a cross-tenant
+denial of service in a multi-tenant product, and it is why the fan-out is `put_nowait` into a
+**bounded** per-connection queue, with each connection owning its own writer task, and why overflow
+or a send timeout closes that one connection with 1013.
+
+**A real bug was found here, by the test written to cover it, and it is recorded because the
+mechanism is easy to get wrong twice.** The first `_drop_backlog` freed one slot and appended the
+close marker. Against a queue filled to its 64-deep bound that left 63 stale envelopes *in front of*
+the marker, and the client this path exists for is by definition not reading — so the writer would
+block on the first of those and the close would never be sent until the send timeout fired ten
+seconds later, leaving the connection registered the whole time. Emptying the queue is what makes
+the marker the next thing the writer sees. It is a one-line difference between a design that works
+and a design that appears to work, which is the argument for testing the decision where it is made
+rather than only through a socket: reaching this state end to end means filling kernel buffers
+before the application queue can start to fill, which is machine-dependent.
+
+**Decision 7 — the local registry is process memory, and that is allowed.** requirements.md §7
+forbids *critical* session state in local memory. A subscription registry is not critical: the
+durable record is the database, the socket carries only notification that the record changed, and a
+lost connection costs latency and nothing else. The requirement's second half is satisfied literally
+— fan-out travels through Redis, so any instance serves any client with no sticky sessions and no
+cross-instance coordination. What it costs is stated in Decision 8.
+
+**Decision 8 — the worker exposes a Redis bug that nothing had hit yet, and the fix is a scoped
+client.** Every Celery task reaches async code through `event_loop.run`, which builds **and closes**
+a loop per call (ADR-011). A client built inside one invocation and cached in `app/core/redis.py`'s
+module-level `_shared` is bound to a loop that is then closed — so the *second* sweep would publish
+through a dead client, and the first would look fine. Nothing had hit this because no task had used
+the async client before; the SLA sweep is the first worker-side publisher. `redis.scoped_client()`
+builds and closes its own, and the publish functions take `client=None`, which is the shape
+`RateLimiter.__init__` already uses for the same reason. This is exactly the class of bug a
+phase-boundary review catches and a per-phase test suite cannot: it is not in any one component, it
+is in the assumption they share.
+
+**Decision 9 — no application-level ping.** uvicorn's protocol-level ping/pong
+(`--ws-ping-interval`, 20 seconds) already detects a dead peer in both directions, and the handler's
+read loop is what observes the resulting disconnect. An application heartbeat would be a second
+liveness mechanism for a problem already solved one layer down, with its own timeout to tune and its
+own way of disagreeing with the first.
+
+**Decision 10 — §54's route walk learns about sockets, because it could not see one.** The walk that
+proves every route is either public by declaration or guarded by a capability uses
+`isinstance(route, APIRoute)`. `APIWebSocketRoute` and `APIRoute` are **siblings**, not parent and
+child, so the first socket in this project would have been silently skipped — and
+`test_the_walk_finds_every_documented_route` would not have noticed, because WebSocket routes do not
+appear in the OpenAPI schema either. Two independent blind spots for the same route. The walk now
+collects `APIWebSocketRoute` too, and `WEBSOCKET_ROUTES` joins `PUBLIC_ROUTES` as a list of its own,
+with a docstring saying why: the socket's credential arrives *after* the handshake, so the per-route
+capability dependency the other two allowlists describe does not apply to it, and what replaces it
+is `tests/security/test_websocket.py`. Leaving the socket invisible to the mechanical guard and
+asserting it by hand would have made §54's checklist true by inspection rather than by construction.
+
+**Decision 11 — the socket declares the capabilities its contents need.** The handler checks
+`TICKET_VIEW` and `NOTIFICATION_LIST` before registering a connection, and closes with 4403 without
+them. All four roles hold both today, so this is a statement of what the channel carries rather than
+a narrowing. It is worth the two lines because it is the only mechanism that would catch a future
+role that lost either: without it, such a role would hold a socket that pushed it events it has no
+route to read the details of.
+
+**Decision 12 — a notification event is filtered per user, not addressed to a per-user channel.**
+`docs/architecture.md` §8 sketched the alternative, and this is the one correction the implementation
+makes to it. A channel per person would multiply the subscription set by the tenant's headcount to
+buy a filter that is one comparison — and it would move the audience decision into the
+*subscription*, where a connection's channel list becomes a second authorization surface to get
+right. Filtering on the organization's channel keeps the decision in the predicate beside the other
+one. `notify_for_event` and `notify_sla_alert` already decided *who* each notification is for, and
+that decision is durable in the row; `notification_visible_to` compares the addressee and
+deliberately does **not** re-derive it. Recomputing the audience here would be a second
+implementation of the notification policy, agreeing with the first until one of them changed, and
+its failure mode is a notification that appears in the inbox and not on the socket, or the reverse.
+
+**Decision 13 — `_NOTHING_PUBLISHED` is a named set, not an omission.** `TicketEventType` has three
+members that produce no `ticket.*` envelope: the SLA pair, because they change a clock rather than a
+rendered field and they do notify somebody (as `notification.created`), and
+`AI_ANALYSIS_COMPLETED`, because §25 names it and nothing produces it yet. A unit test asserts the
+mapping and this set **partition** the enum, so a later phase that adds a timeline entry has to
+decide whether it reaches a client — rather than having it silently never published. That is the
+same guard `SILENT_EVENT_TYPES` and `DEFERRED_EVENT_TYPES` provide from the notification side, and
+the entry naming `AI_ANALYSIS_COMPLETED` is a marker for Phase T-W to delete.
+
+**What Phase R deliberately does not do.** No replay or backfill: a client that was disconnected
+misses events and must refetch, which is the same contract the thin envelope already implies. No
+inbound verb beyond the auth frame — a client cannot subscribe, unsubscribe, or acknowledge, because
+nothing in §25 asks for it and every inbound verb is a new authorization surface. No per-connection
+inbound rate limit, which the README records. No per-user channel (Decision 12). No analytics (§31's
+SLA risks and §28's `GET /analytics/sla` are Phase S's). And no new dependency, no new process, and
+no migration: `websockets==17.1` was already installed as a `uvicorn[standard]` extra, the subscriber
+is a task inside the API's own lifespan, and **`alembic check` reports no new upgrade operations** —
+the mechanical proof that the phase which added the most moving parts of any so far stores nothing
+at all.
+
+**Cost.** Three settings to operate (`WS_AUTH_TIMEOUT_SECONDS`, `WS_QUEUE_MAX_DEPTH`,
+`WS_SEND_TIMEOUT_SECONDS`), a fan-out whose delivery is best-effort and at-most-once where the
+notification row is durable, and a registry that is process memory — so a restart loses subscriptions
+and every client reconnects, which is the trade Decision 7 accepts and names. The publish is
+deliberately non-raising: a Redis outage must not fail a request that has already committed, so the
+failure is a log line naming the error type and not the URL (a broker URL can carry a password) and
+clients that do not reconnect never learn anything changed. And the subscriber reconnects with a
+bounded backoff, so a Redis restart costs real-time delivery for the duration rather than for the
+life of the process — a distinction that is invisible until the day it matters.

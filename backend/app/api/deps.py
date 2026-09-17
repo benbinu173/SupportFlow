@@ -16,6 +16,14 @@ The order of checks matters and is deliberate:
 5. **The organization is active.** A suspended tenant stops being served.
 
 Only then is a `TenantContext` built.
+
+**Phase R made that list a function with two callers.** A WebSocket cannot use these as
+dependencies — a browser cannot set an `Authorization` header on a handshake, so the token
+arrives in a message after the socket is open and there is no dependency tree left to solve.
+`authenticate_token` and `tenant_context_for` below are the list itself, and `get_current_user`
+and `get_tenant_context` are now thin wrappers around them. The alternative was a socket-shaped
+copy of the five checks, which is the failure this module's ordering is written to prevent:
+two copies of an authentication rule agree until one of them is fixed and the other is not.
 """
 
 from collections.abc import Coroutine
@@ -63,7 +71,25 @@ async def get_current_user(credentials: Credentials, db: DbSession) -> User:
     if credentials is None or not credentials.credentials:
         raise AuthenticationRequiredError()
 
-    claims = decode_access_token(credentials.credentials)
+    return await authenticate_token(db, credentials.credentials)
+
+
+async def authenticate_token(db: AsyncSession, token: str) -> User:
+    """The five checks below, over a raw token string.
+
+    **Extracted in Phase R, not restated.** A WebSocket cannot use `get_current_user` as a
+    dependency: a browser cannot set an `Authorization` header on a handshake, so the token
+    arrives in a message *after* the socket is accepted, and there is no dependency tree for
+    FastAPI to solve by then. The alternative — a socket-shaped copy of the checks — is the
+    failure this module exists to prevent, because two copies of an authentication rule
+    agree until one of them is fixed and the other is not. So the rule has one
+    implementation and two callers: the HTTP dependency above, and
+    `app/api/websocket.py`.
+
+    It takes a token rather than a `Request` or a `Credentials` object for exactly that
+    reason — the string is the only input both callers have.
+    """
+    claims = decode_access_token(token)
 
     # `joinedload` rather than two round trips: the organization is needed below for
     # its status, and lazily touching `user.organization` in async code raises.
@@ -106,6 +132,18 @@ async def get_tenant_context(
 
     Built from the database row, never from a header, body field, or query parameter.
     A request cannot influence which organization it is served as.
+    """
+    return tenant_context_for(user)
+
+
+def tenant_context_for(user: User) -> TenantContext:
+    """Build the tenant identity from an authenticated row.
+
+    Split out of the dependency above for the same reason `authenticate_token` was split out
+    of `get_current_user`: a WebSocket handler has no dependency injection to receive a
+    `TenantContext` through, and it must build the identical object. Keeping "this module is
+    the only place a `TenantContext` is constructed" true is worth more than the two lines it
+    saves to inline it.
     """
     return TenantContext(
         user_id=user.id,

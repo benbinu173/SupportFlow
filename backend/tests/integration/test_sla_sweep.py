@@ -29,14 +29,19 @@ the rows were staged. That each id resolves to a readable row and a real message
 """
 
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import cast
 
 import pytest
+import redis as redis_client
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 
+from app.core.config import get_settings
+from app.models.enums import NotificationType
+from app.websocket import events
 from app.workers import sla_tasks
 from tests.conftest import NOTIFICATIONS, TICKETS, USERS, OrgSession
 
@@ -211,6 +216,68 @@ def inbox(session: OrgSession, **params: object) -> list[dict]:
     return response.json()
 
 
+# How long the drain below waits for the first byte and then for each subsequent one. Both
+# are generous for a loopback Redis, and both are *only* reached when there is nothing more
+# to read — the publish has already been acknowledged by the server before `sweep` returns,
+# so this is waiting on a socket buffer rather than on the sweep.
+_PUBSUB_TIMEOUT_SECONDS = 1.0
+
+
+@contextmanager
+def listening_to_organizations() -> Iterator[list[events.Envelope]]:
+    """Subscribe to every organization's channel, and hand back what arrived.
+
+    **A raw subscriber rather than the application's own**, and that is the point of the
+    test below: `app/websocket/manager.py`'s subscriber would prove only that this process
+    can hear itself. A bare `psubscribe` on the same Redis the worker publishes to is the
+    claim that the fan-out is real — a second process on another machine, running only
+    Redis and this subscription, would receive exactly these bytes.
+
+    Two connections, deliberately. `pubsub()` builds its own connection from the client,
+    so the subscription is not competing with the publish for one.
+
+    The `ignore_subscribe_messages=True` flag is what filters `psubscribe`'s own
+    confirmation: it arrives on the same iterator as the messages, and without it the first
+    read would be the subscription rather than anything anyone published.
+
+    **That first read is not optional, and it is not what it looks like.** `psubscribe`
+    does not talk to the server — redis-py queues the intent and issues the command when
+    the connection is next read. So without a read here the subscription would not exist
+    yet, and the work under the `with` would publish to nobody. The call below is what puts
+    the `PSUBSCRIBE` on the wire; the returned `None` is the confirmation, filtered, and it
+    is discarded rather than asserted because an empty read is the only outcome that means
+    what we want and asserting it would turn an unrelated stray message into a failure.
+
+    The drain happens on the way *out* of the `with`, not inside it, because Redis pub/sub
+    has no replay: a subscriber created after a publish has missed it forever. So the
+    subscription is opened before the work and read after it.
+    """
+    client = redis_client.Redis.from_url(str(get_settings().REDIS_URL))
+    pubsub = client.pubsub(ignore_subscribe_messages=True)
+    received: list[events.Envelope] = []
+    try:
+        pubsub.psubscribe(events.ORG_CHANNEL_PATTERN)
+        pubsub.get_message(timeout=_PUBSUB_TIMEOUT_SECONDS)
+        yield received
+        while (message := pubsub.get_message(timeout=_PUBSUB_TIMEOUT_SECONDS)) is not None:
+            received.append(events.parse_envelope(_as_text(message["data"])))
+    finally:
+        # Closed rather than left to the collector: a subscription outliving the test would
+        # keep receiving every later test's events, and the next test to open one would be
+        # sharing a connection with a subscriber nobody can see.
+        #
+        # `close` and not `aclose` — this is the synchronous client. The two spellings are
+        # the one real difference between `redis.Redis` and `redis.asyncio.Redis`, and the
+        # application's subscriber uses the other one.
+        pubsub.close()
+        client.close()
+
+
+def _as_text(value: bytes | str) -> str:
+    """Decode a payload. This client is built without `decode_responses`, like the app's."""
+    return value.decode() if isinstance(value, bytes) else value
+
+
 # ---------------------------------------------------------------------------
 # The warning
 # ---------------------------------------------------------------------------
@@ -381,6 +448,73 @@ def test_the_assignee_can_read_the_alert_from_their_own_inbox(
     assert inbox(staff["admin"]) == []
 
 
+def test_the_sweep_publishes_the_alert_to_the_organizations_channel(
+    staff: dict[str, OrgSession],
+    customer: str,
+    sync_engine: Engine,
+) -> None:
+    """The worker's alert reaches Redis, read back by something that is not the API.
+
+    **This is the assertion Phase R exists to make.** Every other test in this file proves
+    the sweep *wrote* something; this one proves the write crosses a process boundary. The
+    sweep runs the way the worker runs it — `check_organization_sla`, through
+    `event_loop.run` on a loop it owns and closes, through `scoped_client()` — and the
+    subscription that hears it is a bare `psubscribe` on the same Redis with no knowledge
+    of this application. A deployed API instance would be receiving those same bytes.
+
+    That is also why the subscriber is not `app/websocket/manager.py`'s: the application's
+    own subscriber would prove only that one process can hear itself, which an in-process
+    callback would do more cheaply. The channel is the contract.
+
+    Both envelopes are asserted and not just the count. A published event that names the
+    wrong organization would be *delivered* — `channel_for` is computed from the same field
+    — and then silently dropped by every receiving instance's `envelope_visible_to`, which
+    is the failure that looks exactly like success from here. So the audience check is
+    asserted on the payload rather than inferred from the channel it arrived on.
+    """
+    ticket = urgent_ticket(staff, customer)
+    backdate(sync_engine, ticket["id"], minutes=BACKDATE_MINUTES)
+    organization_id = organization_of(sync_engine, ticket["id"])
+
+    with listening_to_organizations() as received:
+        counts = sweep(sync_engine, ticket["id"])
+
+    # Two, because this ticket is unassigned and an SLA warning reaches every manager when
+    # there is no assignee to reach. Asserted against `notifications` rather than against a
+    # literal, so this stays a statement about "every staged row was published" if §26's
+    # recipient list ever changes.
+    assert counts["notifications"] == 2
+    assert counts["published"] == counts["notifications"]
+
+    # `parse_envelope` and not a hand-rolled `json.loads`: the payload is validated by the
+    # same model a receiving instance validates it with, so a field renamed on the
+    # publishing side fails here rather than on a client.
+    alerts = [
+        envelope
+        for envelope in received
+        if envelope.type is events.RealtimeEventType.NOTIFICATION_CREATED
+    ]
+    assert len(alerts) == len(received) == 2
+
+    for envelope in alerts:
+        assert isinstance(envelope, events.NotificationEnvelope)
+        # SLA alerts produce no `ticket.*` event — a clock changing is not a field a client
+        # is rendering — so the ticket id is the only thing tying the toast to a screen.
+        assert envelope.notification_type is NotificationType.SLA_WARNING
+        assert envelope.ticket_id == uuid.UUID(ticket["id"])
+        assert envelope.organization_id == uuid.UUID(organization_id)
+
+    # The addressees, as a set: both managers, which is the same pair
+    # `test_an_unassigned_ticket_reaches_the_managers_alone` reads out of the notification
+    # table and the same pair the admin's inbox assertions above find absent. Two calls to
+    # `inbox` would answer the same question; this answers it on the wire, where the
+    # recipients are a property of the envelope rather than of who happened to query.
+    assert {str(envelope.user_id) for envelope in alerts} == {
+        staff["manager"].user_id,
+        staff["manager2"].user_id,
+    }
+
+
 # ---------------------------------------------------------------------------
 # The breach
 # ---------------------------------------------------------------------------
@@ -482,6 +616,12 @@ def test_a_second_sweep_of_the_same_ticket_produces_nothing(
         "breaches": 0,
         "notifications": 0,
         "queued": 0,
+        # Phase R's addition, and it belongs in this assertion for the same reason the
+        # other two zeroes do: a second sweep that re-published the first sweep's alert
+        # would put the same toast on every open socket once per interval, forever. The
+        # timeline guard above is what stops it, and this is where that guard is visible
+        # from the real-time side.
+        "published": 0,
     }
     assert len(queued_emails) == after_first
     assert len(timeline(staff["admin"], ticket["id"])) == 1
@@ -505,7 +645,14 @@ def test_the_sweep_is_silent_for_a_ticket_still_inside_its_target(
 
     counts = sweep(sync_engine, ticket["id"])
 
-    assert counts == {"tickets": 0, "warnings": 0, "breaches": 0, "notifications": 0, "queued": 0}
+    assert counts == {
+        "tickets": 0,
+        "warnings": 0,
+        "breaches": 0,
+        "notifications": 0,
+        "queued": 0,
+        "published": 0,
+    }
     assert timeline(staff["admin"], ticket["id"]) == []
 
 

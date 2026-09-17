@@ -70,6 +70,19 @@ os.environ.setdefault("SMTP_PORT", "1025")
 os.environ.setdefault("SMTP_FROM", "support@supportflow.local")
 os.environ.setdefault("SMTP_TIMEOUT_SECONDS", "2")
 
+# WebSockets. The auth window is the one that matters, and it is lowered rather than
+# raised — the same direction as nothing else in this file. A test that opens a socket and
+# never sends an auth frame has to wait for the server to give up, so the ten-second
+# production default would turn one assertion into ten seconds of wall clock. One second
+# is still far longer than a local round trip, so no test that *does* authenticate can be
+# racing it.
+#
+# `WS_QUEUE_MAX_DEPTH` and `WS_SEND_TIMEOUT_SECONDS` are deliberately left at their
+# defaults: the slow-consumer tests set them per test through `get_settings()`'s cache
+# being cleared, because a suite-wide shallow queue would make every other socket test
+# depend on how fast the fan-out ran.
+os.environ.setdefault("WS_AUTH_TIMEOUT_SECONDS", "1")
+
 # Imported after the environment is populated, which is why this block sits below
 # the statements above. Ruff's E402 allows `os.environ` setup before imports
 # precisely because this pattern is unavoidable for test configuration.

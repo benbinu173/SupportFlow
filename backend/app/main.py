@@ -4,8 +4,9 @@ Wiring, CORS, exception handling, and the routers. Business logic lives in
 `app/services/` — nothing here decides anything beyond how a failure is rendered.
 """
 
+import asyncio
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 import structlog
 from fastapi import FastAPI, Request
@@ -17,12 +18,14 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.health import router as health_router
 from app.api.v1 import router as v1_router
+from app.api.websocket import router as websocket_router
 from app.core.config import get_settings
 from app.core.database import dispose_engine
 from app.core.exceptions import AppError, ErrorCode, error_body
 from app.core.redis import close_client as close_redis_client
 from app.core.storage import ensure_bucket
 from app.core.storage import reset_client as reset_storage_client
+from app.websocket import manager as realtime
 
 logger = structlog.get_logger(__name__)
 
@@ -41,12 +44,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     deployment whose bucket does not exist should learn that at startup rather than from
     the first user who tries to attach a screenshot. `ensure_bucket` reports a failure
     instead of raising one, so MinIO being down degrades attachments and nothing else.
+
+    **The real-time subscriber is started here too, and this is the only place it may be
+    started.** It is the one task the application owns, and it must have exactly one
+    lifetime: two of them would double every event delivered to a socket on this instance,
+    and none of them — the process running without it — would leave the API answering
+    requests normally while every client's updates had silently stopped. Cancelling it
+    before the pools close is ordering, not politeness: `subscribe_forever` holds a Redis
+    connection, and `close_redis_client` below would be pulling the floor out from under a
+    task that is still trying to reconnect to it.
     """
-    await ensure_bucket()
-    yield
-    await close_redis_client()
-    await dispose_engine()
-    reset_storage_client()
+    subscriber = asyncio.create_task(realtime.subscribe_forever(), name="realtime-subscriber")
+    try:
+        await ensure_bucket()
+        yield
+    finally:
+        subscriber.cancel()
+        # `CancelledError` is the expected outcome and not a failure, but awaiting is what
+        # makes the cancellation *finished* — without it the shutdown would race with a task
+        # still inside `psubscribe`.
+        with suppress(asyncio.CancelledError):
+            await subscriber
+        await close_redis_client()
+        await dispose_engine()
+        reset_storage_client()
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +200,12 @@ def create_app() -> FastAPI:
     app.add_exception_handler(Exception, _unhandled_exception_handler)
 
     app.include_router(health_router, tags=["health"])
+    # Un-prefixed, like the health routes and unlike everything in `v1_router`. `/ws` is not
+    # a versioned API resource — it is a connection, its contract is the frame vocabulary in
+    # `app/websocket/events.py` rather than a request/response schema, and the frontend's
+    # `vite.config.ts` already proxies exactly this path with no rewrite. Versioning it
+    # would mean two paths for one socket and no way to retire the old one.
+    app.include_router(websocket_router, tags=["realtime"])
     app.include_router(v1_router, prefix=settings.API_V1_PREFIX)
 
     return app

@@ -55,6 +55,7 @@ from app.schemas.ticket import (
     TicketStatusUpdate,
 )
 from app.services import audit_service, notification_service
+from app.websocket import manager as realtime
 
 logger = structlog.get_logger(__name__)
 
@@ -226,7 +227,7 @@ async def create_ticket(
     # in one transaction. A ticket without its CREATED event is a timeline that starts
     # mid-story.
     await session.flush()
-    record_event(
+    event = record_event(
         session,
         context,
         ticket,
@@ -247,6 +248,10 @@ async def create_ticket(
         origin=origin,
     )
     await session.commit()
+    # After the commit, like the notification queueing it sits beside — a client told about
+    # a ticket that could still roll back has been told something untrue, and unlike a
+    # notification row there is nothing later that would correct it.
+    await realtime.publish(ticket, event)
 
     logger.info(
         "ticket_created",
@@ -335,6 +340,9 @@ async def assign_ticket(
     notifications = await notification_service.notify_for_event(session, context, ticket, event)
     await session.commit()
     notification_service.enqueue_delivery(notifications)
+    # The ticket event and its notification events in one pipelined round trip, so an
+    # assignment and the toast announcing it cannot arrive out of order.
+    await realtime.publish(ticket, event, notifications)
 
     logger.info(
         "ticket_assigned" if assigned_agent_id else "ticket_unassigned",
@@ -369,7 +377,7 @@ async def change_priority(
 
     previous = ticket.priority
     ticket.priority = payload.priority
-    record_event(
+    event = record_event(
         session,
         context,
         ticket,
@@ -388,6 +396,7 @@ async def change_priority(
         origin=origin,
     )
     await session.commit()
+    await realtime.publish(ticket, event)
 
     logger.info(
         "ticket_priority_changed",
@@ -423,9 +432,12 @@ async def change_status(
     if hint is not None:
         raise InvalidTicketTransitionError(ticket.status.value, payload.status.value, hint)
 
-    notifications = await _transition(session, context, ticket, payload.status, origin=origin)
+    event, notifications = await _transition(
+        session, context, ticket, payload.status, origin=origin
+    )
     await session.commit()
     notification_service.enqueue_delivery(notifications)
+    await realtime.publish(ticket, event, notifications)
 
     logger.info(
         "ticket_status_changed",
@@ -455,9 +467,12 @@ async def close_ticket(
     """
     ticket = await require_visible_ticket(session, context, ticket_id)
 
-    notifications = await _transition(session, context, ticket, TicketStatus.CLOSED, origin=origin)
+    event, notifications = await _transition(
+        session, context, ticket, TicketStatus.CLOSED, origin=origin
+    )
     await session.commit()
     notification_service.enqueue_delivery(notifications)
+    await realtime.publish(ticket, event, notifications)
 
     logger.info(
         "ticket_closed",
@@ -493,7 +508,7 @@ async def reopen_ticket(
     """
     ticket = await require_visible_ticket(session, context, ticket_id)
 
-    notifications = await _transition(
+    event, notifications = await _transition(
         session,
         context,
         ticket,
@@ -509,6 +524,12 @@ async def reopen_ticket(
 
     await session.commit()
     notification_service.enqueue_delivery(notifications)
+    # Published *after* the assignment is cleared, so the envelope carries the reopened
+    # state rather than the state it was in when `_transition` ran. That matters to the
+    # audience decision and not just to accuracy: an agent scoped to their own assignments
+    # must not be shown a reopen of a ticket that is no longer theirs, and reading
+    # `assigned_agent_id` before this line would have shown it to exactly them.
+    await realtime.publish(ticket, event, notifications)
 
     logger.info(
         "ticket_reopened",
@@ -533,7 +554,7 @@ async def _transition(
     *,
     event_type: TicketEventType = TicketEventType.STATUS_CHANGED,
     origin: RequestOrigin | None = None,
-) -> list[Notification]:
+) -> tuple[TicketEvent, list[Notification]]:
     """Validate one lifecycle edge and apply it. **The only writer of `Ticket.status`.**
 
     Kept as a plain function that mutates and records without committing, so the caller
@@ -556,7 +577,12 @@ async def _transition(
     the audit row: hooking the one route that resolves a ticket today would work today
     and would silently stop the day a second route did.
 
-    Returns the staged notifications; the caller delivers them after its commit.
+    Returns the recorded event and the staged notifications; the caller commits, delivers
+    the notifications, and publishes both after its commit. **The event is returned rather
+    than rebuilt by the caller** because this function is the only place that knows both
+    ends of the change, which is the same reason the audit row is written here — and a
+    caller assembling an envelope from `ticket.status` would read the value *after* the
+    write and announce a change from nothing to itself.
     """
     current = ticket.status
     if not can_transition(current, target):
@@ -613,7 +639,8 @@ async def _transition(
     # and their `enqueue_delivery` is a no-op. Calling it unconditionally rather than
     # behind `if target is RESOLVED` is what keeps the notification a property of the
     # transition rather than of one of the transitions.
-    return await notification_service.notify_for_event(session, context, ticket, event)
+    notifications = await notification_service.notify_for_event(session, context, ticket, event)
+    return event, notifications
 
 
 def record_event(

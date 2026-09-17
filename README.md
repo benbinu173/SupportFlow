@@ -311,10 +311,11 @@ organization and, for a deactivation, by the victim logging in again.
 
 ### What is not yet tenant-scoped
 
-Everything the API exposes now is tenant-owned. `organizations` is the tenant itself,
-and `refresh_tokens` is read by token hash before a tenant is known — neither is a
-resource a client can list. Knowledge articles, attachments, and audit logs arrive in
-Phases L–N and follow the identical repository pattern. See
+Everything the API exposes now is tenant-owned. `organizations` is the tenant itself, and
+`refresh_tokens` is read by token hash before a tenant is known — neither is a resource a
+client can list. Knowledge articles arrive in Phase X and follow the identical repository
+pattern. The real-time channel is the one thing that is not a read: it is keyed by
+organization, filtered by one predicate, and covered by its own security suite. See
 [docs/data-model.md](docs/data-model.md).
 
 ## Customers, tickets, and messages
@@ -875,6 +876,143 @@ deliberately indistinguishable from "this priority has no active policy" — the
 fact about the tenant's configuration, and telling a customer which priorities their
 provider has targets for is the disclosure the null exists to prevent.
 
+## Real-time updates
+
+One socket, at `/ws`, mounted at the application root rather than under `/api/v1` —
+`vite.config.ts` proxies that exact path and rewrites nothing, so the path was agreed before
+this backend existed on the other side of it.
+
+### The credential travels in a frame, never in the URL
+
+A browser cannot set an `Authorization` header on a WebSocket handshake, so the credential
+arrives as the **first message** the client sends:
+
+```json
+{ "type": "auth", "token": "<access token>" }
+```
+
+On success the server replies `{"type": "authenticated"}` and starts delivering events. The
+query-string alternative is the one every tutorial uses and it is the wrong one here: uvicorn
+logs the full request line, so a live token would reach stdout on every connect and every
+reconnect — and
+[tests/security/test_log_hygiene.py](backend/tests/security/test_log_hygiene.py), which records
+structlog calls, would not have seen it. Full reasoning in ADR-025.
+
+### The close codes are the whole refusal vocabulary
+
+A WebSocket has no status line, so the §42 error envelope cannot be used and the reason has to
+arrive *in* the code:
+
+| Code | Meaning | What a client should do |
+|---|---|---|
+| `1000` | The server is going away | Reconnect |
+| `1013` | This socket fell behind and was dropped | Reconnect, then refetch |
+| `4401` | No valid credential, or a malformed auth frame | Refresh the token, then reconnect |
+| `4403` | Authenticated, but not permitted to hold this socket | Do not retry; the account lacks the capability |
+| `4408` | Nothing was sent within `WS_AUTH_TIMEOUT_SECONDS` | Reconnect and send the auth frame |
+
+`4401` and `1000` are deliberately different: a client that could not tell them apart would
+refresh a token it did not need to refresh, in a loop.
+
+### The events
+
+| Type | Raised when |
+|---|---|
+| `ticket.created` | A ticket is created |
+| `ticket.assigned` / `ticket.unassigned` | The assignee changes |
+| `ticket.status_changed` | The status changes, with both ends of the change |
+| `ticket.priority_changed` | The priority changes |
+| `ticket.message_added` | A reply is posted |
+| `ticket.note_added` | An internal note is posted |
+| `ticket.attachment_added` | A file is attached to a visible message |
+| `ticket.reopened` | A closed ticket is reopened |
+| `notification.created` | Anything that puts a row in the notification centre |
+
+A `ticket.*` envelope names the change and nothing else:
+
+```json
+{
+  "type": "ticket.status_changed",
+  "organization_id": "…", "ticket_id": "…", "ticket_number": 1042,
+  "from_value": "assigned", "to_value": "in_progress"
+}
+```
+
+**A client re-reads the ticket over HTTP.** The envelope is deliberately an announcement and
+not a rendering, so there is exactly one place a ticket is serialized and the socket cannot
+disagree with `GET /tickets/{id}`. The usual shape is: receive, invalidate the ticket query in
+the cache layer, let the existing fetch do the work. `App.tsx` already sets
+`refetchOnWindowFocus: false` with that contract in mind. One exception is
+`NotificationEnvelope.title`, which is carried because a toast wants something to render and
+its only alternative read is fetching a page.
+
+### Who is told
+
+`app/websocket/events.py` holds one pure predicate, `visible_to(envelope, context)`, with no
+session and no socket, deciding three things:
+
+1. **Same organization.** Checked inside the predicate as well as by the channel, so the
+   boundary is fail-closed on its own.
+2. **Row scope** — the same `TICKET_SCOPE_BY_ROLE` table that governs every HTTP read:
+   admin and manager reach the organization, an agent only their assigned tickets, a customer
+   only their own. The socket cannot drift from the routes because there is one table.
+3. **Internal content.** Row scope alone is *not* enough, and this is the leak the first
+   design would have shipped: a customer owns their own ticket, so scope alone would push them
+   `ticket.note_added` for a note written *about them*. An envelope carrying
+   `internal: true` requires `MESSAGE_READ_INTERNAL`, which staff hold and customers do not.
+
+Everything is filtered **per user on the organization's channel**, not by giving each person a
+channel of their own: `notify_for_event` and `notify_sla_alert` already decided who each
+notification is for, and that decision is durable in the row, so the predicate compares the
+addressee rather than re-deriving the audience. A second implementation of that policy is the
+one thing that would make the inbox and the socket disagree.
+
+### Why it scales past one process
+
+Fan-out travels through Redis on a channel per organization, so **any instance serves any
+client with no sticky sessions** (§7). The subscriber is a task inside the API's own lifespan,
+so there is no new service to deploy and no new dependency — `websockets` was already installed
+as a `uvicorn[standard]` extra.
+
+The registry of who is connected *is* process memory, and that is a deliberate reading of §7:
+the requirement forbids *critical* session state in local memory, and a subscription registry
+is not critical — the durable record is the database, the socket only announces that the record
+changed, and a lost connection costs latency and nothing else.
+
+The worker publishes too. An SLA alert raised by the scheduled sweep in the **worker process**
+arrives on a socket held by the **API process** — the property that makes the whole design worth
+its moving parts, and the one thing the test suite cannot demonstrate because the suite is one
+process. `scripts/phase_r_walkthrough.py` demonstrates it over a real socket.
+
+### One slow client cannot delay another
+
+The subscriber task is the only thing on an instance turning Redis messages into socket writes,
+for every tenant on it. If it could block on one socket — a suspended tab, a laptop that went to
+sleep — every other tenant's events would queue behind it. That is a cross-tenant denial of
+service, so the fan-out never awaits a socket: each connection owns a bounded queue and its own
+writer task, the fan-out is `put_nowait`, and overflow closes that one connection with `1013`.
+The bound is `WS_QUEUE_MAX_DEPTH` (64).
+
+No application-level heartbeat is sent. uvicorn already pings at the protocol level every 20
+seconds and the handler's read loop observes the resulting disconnect; a second liveness
+mechanism would only have its own way of disagreeing with the first.
+
+### Verifying it by hand
+
+`scripts/phase_r_walkthrough.py` drives all of it against a running server: the frame handshake,
+a bad token refused with `4401`, the envelope shape, an internal note reaching staff and not the
+customer, another tenant's event not arriving, and a worker-dispatched SLA alert landing on a
+socket this process holds. It prints what to check in uvicorn's stdout afterwards — the other
+half of the frame decision.
+
+`scripts/redis_bounce_check.py` covers the outage: it stops Redis, creates a ticket (which
+succeeds, because the publish fails open), confirms nothing is announced, starts Redis again,
+and confirms delivery resumes **on the socket that was already open**. That last part is the
+claim a restart would hide.
+
+Both scripts need the API running with
+`--loop app.core.event_loop:loop_factory`; the walkthrough also needs the worker.
+
 ## Security posture
 
 Implemented in Phase C:
@@ -941,6 +1079,32 @@ Implemented in Phases I–K:
   through the whole lifecycle, a reply, and an internal note, and asserts no password,
   token, or hash appears in any of it — with the same positive control.
 
+Implemented in Phases L–R:
+
+- **The WebSocket audience is a pure predicate**, tested without a socket:
+  [tests/unit/test_realtime_events.py](backend/tests/unit/test_realtime_events.py) covers all
+  three row scopes, an internal envelope refused without `MESSAGE_READ_INTERNAL`, a portal
+  account with no linked customer receiving nothing, and a partition check over
+  `TicketEventType` so a later phase cannot add an event that is silently never published.
+- **§54's WebSocket authorization** is its own suite,
+  [tests/security/test_websocket.py](backend/tests/security/test_websocket.py): two
+  organizations with a socket each, an event for one never reaching the other; an agent not
+  receiving a colleague's assignment; a customer not receiving the internal note on *their own*
+  ticket; and a deactivated user, a foreign tenant in the token, and a suspended organization
+  each refused before joining. Every refusal is followed by proof the registry is still empty.
+  Absence is asserted by publishing a **control** envelope the socket *is* entitled to and
+  reading once — so a leaked event is caught by the read rather than by a sleep.
+- **§54's mechanical route guard now sees sockets.** `APIWebSocketRoute` and `APIRoute` are
+  siblings, so the walk that proves every route is capability-guarded skipped the first socket
+  in this project — and WebSocket routes do not appear in the OpenAPI schema either, so
+  `test_the_walk_finds_every_documented_route` would not have noticed. Two independent blind
+  spots for one route (ADR-025).
+- **The refusal path is a close code, not a response**, because a WebSocket scope has no
+  response to render the §42 envelope into. Four codes, each asserted.
+- **The socket declares the capabilities its contents need** — `TICKET_VIEW` and
+  `NOTIFICATION_LIST` — which is the only mechanism that would catch a future role that lost
+  either.
+
 Two trade-offs are deliberate and recorded in ADR-014: the login limiter **fails open**
 when Redis is unreachable (it is an abuse control, not an authentication control, and
 failing closed would turn a Redis blip into a total login outage), and it is keyed on
@@ -964,7 +1128,8 @@ instead; see [Rate limiting](#rate-limiting).
 | O | Redis: shared client, rate-limit consolidation | ✅ |
 | P | Celery, notifications, email delivery | ✅ |
 | Q | SLA monitoring, beat | ✅ |
-| R–S | WebSockets, analytics | next |
+| R | WebSockets, real-time fan-out | ✅ |
+| S | Analytics | next |
 | T–W | AI foundation, analysis, summaries, drafts | |
 | X | Knowledge base and RAG | |
 | Y–Z | Hardening, deployment | |
@@ -979,9 +1144,9 @@ instead; see [Rate limiting](#rate-limiting).
   [tests/integration/test_migrations.py](backend/tests/integration/test_migrations.py)
   is what stops the two from diverging.
 - The embedding provider is deliberately undecided until Phase X (ADR-008).
-- Redis carries rate limiting and the Celery broker. Caching and Pub/Sub are assigned to
-  the phases that give them a consumer — S and R — rather than built ahead of one
-  (ADR-022).
+- Redis carries rate limiting, the Celery broker, and real-time pub/sub. Caching is
+  assigned to the phase that gives it a consumer (S) rather than built ahead of one
+  (ADR-022, ADR-025).
 - **A "ticket resolved" notification reaches the customer's *portal login*, so a customer
   record with no login gets no notification at all** — no row is written, rather than a row
   addressed to the agent who resolved it. `notifications.user_id` is NOT NULL and §26
@@ -993,8 +1158,26 @@ instead; see [Rate limiting](#rate-limiting).
   is not written yet.
 - **Manager mentions are specified but unbuilt.** §26 lists them once, with no syntax and no
   resolution rule. `NotificationType.MENTION` is in the enum and unreachable.
-- **No WebSocket push.** The notification is persisted so that Phase R has something to
-  push, but clients poll today.
+- **Real-time delivery has no replay or backfill.** A client that was disconnected, or whose
+  queue overflowed, misses those events and learns about them by refetching. The socket is a
+  latency optimization over `GET /notifications`; the row is the record.
+- **Publication is best-effort and at-most-once.** A Redis outage makes the publish fail
+  open — the request has already committed and must not be failed by it — so that event is
+  lost, and only the log line and the client's own refetch recover it. The `notifications` row
+  and the `ticket_events` row are the durable half.
+- **The connection registry is process memory, so a restart drops every socket.** Clients
+  reconnect and nothing is lost but the latency in between. A second instance is still served
+  correctly, because the fan-out travels through Redis — what is not shared is the registry
+  (ADR-025).
+- **No per-connection limit on inbound frames.** A client can send frames as fast as it likes
+  for the life of the connection. Only the first is read and the rest are discarded by the
+  read loop, so the exposure is bandwidth rather than work.
+- **A socket that falls behind is dropped with `1013`, not throttled.** A slow client sees an
+  occasional close and reconnects and refetches. The alternative — an unbounded queue — would
+  delay every other tenant on the instance instead.
+- **`--ws-max-size` is left at uvicorn's 16 MiB default.** The only client message the
+  protocol accepts is an auth frame, so the setting bounds a payload nothing is expected to
+  send yet; it is worth revisiting the day an inbound verb is added.
 - **SLA timers run on wall-clock UTC, with no business calendars and no pause.** §27's
   figures are bare durations, and the spec mentions business hours, calendars, or timezones
   nowhere. A ticket raised at 23:50 on Friday against a 2-hour target warns at 00:10 on
@@ -1009,8 +1192,10 @@ instead; see [Rate limiting](#rate-limiting).
   not erase it, and the timeline entry is still there when the agent opens the ticket. This
   is different from a notification whose subject has no other record, which is why the
   policy is stated rather than assumed.
-- **The SLA alert is not pushed.** Like every other notification it is persisted for Phase R
-  and polled today, so a warning's latency is the poll interval plus the sweep interval.
+- **An SLA alert's latency is the sweep interval plus the worker's queue.** The alert is
+  pushed as `notification.created` the moment the sweep finds it due, so the poll interval is
+  no longer part of it — but the sweep runs on beat's schedule, and a worker that is not
+  running means the alert is never raised rather than merely late.
 - **One beat process, and two would double every sweep.** The timeline guard stops the
   duplicate from double-alerting, so the failure is invisible rather than loud — the only
   thing standing between it and silence is that beat is a single service in the compose file.
@@ -1080,6 +1265,6 @@ instead; see [Rate limiting](#rate-limiting).
   to whoever had it. That is a deliberate reading of `OPEN` as "nobody owns this", and
   the history is not lost: it is in `ticket_events`.
 - **The frontend has no screens for any of this.** Every phase since C has been
-  backend-only; the routes are exercised by 930 tests, and the SPA still shows the Phase
+  backend-only; the routes are exercised by 1008 tests, and the SPA still shows the Phase
   C scaffolding.
 

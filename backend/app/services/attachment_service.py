@@ -48,8 +48,10 @@ from app.models.attachment import Attachment
 from app.models.enums import TicketEventType
 from app.models.message import Message
 from app.models.ticket import Ticket
+from app.models.ticket_event import TicketEvent
 from app.repositories.attachment_repository import AttachmentRepository
 from app.services import ticket_service
+from app.websocket import manager as realtime
 
 logger = structlog.get_logger(__name__)
 
@@ -207,13 +209,14 @@ async def create_attachment(
     AttachmentRepository(session, context).add(attachment)
     await session.flush()
 
+    event: TicketEvent | None = None
     if message is None or not message.is_internal:
         # No event for an internal-note attachment. The note's own `INTERNAL_NOTE_ADDED`
         # entry already covers it, and an `ATTACHMENT_ADDED` entry would put the
         # client-supplied filename on the customer-visible timeline of a file they
         # cannot download. The timeline is read by the ticket's audience; this file's
         # audience is narrower.
-        ticket_service.record_event(
+        event = ticket_service.record_event(
             session,
             context,
             ticket,
@@ -227,6 +230,14 @@ async def create_attachment(
         )
 
     await session.commit()
+    if event is not None:
+        # Only reached when a timeline entry was written, which is the same condition that
+        # makes this attachment customer-visible — so `internal` is False here by
+        # construction rather than by choice. There is nothing to announce for a file on an
+        # internal note, for the same reason there is no timeline entry for one: the wire
+        # vocabulary is derived from the timeline, so an event the timeline does not record
+        # cannot be published to a client.
+        await realtime.publish(ticket, event)
 
     logger.info(
         "attachment_created",

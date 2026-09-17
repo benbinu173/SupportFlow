@@ -42,9 +42,24 @@ pytestmark = pytest.mark.security
 #
 # The `api` routers are absent because they hold no logger — logging is the service
 # layer's job, and a route that logged on its own would bypass the services listed here.
+#
+# **`app.api.websocket` and `app.websocket.manager` are the two exceptions**, and they are
+# here for the opposite reason: those two modules *do* hold loggers, because there is no
+# service layer between them and the socket to hold one instead. The socket's refusals are
+# logged where they happen (the close codes are the only channel a WebSocket has) and the
+# fan-out's deliveries are logged where they happen. Both handle a token — one receives
+# it, the other never sees it — so both belong in a suite whose job is to prove a
+# credential does not reach a log line.
+#
+# They are also the reason this list is worth reading twice. uvicorn logs a handshake's
+# full request line, and this suite cannot see uvicorn's logs at all, so a `?token=` in a
+# query string would have leaked straight past every assertion below. ADR-025 records the
+# auth frame as the answer to that, and this entry is what makes the frame's own module
+# subject to the same checks the HTTP path is.
 LOGGING_MODULES = (
     "app.api.auth",
     "app.api.deps",
+    "app.api.websocket",
     "app.main",
     "app.core.rate_limit",
     "app.services.attachment_service",
@@ -54,6 +69,7 @@ LOGGING_MODULES = (
     "app.services.message_service",
     "app.services.ticket_service",
     "app.services.user_service",
+    "app.websocket.manager",
 )
 
 # The events this file relies on. Asserted present so that a rename shows up as a

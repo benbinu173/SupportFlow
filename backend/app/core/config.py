@@ -144,6 +144,32 @@ class Settings(BaseSettings):
     # reasonable.
     MAX_ATTACHMENT_BYTES: int = 25 * 1024 * 1024
 
+    # --- WebSockets --------------------------------------------------------
+    # Three settings, each with the consumer it arrived with, per the rule the Celery and
+    # S3 blocks above follow.
+    #
+    # **The auth window is the one that matters.** A socket is accepted before it knows who
+    # is calling — a browser cannot set an `Authorization` header on a handshake — so an
+    # unauthenticated connection exists for as long as this timeout allows. 10 seconds is
+    # generous for a frame that contains one string and is already in memory, and short
+    # enough that a port scanner opening ten thousand sockets and saying nothing goes
+    # nowhere. See ADR-025.
+    WS_AUTH_TIMEOUT_SECONDS: int = 10
+
+    # How many events one connection may have queued before it is disconnected. The queue is
+    # what stops a client that has stopped reading from delaying every other tenant's
+    # delivery, and the bound is what stops it from holding an unbounded backlog of events the
+    # client will never render — it re-reads state over HTTP when it reconnects, so a deeper
+    # queue would only delay that. 64 is several screens of changes for a client that is
+    # briefly busy and nowhere near enough to hold a backlog for one that is gone.
+    WS_QUEUE_MAX_DEPTH: int = 64
+
+    # A single send's ceiling. Bounds the case the queue cannot see: a half-open connection
+    # that accepts bytes into a buffer nothing will ever drain, so no exception is raised and
+    # the queue never fills. The writer task gives up on the connection rather than holding
+    # the slot indefinitely.
+    WS_SEND_TIMEOUT_SECONDS: float = 10.0
+
     # --- CORS -------------------------------------------------------------
     # Explicit allowlist. Required because the refresh cookie is sent with
     # credentials, which forbids a wildcard origin.

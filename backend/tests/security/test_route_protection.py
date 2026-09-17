@@ -17,19 +17,36 @@ The allowlists are compared for *equality* against what the application actually
 not merely consulted. That is what makes them a record of deliberate decisions: adding
 a public route means editing this file, which is the point at which someone asks
 whether it should be public.
+
+**Phase R added a third kind of route, and neither claim above applies to it.** The
+real-time socket authenticates, but it cannot be *checked* the way the other two are: a
+browser cannot set an `Authorization` header on a WebSocket handshake, so the token
+arrives in a message after the socket is open and there is no dependency tree to inspect
+at handshake time. It therefore gets its own allowlist, `WEBSOCKET_ROUTES`, its own
+equality assertions, and its own behavioural suite — `tests/security/test_websocket.py`
+— because an allowlist that says "this route is exempt" and nothing else would be a hole
+with a comment on it.
 """
 
 from collections.abc import Iterable, Iterator
 
 import pytest
 from fastapi import FastAPI
-from fastapi.routing import APIRoute
+from fastapi.routing import APIRoute, APIWebSocketRoute
 
 from app.api.deps import get_current_user
 from app.core.permissions import Permission
 from app.main import create_app
 
 pytestmark = pytest.mark.security
+
+#: The two route classes this walk knows about. Both descend from Starlette's
+#: `BaseRoute`, and **neither is a subclass of the other** — `APIWebSocketRoute` extends
+#: `routing.WebSocketRoute` while `APIRoute` extends `routing.Route`, so an
+#: `isinstance(route, APIRoute)` check silently skips a socket. That is not a hypothetical:
+#: it is what this file did until Phase R, and it would have made `/ws` the first route in
+#: the project that §54's guard could not see.
+Route = APIRoute | APIWebSocketRoute
 
 _HTTP_METHODS = frozenset({"get", "post", "put", "patch", "delete", "head", "options", "trace"})
 
@@ -83,6 +100,26 @@ AUTHENTICATED_WITHOUT_CAPABILITY: frozenset[tuple[str, str]] = frozenset(
     }
 )
 
+# WebSocket routes, by path. **Not an exemption list — the opposite.** A socket is not
+# on `PUBLIC_ROUTES` and it is not on `AUTHENTICATED_WITHOUT_CAPABILITY`; neither
+# describes it, because both are statements about a dependency tree that the socket does
+# not have. What this list says is "the two claims at the top of this module have been
+# replaced by something else here, and here is where that something else lives."
+#
+# The replacement is `tests/security/test_websocket.py`, which asserts the same
+# properties through behaviour rather than through introspection: that an unauthenticated
+# socket is closed, that a bad token is refused, that two tenants cannot hear each other,
+# and that an internal note does not reach the customer it was written about. A socket
+# added without a capability check (`REQUIRED_CAPABILITIES` in
+# `app/api/websocket.py`) is invisible to the walk below *by construction* — there is no
+# dependency to declare one in — so that suite is not a nice-to-have alongside this
+# entry, it is the whole reason the entry is acceptable.
+#
+# Un-prefixed, unlike every path above: `/ws` mounts at the application root rather than
+# under `API_V1_PREFIX`. It is a connection rather than a versioned resource, and the
+# frontend's `vite.config.ts` already proxies exactly this path.
+WEBSOCKET_ROUTES: frozenset[str] = frozenset({"/ws"})
+
 
 # ---------------------------------------------------------------------------
 # Walking the routing table
@@ -101,12 +138,12 @@ def _walk(dependant: object) -> Iterator[object]:
         yield from _walk(child)
 
 
-def _calls(route: APIRoute) -> set[object]:
+def _calls(route: Route) -> set[object]:
     """The callables in a route's dependency tree, at every depth."""
     return {node.call for node in _walk(route.dependant)}
 
 
-def _required_permissions(route: APIRoute) -> tuple[Permission, ...]:
+def _required_permissions(route: Route) -> tuple[Permission, ...]:
     """Every capability the route declares, gathered from all of its guards.
 
     A guard is recognised by the `requires` attribute `require_permission` attaches to
@@ -120,8 +157,8 @@ def _required_permissions(route: APIRoute) -> tuple[Permission, ...]:
     return tuple(required)
 
 
-def _walk_routes(routes: Iterable[object], prefix: str = "") -> Iterator[tuple[str, APIRoute]]:
-    """Every `APIRoute` in a routing table, paired with its mounted path.
+def _walk_routes(routes: Iterable[object], prefix: str = "") -> Iterator[tuple[str, Route]]:
+    """Every API route in a routing table, paired with its mounted path.
 
     Recursive because routers are not always flattened into `app.routes`: this version
     of FastAPI keeps an included router as a container and resolves its prefix at
@@ -134,9 +171,15 @@ def _walk_routes(routes: Iterable[object], prefix: str = "") -> Iterator[tuple[s
     implementation details, and this walk has to survive either. What it must not do is
     silently find nothing, which `test_the_walk_finds_every_documented_route` guarantees
     by checking the result against the OpenAPI schema FastAPI generates itself.
+
+    **Both route classes are matched, and that is the Phase R fix.** See `Route` above:
+    an `isinstance` against `APIRoute` alone skips a socket without saying so, and
+    nothing downstream would have noticed — WebSocket routes do not appear in the
+    OpenAPI schema either, so the cross-check above could not have caught the omission
+    even in principle.
     """
     for route in routes:
-        if isinstance(route, APIRoute):
+        if isinstance(route, (APIRoute, APIWebSocketRoute)):
             yield prefix + route.path, route
             continue
 
@@ -149,19 +192,37 @@ def _walk_routes(routes: Iterable[object], prefix: str = "") -> Iterator[tuple[s
         yield from _walk_routes(inner.routes, prefix + (getattr(context, "prefix", "") or ""))
 
 
-def _routes(api: FastAPI) -> list[tuple[str, APIRoute]]:
+def _routes(api: FastAPI) -> list[tuple[str, Route]]:
     """Every API route, with the path it is served at."""
     return list(_walk_routes(api.routes))
 
 
+def _http_routes(api: FastAPI) -> list[tuple[str, APIRoute]]:
+    """Only the request/response routes.
+
+    The three claims the rest of this file makes — authentication, capability, and
+    agreement with the OpenAPI schema — are all claims about HTTP, and every one of them
+    is wrong for a socket. So the split happens here, once, rather than as an exclusion
+    clause inside each assertion.
+    """
+    return [(path, route) for path, route in _routes(api) if isinstance(route, APIRoute)]
+
+
+def _websocket_routes(api: FastAPI) -> list[tuple[str, APIWebSocketRoute]]:
+    """Only the sockets."""
+    return [(path, route) for path, route in _routes(api) if isinstance(route, APIWebSocketRoute)]
+
+
 def _entries(api: FastAPI) -> list[tuple[str, str, APIRoute]]:
-    """`(method, path, route)` for every method of every route.
+    """`(method, path, route)` for every method of every HTTP route.
 
     One route yields several entries where it handles several methods, because the
     question "is this endpoint protected?" is per-method.
     """
     return [
-        (method, path, route) for path, route in _routes(api) for method in sorted(route.methods)
+        (method, path, route)
+        for path, route in _http_routes(api)
+        for method in sorted(route.methods)
     ]
 
 
@@ -192,6 +253,13 @@ def test_there_are_routes_to_check(api: FastAPI) -> None:
 
     Phase P added four: the notification collection, the unread count, and the two ways
     of marking read.
+
+    **Phase R left the floor where it is, deliberately.** It added a route, but not an
+    HTTP one — `/ws` is excluded from `_entries` because every claim this file makes is
+    about a request/response endpoint, and a socket satisfies none of them. Bumping the
+    number to look like the surface grew would make this floor measure something it does
+    not measure. The socket is counted by
+    `test_the_walk_finds_the_websocket_routes` instead.
     """
     assert len(_entries(api)) >= 28
 
@@ -207,6 +275,12 @@ def test_the_walk_finds_every_documented_route(api: FastAPI) -> None:
     The OpenAPI schema is generated by FastAPI from the same routing table by a
     completely separate code path, so agreement between the two is real evidence. Any
     route the walk misses shows up here.
+
+    **HTTP routes only, and that is not a weakening.** A WebSocket route does not appear
+    in the OpenAPI schema at all — the schema describes operations with request and
+    response bodies, and a socket has neither — so including one in both sides of this
+    comparison would make it pass vacuously while making the sets incomparable. The
+    socket has its own positive control below, over the same `_walk_routes`.
     """
     documented = {
         (method.upper(), path)
@@ -220,6 +294,50 @@ def test_the_walk_finds_every_documented_route(api: FastAPI) -> None:
     assert walked == documented, (
         f"missed: {sorted(documented - walked)}; invented: {sorted(walked - documented)}"
     )
+
+
+def test_the_walk_finds_the_websocket_routes(api: FastAPI) -> None:
+    """The positive control for the sockets, since OpenAPI cannot provide one.
+
+    Everything else in this file would pass if `_walk_routes` returned no WebSocket
+    routes at all — `WEBSOCKET_ROUTES` would simply never be consulted, and the
+    equality assertion below it would compare an empty set against a one-element one and
+    fail. So this test exists to make that failure say what is actually wrong: the walk
+    stopped seeing sockets, rather than the application grew one.
+
+    Asserted as a set of paths and not a count, for the same reason the HTTP walk is
+    cross-checked against the schema: a count tells you something moved, not what.
+    """
+    found = {path for path, _ in _websocket_routes(api)}
+
+    assert found == WEBSOCKET_ROUTES, (
+        f"the walk found {sorted(found)}; the allowlist names {sorted(WEBSOCKET_ROUTES)}"
+    )
+
+
+def test_every_websocket_route_is_declared_and_declares_nothing(api: FastAPI) -> None:
+    """A socket is neither public nor capability-guarded, and both are asserted together.
+
+    The first assertion is the equality in the other direction to the test above: a route
+    that vanished from the allowlist without vanishing from the application is a stale
+    entry, and a socket added without an entry would otherwise be unreviewed.
+
+    The second is the substantive one. `get_current_user` must **not** be reachable from
+    a socket — the token arrives in a frame after the handshake, so a route that somehow
+    declared the HTTP dependency would be asserting a protection it does not have. And no
+    capability may be declared, because there is no dependency tree at handshake time for
+    a guard to live in; the socket's check is `REQUIRED_CAPABILITIES` in
+    `app/api/websocket.py`, applied by hand after authentication. This test is what keeps
+    the introspectable view of `/ws` honest about that, so nobody reads a green
+    `test_every_protected_route_declares_a_capability` and assumes it covered the socket.
+    """
+    routes = _websocket_routes(api)
+
+    assert {path for path, _ in routes} == WEBSOCKET_ROUTES
+
+    for path, route in routes:
+        assert get_current_user not in _calls(route), f"{path} declares the HTTP auth dependency"
+        assert not _required_permissions(route), f"{path} declares a capability dependency"
 
 
 def test_every_route_is_authenticated_or_explicitly_public(api: FastAPI) -> None:

@@ -32,6 +32,7 @@ from app.models.ticket import Ticket
 from app.repositories.message_repository import MessageRepository
 from app.schemas.message import MessageCreate
 from app.services import notification_service, ticket_service
+from app.websocket import manager as realtime
 
 logger = structlog.get_logger(__name__)
 
@@ -107,6 +108,9 @@ async def post_reply(
     )
     await session.commit()
     notification_service.enqueue_delivery(notifications)
+    # `internal` is False because `_post` wrote `is_internal=False` above — this is the
+    # customer-facing half of the thread, so row scope alone decides the audience.
+    await realtime.publish(ticket, event, notifications)
 
     logger.info(
         "message_posted",
@@ -141,8 +145,20 @@ async def post_note(
 
     message = _post(session, context, ticket, payload, is_internal=True)
 
-    ticket_service.record_event(session, context, ticket, TicketEventType.INTERNAL_NOTE_ADDED)
+    event = ticket_service.record_event(
+        session, context, ticket, TicketEventType.INTERNAL_NOTE_ADDED
+    )
     await session.commit()
+    # **`internal=True`, and this is the flag that does the work.** Row scope alone would
+    # hand this event to the ticket's own customer — they own the ticket, so check 2 of
+    # `ticket_event_visible_to` passes — and the note they must never read would arrive on
+    # their socket as a `ticket.note_added`. The predicate requires
+    # `MESSAGE_READ_INTERNAL` when this is set, which is the same capability the HTTP side
+    # applies in the service because a route cannot express "this field, for this audience".
+    #
+    # No notifications: `notify_for_event` has never had a recipient for a note, so there is
+    # no `notification.created` to send alongside it and no `enqueue_delivery` above it.
+    await realtime.publish(ticket, event, internal=True)
 
     logger.info(
         "message_posted",
