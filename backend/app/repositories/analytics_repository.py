@@ -364,17 +364,21 @@ class AnalyticsRepository(TenantScopedRepository[Ticket]):
     async def ai_usage(self, start: datetime, end: datetime) -> Mapping[str, Any]:
         """§28's "AI usage": totals, and the same broken down by operation.
 
-        **Empty until Phase T**, because nothing writes `ai_usage` yet — so every number
-        here is what a real `COUNT` and `SUM` over the rows that exist actually say.
-        §8's eleventh criterion is that analytics come from real aggregation queries and
-        never hardcoded values, and a query whose answer is zero is still a query.
+        **Written since Phase T**, which added `app/services/ai_service.py` — the one call
+        path, staging a row per attempt. So every number here is a real `COUNT` and `SUM`
+        over the rows that exist: non-zero for a tenant that has made calls, and genuinely
+        zero for one that has not. §8's eleventh criterion is that analytics come from real
+        aggregation queries and never hardcoded values, and a query whose answer is zero is
+        still a query.
 
-        **Row scope is applied through the ticket, not on this table.** `ai_usage` has no
-        `customer_id` and no `assigned_agent_id` — it is a ledger of calls, and a call's
-        audience is the ticket it was made for. So an agent's AI usage is the usage
-        attributed to *their* tickets, expressed as a subquery over `_scoped`, which keeps
-        the scope rule in the one place that owns it. Ingestion calls have no ticket and
-        are therefore outside every row-scoped view — for an agent, correctly so.
+        **A row is counted only if it names a ticket in the caller's scope.** Row scope is
+        applied through the ticket, not on this table: `ai_usage` has no `customer_id` and
+        no `assigned_agent_id` — it is a ledger of calls, and a call's audience is the
+        ticket it was made for. So an agent's AI usage is the usage attributed to *their*
+        tickets, expressed as a subquery over `_scoped`, which keeps the scope rule in the
+        one place that owns it. Ingestion calls have no ticket and are therefore outside
+        every row-scoped view — for an agent, correctly so. `app/services/ai_service.py`
+        takes `ticket_id` as an optional argument for exactly this reason.
 
         `cost_usd` is `Numeric`, so a `SUM` comes back as a `Decimal` and is kept as one.
         Six decimal places of a fraction of a cent is exactly the quantity floating point

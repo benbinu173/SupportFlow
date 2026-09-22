@@ -324,6 +324,27 @@ class StorageUnavailableError(AppError):
     message = "File storage is temporarily unavailable."
 
 
+class AIServiceError(AppError):
+    """The AI provider could not be reached, or could not be trusted.
+
+    503 for the same reason `StorageUnavailableError` is: a dependency being down is not a
+    bug in this service and it is recoverable, so the client should try again rather than
+    give up. **One class, not two.** A provider that timed out and a provider that answered
+    with something that was not the requested schema produce the same client experience,
+    and the distinction an operator needs is already in the log where it can be acted on —
+    splitting the response would only tell a client which of two identical retries to make.
+
+    §42's `AI_SERVICE_ERROR` code has been in `ErrorCode` since Phase G with no class behind
+    it; this is the class, added the phase the behaviour arrived (`app/ai/`). The provider's
+    own message is never returned: an SDK error can quote the request, and the request
+    carries the API key in a header and the customer's words in the body.
+    """
+
+    code = ErrorCode.AI_SERVICE_ERROR
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    message = "The AI service is temporarily unavailable."
+
+
 # ---------------------------------------------------------------------------
 # 429 / 500
 # ---------------------------------------------------------------------------

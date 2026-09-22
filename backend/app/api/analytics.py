@@ -101,9 +101,13 @@ async def overview(
     zero, when nothing in the window has been answered or resolved — an average of no rows
     does not exist, and zero would report an instantly-answered desk.
 
-    `ai_usage` is zero throughout until Phase T, and that is a real `COUNT` over the rows
-    that exist rather than a placeholder. §8's eleventh criterion is that analytics come
-    from real aggregation queries and never hardcoded values.
+    `ai_usage` is a real `COUNT` and `SUM` over the rows the tenant has, written since
+    Phase T by `app/services/ai_service.py` — the one call path. It reads zero for a tenant
+    that has made no calls, and §8's eleventh criterion is that analytics come from real
+    aggregation queries and never hardcoded values. It is **cached**, unlike `/tickets`:
+    it is an aggregate over a window, and the TTL is the trade `app/core/cache.py`
+    documents. `calls` counts only calls attributed to a ticket in the caller's row scope,
+    so a call made with no ticket is spend without a place on this screen.
 
     An agent calling this gets their own totals; a manager calling it gets the
     organization's. Same route, same SQL, one row-scope predicate in between.

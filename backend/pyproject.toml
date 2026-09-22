@@ -18,6 +18,7 @@ dependencies = [
     "redis==8.1.0",
     "celery==5.6.3",
     "boto3==1.43.93",             # S3-compatible object storage for attachments
+    "anthropic==1.6.0",           # ADR-008, ADR-027 — ships py.typed, so no mypy override
     "pyjwt[crypto]==2.13.0",       # ADR-002
     "pwdlib[argon2]==0.3.1",       # ADR-001
     "email-validator==2.3.0",      # required by pydantic.EmailStr
@@ -82,8 +83,10 @@ known-first-party = ["app", "tests"]
 # Alembic generates its own style.
 "alembic/**" = ["E501", "I001"]
 # Operator scripts report to a person rather than a log, so they print and assert, and
-# they carry a throwaway account password the same way the tests do.
-"scripts/**" = ["S101", "S105", "S106"]
+# they carry a throwaway account password the same way the tests do. S608 is exempted
+# because several of them print a SQL statement for a person to paste into `psql` — the
+# statements they *execute* go through `text()` with bound parameters like everything else.
+"scripts/**" = ["S101", "S105", "S106", "S608"]
 
 [tool.ruff.format]
 quote-style = "double"

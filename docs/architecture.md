@@ -135,30 +135,69 @@ AI-review rules structural rather than conventional.
 
 ## 6. AI flow
 
+The lower half of this section is implemented; the upper half is a plan. **Phase T (ADR-027)**
+built the provider abstraction, the call path, and the ledger, and deliberately built no route and
+no Celery task — the work those would carry is Phase U's, V's, and W's.
+
 ```
-trigger (ticket created, or agent request)
-   → enqueue task, return immediately
-   → worker loads ticket within tenant scope
-   → build prompt from a versioned template
-   → provider call with timeout and bounded retry
-   → parse into a Pydantic model  ── invalid ──▶ mark failed, do not persist
-   → persist AI_ANALYSIS + AI_USAGE
-   → update ticket AI fields
-   → publish event → clients update live
+trigger (ticket created, or agent request)          ── plan: Phases U-W
+   → enqueue task, return immediately                    ── plan: U, and `celery_app.py`'s undeclared `ai` queue
+   → worker loads ticket within tenant scope             ── plan: U
+   → build prompt from a versioned template              ── mechanism in T (`app/ai/prompts.py`); text in U-W
+   → provider call with timeout and bounded retry        ── ✅ T
+   → parse into a Pydantic model  ── invalid ──▶ handled failure, no result  ✅ T
+   → persist AI_USAGE (one row per attempt)              ── ✅ T
+   → persist AI_ANALYSIS                                 ── plan: U
+   → update ticket AI fields                             ── plan: U
+   → publish event → clients update live                 ── plan: U
 ```
 
-Three invariants:
+**What runs today.** `app/services/ai_service.py` is the single call path — `classify_ticket`,
+`analyze_sentiment`, `summarize_conversation`, `generate_response` — and every one of them reduces
+to a private `_run`: select the provider, call it with the client's timeout, retry a *transient*
+failure up to `AI_MAX_ATTEMPTS` with jittered backoff, validate the answer into its schema, and
+stage one `ai_usage` row for every attempt including the failed ones. The provider is chosen by
+`AI_PROVIDER`, and `app/ai/claude.py` is the only module in the project that imports a vendor SDK.
 
-- **Provider-agnostic.** Application code depends on an `AIProvider` interface
-  (`classify_ticket`, `analyze_sentiment`, `summarize_conversation`,
-  `generate_response`, `generate_embedding`), never on a vendor SDK.
-- **Output is untrusted.** Every response is parsed into a Pydantic schema before it
-  touches the database. Malformed output is a handled failure, not an exception path.
-- **Never autonomous.** AI drafts replies; a human sends them. No AI output reaches a
-  customer without explicit human action.
+Three invariants, and how each is held:
 
-Failure is contained: if the provider is down, ticket creation still succeeds and the
-analysis carries a `failed` status that can be retried.
+- **Provider-agnostic.** Application code depends on the `AIProvider` protocol
+  (`classify_ticket`, `analyze_sentiment`, `summarize_conversation`, `generate_response`) and never
+  on a vendor SDK. `generate_embedding` is deliberately **not** in it yet: ADR-008 puts embeddings
+  behind the same interface with a *different* vendor, and declaring the method now would give
+  `ClaudeProvider` a stub it can never serve. It arrives in Phase X with the provider that can
+  answer it.
+- **Output is untrusted.** `app/ai/provider.py`'s `validate_output` is the one place a provider's
+  payload is parsed, and it is called by both the real provider and the fake — so a model that
+  answered in prose, truncated at `max_tokens`, invented an enum member, or returned a confidence of
+  `1.4` produces an `AIOutputError` and no value. §18's requirement is structural rather than
+  conventional: there is no path from a provider response to application code that skips it.
+- **Never autonomous.** `SuggestedReply` has a body and no confidence, no status, and no sender —
+  the schema cannot express "sent". §21's rule is enforced by what the types can say.
+
+Customer-written text is fenced before it reaches a model, in `app/ai/prompts.py`: `as_untrusted`
+wraps it in a delimited block under a sentence saying it is content rather than instruction, and
+defuses any fence marker appearing inside it so the boundary cannot be spelled by the customer.
+This is mitigation and not a guarantee — prompt injection is unsolved — which is why the two
+invariants above are the containment that matters.
+
+**Cost is recorded, not estimated.** Every attempt writes an `ai_usage` row with the provider's own
+token counts, a `cost_usd` computed at write time from the published rate in `app/ai/pricing.py`,
+the latency, and whether the attempt succeeded. A failed call is recorded rather than dropped,
+because it consumed quota and may have been billed. `GET /analytics/overview` reads that table
+through the Phase S aggregate and needed no change to start reporting real numbers.
+
+**Two obligations travel with the ledger, and both belong to the caller.** `ai_service` stages rows
+and never commits, so whoever calls it commits — including after a failure, since a ledger that
+rolled back with a failed request would be missing exactly when it matters. And because
+`/analytics/overview` is cached while an `ai_usage` write does not bump the version integer, whoever
+commits also owns the `cache.invalidate` — the same pattern `ticket_service` follows after its own
+commit. Phase U's route is where both obligations land.
+
+Failure is contained: a provider that is down, throttled, or holding a bad key raises
+`AIServiceError` (503) and nothing else escapes, so a caller can treat every AI failure as one
+condition. Nothing on a request path is blocked by it, because nothing on a request path calls it
+yet.
 
 ## 7. RAG flow
 

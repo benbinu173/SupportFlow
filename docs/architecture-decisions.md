@@ -1805,3 +1805,193 @@ whole suite is 1092 tests; `scripts/phase_s_walkthrough.py` runs 58 assertions l
 built through the API, every expectation derived from the fixture's own ages and the tenant's own
 policies; and the fail-open path was checked with Redis actually stopped, which is also how the
 stale-window cost above was measured rather than estimated.
+
+## ADR-027 — The AI layer is one provider boundary and one call path, and every attempt reaches the ledger
+
+**Status:** accepted · Phase T
+
+**Context.** §17 states the whole of this phase: *"Create AI provider abstraction. Implement:
+configuration, provider client, structured output validation, timeout handling, retry strategy,
+usage tracking."* Four earlier phases wrote it down and left the seams for it, each in writing.
+Phase D built `ai_usage` and `ai_analyses` with their constraints and indexes and **nothing has
+ever written a row**. Phase S pre-built the read: `GET /analytics/overview` already returns an
+`ai_usage` block, with `failed_calls` counted separately *"because `ai_usage` records a failed call
+— it consumed quota and may have been billed"*, and ADR-026 Decision 8 defended the zeros as *"a
+real `COUNT` over a table nothing writes yet is a real query answering the question actually
+asked."* Phase C wrote the `--- AI ---` block into `.env.example` and then deliberately left it out
+of `config.py`, because of the rule that file repeats: *a setting with no consumer is a guess with a
+name.* And Phase G transcribed §3's AI permission rows — `AI_REQUEST_ANALYSIS`,
+`AI_REQUEST_SUGGESTION`, `AI_QUERY_KNOWLEDGE`, `AI_CONFIGURE`, `AI_VIEW_USAGE` — which guard nothing
+yet.
+
+ADR-008 had already made the load-bearing choice in Phase C: *"Implement `AIProvider` with Claude
+behind it for classification, sentiment, summarization, and drafting, using tool-use for structured
+output… A deterministic fake provider exists for tests only."* The vendor was settled. Every
+mechanism below it was not.
+
+**Decision 1 — the protocol carries the four generation operations, and `generate_embedding` is
+deliberately absent.** §17 lists five methods, and the plan for this phase restated all five.
+ADR-008 puts embeddings behind the *same interface* with a **different vendor** and defers that
+choice to Phase X. Declaring the method now would force `ClaudeProvider` to carry one it can never
+serve — a stub with no caller, which is what this codebase refuses everywhere else: settings wait
+for their consumers, and `celery_app.py` still does not declare the `ai` queue because *"declaring a
+queue nothing publishes to is a worker process waiting for work that does not exist."* So Phase X
+adds `generate_embedding` together with the provider that can answer it. **This is a deviation from
+§17's literal list, recorded rather than quietly taken**, and `provider.py`'s docstring says so at
+the place a reader would look for the missing method.
+
+**Decision 2 — validation is one function, so §18 is structural rather than per-vendor.** §18:
+*"The backend must validate the returned structure. Never assume LLM output is automatically
+valid."* A guarantee implemented once per vendor is a guarantee with as many implementations as
+there are vendors, so `validate_output` in `app/ai/provider.py` is the single place a payload
+becomes a Pydantic model, and **both** `ClaudeProvider` and `FakeProvider` call it. Each provider's
+job is reduced to getting a payload out of its own SDK; the malformed-output test therefore needs no
+vendor at all, and a third provider inherits the §18 behaviour by using the function.
+
+Every shape of rejection produces the same `AIOutputError`: prose instead of a tool call, a tool
+call naming the wrong tool, arguments that were never closed because the answer hit `max_tokens`,
+JSON that is not an object, an object missing a field, a confidence of `1.4`, a sentiment the model
+invented. They are one condition for a caller — the answer could not be trusted — and the reason
+string distinguishes them for the log. **The log never quotes the payload.** `ValidationError`
+carries the offending `input` beside each failure, and for these schemas that input is
+model-authored text derived from a customer's message, so `_failure_summary` reports only `type` and
+`loc`, capped at five failures: an uncapped string would put kilobytes in a log line for no extra
+information.
+
+**Decision 3 — the retry policy lives in one place, so the SDK's own retries are off.**
+`AsyncAnthropic(..., max_retries=0, timeout=AI_TIMEOUT_SECONDS)`. A provider that also retried would
+multiply two policies, and the attempt count in the ledger would stop meaning anything: three SDK
+retries behind one application attempt would be recorded as one call. The timeout is the client's
+because the SDK owns the socket; everything about *what to do when it fires* is `ai_service`'s,
+because that is policy.
+
+**Only `AITransientError` is retried** — unreachable, timed out, throttled, 5xx — up to
+`AI_MAX_ATTEMPTS` (3), exponential from `AI_RETRY_BACKOFF_SECONDS` with a delay jittered between
+half and all of the ceiling. **Full jitter would be the textbook choice and is wrong here**: it can
+return a delay near zero, and the failure being retried is usually a rate limit, which is the one
+case where waiting less is pointless. `AIPermanentError` (a refused key, an unknown model) fails on
+the first attempt, and so does `AIOutputError`: the same input at the same temperature reproduces
+the same unusable answer, §53 names *"repeated AI calls"* as waste, and paying twice for one
+malformed answer is exactly that. A truncation is fixed by raising `AI_MAX_TOKENS`, which is a
+configuration answer and not a retry one. `_sleep` is bound at module scope so the tests replace it
+— retry timing is worth testing, and a suite that slept through backoff would be the slowest thing
+in the run.
+
+**Decision 4 — every attempt is recorded, including the ones that fail, and the caller commits.**
+`AIUsage`'s own docstring is the rule: *"A failed call still consumed quota and may still have been
+billed, so it is recorded rather than dropped."* So `_run` stages one row per attempt — the
+transient failures on the way to a success, the permanent failure, the malformed answer, and the
+success — which is why a retried call appears three times and why `failed_calls` is a subset of
+`calls` rather than a complement. **Nothing here commits.** `ai_service` is called from inside a
+transaction a route or a task already owns, and committing would end it early; so the obligation
+travels with the call, and a caller that lets its own rollback discard these rows loses exactly the
+record that matters most. Phase T writes no caller, so the obligation is discharged by
+`scripts/phase_t_walkthrough.py`, which commits after a deliberate permanent failure and then reads
+`failed_calls: 1` back over HTTP rather than asserting that it happened.
+
+**A related obligation has no discharge in this phase, and it belongs to Phase U.** An `ai_usage`
+write does not bump `analytics:version:{organization_id}`, so `/analytics/overview`'s AI block can
+read up to one TTL stale after a call. `ai_service` must not invalidate — invalidating before the
+caller's commit lands is the race `ticket_service` comments about at its own invalidation — so
+**whoever commits owns the invalidation**, in the same place and at the same moment as the
+post-commit realtime publish. It is recorded here as a debt with a named owner rather than left as
+an oversight, and it is why `tests/integration/test_ai_usage_ledger.py` reads `overview` at most
+once per tenant per window: a second read of the same key answers from Redis, or recomputes if Redis
+is down, and an assertion that passed or failed depending on whether a container was running would
+be worse than no assertion.
+
+**Decision 5 — cost is computed at write time, from a table `AI_MODEL` is validated against.**
+`AIUsage.cost_usd` exists because *rates change and a historical row must keep the price actually
+charged*, so the price is computed when the row is written and never recomputed on read.
+`app/ai/pricing.py` holds published rates per model with the source and the date it was read in the
+module docstring, and `Settings` **refuses an `AI_MODEL` that is not in that table**. The
+alternative is a deployment quietly logging `cost_usd = 0` forever: a wrong number, which is worse
+than a missing one, and the same instinct that made `scoping.py` a required argument rather than a
+default.
+
+**Decision 6 — a rejected answer is priced from the tokens it was billed, and that took a fix.**
+Found while writing this phase's tests: `validate_output`'s `AIOutputError` carried no token counts,
+so the most expensive failure there is — a full-length answer that was then rejected for not
+matching the schema — would reach the ledger as a zero-cost row. `claude.py` now catches the
+rejection and re-raises it with the counts it read off the response, which is why the counts ride on
+the exception at all: the exception is the only thing that leaves the provider on that path, and a
+caller that had to ask a second time would be asking about a call that has already ended. The
+regression is pinned by a unit test that drives the real `ClaudeProvider` against a fake SDK client
+returning a `1.4` confidence and asserts the row's cost equals `cost_usd` for the tokens it was
+billed.
+
+**Decision 7 — the fake provider is refused outside the test environment.** §60 forbids *"use fake
+AI results in the final implementation"* and ADR-008 says the fake exists for tests only. A
+convention would not hold that line; a validator does. `AI_PROVIDER: Literal["anthropic", "fake"]`
+plus a validator that raises when `AI_PROVIDER == "fake"` and `ENVIRONMENT != "test"`, and
+`tests/unit/test_config.py` asserts the refusal rather than trusting it. The fake is also scripted
+rather than generative: it answers from a queue of outcomes and counts calls, and a test that forgets
+to script it gets an `AssertionError` naming the call count instead of a plausible-looking result.
+`ai_service._provider` is the seam a test patches, which is how the retry tests script three
+attempts without a vendor.
+
+**Decision 8 — customer-written text is fenced before it reaches a model.**
+`app/ai/prompts.py`'s `as_untrusted(label, text)` wraps the text in a delimited block under a
+sentence saying it is content rather than instruction, and **defuses any fence marker appearing
+inside it — in the body and in the label** — so the boundary cannot be spelled by the customer. The
+provider applies it, not the caller, so fencing is not something a prompt author can forget. This is
+mitigation and not a guarantee: prompt injection is unsolved, and the honest containment is the two
+decisions above it — the answer must be a validated model, and no model output can send anything.
+
+**Decision 9 — nothing is autonomous, and the types say so.** `SuggestedReply` has a body and no
+confidence, no status, and no sender: the schema cannot express "sent". §21's *"AI must NEVER
+automatically send a customer-facing response in the default implementation"* is enforced by what
+the return type can say rather than by a comment a later caller could ignore.
+
+**Decision 10 — no route, no queue, no `ai_analyses` rows, no migration.** §36's three AI routes —
+`/ai/analyze`, `/ai/summarize`, `/ai/suggest-response` — belong to Phases U, V, and W, and this
+phase builds no consumer for them. `celery_app.py` is unchanged for the reason Decision 1 gives.
+`ai_analyses` is a ticket-scoped history of what the model said, and Phase U is what has something
+to store; Phase T writes the ledger and nothing else. **`alembic check` reporting "No new upgrade
+operations detected" is the mechanical proof that Phase T adds no table, no column, and no index**,
+the same proof Phase S used.
+
+**What Phase T deliberately does not do.** No embedding provider and no `generate_embedding`
+(Decision 1, Phase X). No route, no Celery task, no `ai` queue (Decision 10). No `AIAnalysis` rows
+(Phase U). No AI result cache: `was_cached` is written `False` on every row, and §20's *"avoid
+regenerating"* is Phase V's, because writing `True` for a call that reached the provider would
+corrupt the measurement the column exists for. No rate limit on AI calls: §45 names AI endpoints,
+and the limit arrives with its consumer as every other limit did. No prompt-injection defence
+beyond fencing: §24's grounding rules are RAG work. And no frontend, as in every phase — §8's first
+success criterion is that the backend is fully exercisable without it.
+
+**Cost.** One new runtime dependency (`anthropic`, pinned, and it ships `py.typed` so mypy `strict`
+needs no override — unlike boto3 and Celery), and `httpx` as a dev-only one for the SDK's transport.
+Seven settings to operate, all defaulted, and one of them (`AI_API_KEY`) is optional because every
+self-hosted installation that does not want AI starts without a key — the failure is loud at the
+point of use rather than at import, so a checkout with no key still runs the whole test suite. The
+ledger grows at **one row per attempt, not per call**, so a rate-limited afternoon costs three rows
+where a naive count would say one; that is the intended reading, and `calls` in the analytics block
+counts attempts too. Nothing is saved yet, because nothing is cached. And the honest cost of
+Decision 4 is that the ledger's completeness depends on callers honouring a commit obligation
+nothing can check for them.
+
+**Verification.** The four §46 cases this phase exists to cover were each deliberately broken and
+the corresponding test confirmed to fail, because a test that cannot fail is not testing anything:
+bounding the retry loop at one attempt failed five tests in `tests/unit/test_ai_retry.py`; replacing
+`validate_output`'s `model_validate` with a cast to the raw payload failed fifteen in
+`tests/unit/test_ai_structured_output.py`; removing `claude.py`'s token re-attachment failed
+`test_a_rejected_answer_is_priced_from_the_tokens_it_was_billed` and nothing else; and logging
+`str(exc)` instead of `type(exc).__name__` failed two in
+`tests/security/test_ai_log_hygiene.py`. Each break was reverted and the files confirmed
+byte-identical to their backups, which matters here because `app/ai/` is new in this phase and has
+no earlier revision to restore from. The suite is 1209 tests, up from Phase S's 1092, all passing;
+`alembic check` reports no new upgrade operations, which is the mechanical proof that this phase
+adds no table, column, or index.
+
+**The live end-to-end is the one claim this phase cannot make yet.**
+`scripts/phase_t_walkthrough.py` is written and its refusal path was exercised — with `AI_API_KEY`
+empty in `.env` the script prints what to add and exits `0`, and the API it needs starts cleanly
+with the new module in place — but the four real calls and the dashboard read-back it exists for
+**have not been run**, because the key this repository's `.env` is meant to hold is not in it. What
+the script would add is the two things no test in the suite can show: that a real model answers
+through `ai_service` today, and that the ledger and the endpoint agree across a process boundary.
+Everything it asserts about the ledger's contents is asserted against a real database in
+`tests/integration/test_ai_usage_ledger.py`, and the endpoint's own behaviour is covered in
+`tests/api/test_analytics.py` — so the outstanding part is the provider, not the plumbing. It is
+recorded as outstanding rather than described as done.

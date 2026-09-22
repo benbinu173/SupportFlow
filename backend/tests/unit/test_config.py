@@ -102,3 +102,106 @@ def test_the_upload_limit_is_on_by_default_and_tunable(monkeypatch: pytest.Monke
 
     assert _settings().RATE_LIMIT_UPLOAD_PER_HOUR == 60
     assert _settings(RATE_LIMIT_UPLOAD_PER_HOUR="2").RATE_LIMIT_UPLOAD_PER_HOUR == 2
+
+
+# ---------------------------------------------------------------------------
+# AI (§17 configuration, and §60's guard on the fake provider)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_the_ai_provider_defaults_to_the_real_one() -> None:
+    """A default is what a deployment gets when nobody decides."""
+    assert _settings().AI_PROVIDER == "anthropic"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("environment", ["development", "production"])
+def test_the_fake_provider_is_refused_outside_tests(environment: str) -> None:
+    """§60: the final implementation must not *"use fake AI results"*.
+
+    ADR-008 says the fake *"exists for tests only"*, and a comment saying so is a rule the
+    next commit cannot break. This is the rule that commit fails on — the guard is in
+    configuration, so there is no code path that constructs a fake provider in a
+    deployment that asked for one.
+
+    Both non-test environments are checked, because the failure mode of an `!= "test"`
+    condition written as `== "development"` is that production silently gets a scripted
+    provider that answers nothing.
+    """
+    with pytest.raises(ValidationError, match="AI_PROVIDER=fake"):
+        _settings(AI_PROVIDER="fake", ENVIRONMENT=environment)
+
+
+@pytest.mark.unit
+def test_the_fake_provider_is_allowed_in_tests() -> None:
+    """The same setting, one environment over — so the guard is narrow and not a ban."""
+    assert _settings(AI_PROVIDER="fake", ENVIRONMENT="test").AI_PROVIDER == "fake"
+
+
+@pytest.mark.unit
+def test_an_unpriced_ai_model_is_refused() -> None:
+    """The failure `app/ai/pricing.py` exists to prevent, caught at startup instead.
+
+    A model whose published rate is unknown would write `cost_usd = 0` for every call it
+    served, and a dashboard renders that as "free" rather than as "unpriced" — a wrong
+    number rather than a missing one.
+    """
+    with pytest.raises(ValidationError, match="has no published rate"):
+        _settings(AI_MODEL="gpt-4-turbo")
+
+
+@pytest.mark.unit
+def test_a_priced_ai_model_is_accepted() -> None:
+    assert _settings(AI_MODEL="claude-haiku-4-5-20251001").AI_MODEL == ("claude-haiku-4-5-20251001")
+
+
+@pytest.mark.unit
+def test_ai_is_optional_and_a_blank_key_is_absent() -> None:
+    """A blank key is not a credential, and an absent one is a legal configuration.
+
+    `.env.example` ships `AI_API_KEY=` with no value, so a developer who copies it has an
+    empty string in the environment. Without the blank-becomes-`None` rule the AI layer
+    would hand the SDK a key that is present and wrong, which fails differently from one
+    that is absent and is harder to read. The `None` half is what lets a checkout with no
+    key run the entire suite and a self-hosted installation start without AI.
+    """
+    assert _settings().AI_API_KEY is None
+    assert _settings(AI_API_KEY="").AI_API_KEY is None
+    assert _settings(AI_API_KEY="   ").AI_API_KEY is None
+    assert _settings(AI_API_KEY="sk-ant-real").AI_API_KEY == "sk-ant-real"
+
+
+@pytest.mark.unit
+def test_the_retry_budget_is_what_the_reasoning_argues_for() -> None:
+    """Three attempts inside a request, not five over minutes.
+
+    `app/workers/email_tasks.py` retries five times because mail is delivered eventually.
+    An AI call has a person watching a spinner, so the whole sequence has to fit inside a
+    request: the assertion is that this number never drifts upward by accident.
+    """
+    settings = _settings()
+
+    assert settings.AI_MAX_ATTEMPTS == 3
+    assert settings.AI_TIMEOUT_SECONDS == 30.0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"AI_MAX_ATTEMPTS": 0},
+        {"AI_TIMEOUT_SECONDS": 0},
+        {"AI_RETRY_BACKOFF_SECONDS": -1},
+    ],
+)
+def test_an_ai_setting_that_would_break_the_call_path_is_refused(
+    override: dict[str, object],
+) -> None:
+    """Zero attempts is not a policy — it is a call path that never calls anything.
+
+    Each of these would fail in a way that reads like a bug in the retry loop rather than
+    like a misconfiguration, which is why the bound is on the field.
+    """
+    with pytest.raises(ValidationError):
+        _settings(**override)  # type: ignore[arg-type]

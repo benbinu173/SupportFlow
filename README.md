@@ -106,7 +106,9 @@ rather than falling back to something insecure.
 | `RATE_LIMIT_*` | Per-address login/registration limits and the per-user upload limit |
 | `JWT_SECRET` | Access-token signing; minimum 32 characters (required) |
 | `CORS_ORIGINS` | Comma-separated allowlist. No wildcard — the refresh cookie needs credentials |
-| `AI_API_KEY` / `AI_MODEL` | Generation provider |
+| `AI_API_KEY` | Generation provider credential (optional — an installation that does not want AI runs without one, and the first call is what says so) |
+| `AI_PROVIDER` / `AI_MODEL` | `anthropic` or `fake`; the fake is refused outside `ENVIRONMENT=test`. `AI_MODEL` must be a model `app/ai/pricing.py` can price, because the ledger computes cost at write time |
+| `AI_MAX_TOKENS` / `AI_TIMEOUT_SECONDS` / `AI_MAX_ATTEMPTS` / `AI_RETRY_BACKOFF_SECONDS` | Output ceiling, per-call timeout, attempts per call, and the backoff base — see [AI](#ai) |
 | `S3_*` | Object storage for attachments |
 
 ## Commands
@@ -150,6 +152,11 @@ python scripts/phase_r_walkthrough.py
 # every endpoint checked against numbers derived from that fixture and the tenant's own
 # policies — plus a cache hit proved by an entry's TTL counting down rather than resetting.
 python scripts/phase_s_walkthrough.py
+
+# And for the AI foundation: only the API, and a real key in .env. Four live calls across
+# §17's four operations, one deliberate permanent failure with a wrong key, and the spend
+# read back out of /analytics/overview. An empty AI_API_KEY skips with a message.
+python scripts/phase_t_walkthrough.py
 
 # Frontend (from frontend/)
 npm test
@@ -1142,6 +1149,118 @@ The fail-open path needs Redis stopped, which a script cannot do to itself: stop
 stdout carries `analytics_cache_unavailable` with an **error type and no message** — a connection
 error's message embeds `REDIS_URL`, which carries a password in production.
 
+## AI
+
+§17's foundation, and **nothing above it yet**: there is no AI route, no Celery task, and no
+`ai_analyses` row. What exists is the layer the next three phases call —
+[backend/app/ai/](backend/app/ai/) (the provider boundary), and
+[backend/app/services/ai_service.py](backend/app/services/ai_service.py) (the one call path that
+enforces the timeout, retries what is worth retrying, validates the answer, and records what it
+cost). §36's three routes are Phases U, V, and W. A count of calls and dollars is already visible
+without them: `GET /analytics/overview` reports the ledger, and Phase S built that read path before
+there was anything to read (ADR-026).
+
+### The provider boundary
+
+Application code depends on `AIProvider` — `classify_ticket`, `analyze_sentiment`,
+`summarize_conversation`, `generate_response` — and never on a vendor SDK.
+`app/ai/claude.py` is the only module in the project that imports one, the same boundary
+`app/core/storage.py` draws around boto3. Two implementations exist: the real one, which asks Claude
+for a **tool call** so the answer arrives as typed arguments rather than prose to be parsed, and a
+**scripted fake** that answers from a queue of outcomes. The fake is refused outside
+`ENVIRONMENT=test` by a config validator, not by a convention — §60 forbids fake AI results in the
+final implementation, and a validator is what holds that line.
+
+**`generate_embedding` is deliberately not in the interface.** §17 lists five methods, and ADR-008
+puts embeddings behind the same interface with a *different* vendor. Declaring it now would give
+`ClaudeProvider` a method it can never serve, so Phase X adds it together with the provider that can
+answer it.
+
+### The answer is data, never instructions
+
+Two rules, and both are structural rather than reviewed.
+
+**Model output cannot reach application code unvalidated.** `validate_output` in
+`app/ai/provider.py` is the single place a payload becomes a Pydantic model, and both providers call
+it — so a provider that answered in prose, invented an enum member, returned a confidence of `1.4`,
+or was cut off at `max_tokens` produces an `AIOutputError` and no value. There is no code path that
+skips it. Every one of those failures is the same condition to a caller (the answer could not be
+trusted) and a different one in the log.
+
+**Customer-written text is fenced before it reaches a model.** `as_untrusted(label, text)` wraps it
+in a delimited block under a sentence saying it is content and not instruction, and defuses any
+fence marker appearing inside it — in the body *and* in the label — so the boundary cannot be
+spelled by the customer. The provider applies the fence, so a prompt author cannot forget it. This
+is mitigation and not a guarantee: prompt injection is unsolved, which is why the two rules above it
+are the containment that matters.
+
+**Nothing is autonomous.** `SuggestedReply` has a body and no confidence, no status, and no sender,
+so the schema cannot express "sent". §21's *"AI must NEVER automatically send a customer-facing
+response"* is enforced by what the type can say.
+
+### Retry is a policy with one owner
+
+The SDK's own retries are off (`max_retries=0`) so that the timeout and the retry policy live in
+exactly one place and the attempt count in the ledger means what it says.
+
+- **Only a transient failure is retried** — unreachable, timed out, throttled, 5xx — up to
+  `AI_MAX_ATTEMPTS` (3), with exponential backoff from `AI_RETRY_BACKOFF_SECONDS` (1) and the delay
+  jittered to between half and all of the ceiling. Full jitter would be the textbook choice and is
+  wrong here: it can return a delay near zero, and the failure being retried is usually a rate
+  limit, which is the one case where waiting less is pointless.
+- **A permanent failure is not retried.** A refused key or an unknown model fails identically on the
+  second attempt.
+- **Malformed output is not retried either.** The same input at the same temperature reproduces it,
+  and §53 names repeated AI calls as waste — paying twice for one unusable answer is exactly that. A
+  truncation is fixed by raising `AI_MAX_TOKENS`, which is a configuration answer and not a retry
+  one.
+
+### The ledger
+
+Every attempt writes a row into `ai_usage` — **including the ones that fail**, because a failed call
+consumed quota and may have been billed. That is why a retried call appears three times, and why
+`failed_calls` is a subset of `calls` rather than a complement. The row carries the provider's own
+token counts, its latency, whether it succeeded, and a `cost_usd` computed **at write time** from
+the published rate for that model: rates change, and a historical row has to keep the price that was
+actually charged. `AI_MODEL` is validated against that table at startup, so a model whose price is
+unknown cannot be configured at all — the alternative is a deployment quietly recording every call
+as free.
+
+**The caller commits, including after a failure.** `ai_service` stages rows and never commits,
+because it is called from inside a transaction a route or a task already owns. A caller that lets
+its own rollback discard them loses exactly the record that matters most — which is why the
+walkthrough commits after a deliberate failure and then reads `failed_calls: 1` back rather than
+asserting that it happened.
+
+**An `ai_usage` write does not invalidate the analytics cache**, so `/analytics/overview`'s AI block
+can read up to one TTL stale. `ai_service` cannot fix that from where it sits — invalidating before
+the caller's commit lands is a race — so whoever commits owns the invalidation, in the same place
+and at the same moment as the realtime publish. That is Phase U's route, and it is recorded in
+ADR-027 (and below) rather than left as an oversight.
+
+### Verifying it by hand
+
+    # the API, from backend/ (.env needs a real AI_API_KEY)
+    .venv/Scripts/python.exe -m uvicorn app.main:app \
+        --loop app.core.event_loop:loop_factory --port 8000
+    # then, from backend/
+    .venv/Scripts/python.exe scripts/phase_t_walkthrough.py
+
+It registers two tenants, opens a ticket whose description contains an injected instruction and a
+forged closing fence, and drives the four operations through the real provider in one session — then
+makes a fifth call with a deliberately wrong key, which is a permanent failure, and commits anyway.
+It reads `GET /analytics/overview` over HTTP and checks that `calls` equals the attempts it made,
+that `failed_calls` is 1, that tokens and `cost_usd` are non-zero and that `by_operation` names the
+operations it used — with every expectation computed from what the script did, never written down
+twice. The second tenant reads zeros.
+
+The rows themselves are worth reading once:
+
+    psql "postgresql://supportflow:supportflow@localhost:5432/supportflow" -c \
+      "SELECT operation, provider, model, prompt_tokens, completion_tokens, \
+              cost_usd, latency_ms, was_successful \
+         FROM ai_usage ORDER BY created_at"
+
 ## Security posture
 
 Implemented in Phase C:
@@ -1180,10 +1299,6 @@ Implemented in Phases F–H:
   password, access token, refresh token, authorization header, or password hash
   appears anywhere in it. It carries a positive control, so a recorder that captured
   nothing fails rather than passing vacuously.
-
-Designed and documented, enforced in later phases: upload validation, and treating AI
-output as untrusted until schema-validated. See
-[docs/requirements.md](docs/requirements.md) §7.
 
 Implemented in Phases I–K:
 
@@ -1255,6 +1370,30 @@ Implemented in Phase S:
   (`remaining_seconds`) is computed per request from the same clock the ticket detail screen uses,
   and only the aggregate half of `/analytics/sla` is shared.
 
+Implemented in Phase T:
+
+- **§54's "AI output validated"** is a requirement about a code path, so it is enforced as one:
+  `validate_output` is the single place a provider payload becomes a model, both providers call it,
+  and a payload that is prose, missing a field, claiming a confidence of `1.4`, or cut off at
+  `max_tokens` produces an error and no value. It is exercised without a vendor in
+  [tests/unit/test_ai_structured_output.py](backend/tests/unit/test_ai_structured_output.py) — which
+  is the point of putting it in one function.
+- **§60's "do not use fake AI results in the final implementation"** is a config validator, not a
+  convention: `AI_PROVIDER=fake` is refused everywhere except `ENVIRONMENT=test`, and a test asserts
+  the refusal rather than trusting it.
+- **§54's "no tokens in logs" now covers the AI path, where the new secret is a third party's.**
+  [tests/security/test_ai_log_hygiene.py](backend/tests/security/test_ai_log_hygiene.py) drives a
+  transient failure, a rejected key, a malformed payload, and a success, and asserts that the API
+  key, the ticket's subject and body, and the assembled prompt appear in no log line. It also
+  asserts the set of event names the AI modules emit, so a *new* log statement carrying unknown
+  fields fails loudly rather than passing — the realistic way a prompt reaches a log.
+- **§21's "never automatically send"** is a type: `SuggestedReply` has no sender, no status, and no
+  confidence, so no code path can turn a draft into a message.
+- **A rejected answer is priced.** `AIOutputError` carries the token counts it was billed for, so
+  the most expensive failure there is — a full-length answer that missed the schema — reaches the
+  ledger at its real cost instead of as a zero row. Found while writing this phase's tests, and
+  pinned by one that drives the real provider against a fake SDK client.
+
 Two trade-offs are deliberate and recorded in ADR-014: the login limiter **fails open**
 when Redis is unreachable (it is an abuse control, not an authentication control, and
 failing closed would turn a Redis blip into a total login outage), and it is keyed on
@@ -1280,7 +1419,8 @@ instead; see [Rate limiting](#rate-limiting).
 | Q | SLA monitoring, beat | ✅ |
 | R | WebSockets, real-time fan-out | ✅ |
 | S | Analytics | ✅ |
-| T–W | AI foundation, analysis, summaries, drafts | next |
+| T | AI foundation: provider, structured output, retry, usage ledger | ✅ |
+| U–W | AI analysis, summaries, drafts | next |
 | X | Knowledge base and RAG | |
 | Y–Z | Hardening, deployment | |
 
@@ -1308,10 +1448,40 @@ instead; see [Rate limiting](#rate-limiting).
 - **The risk list is a ranking, not a page.** `limit` caps at 50 and there is no `offset`, so a
   tenant with more than 50 tickets past due sees the 50 nearest their deadline and nothing reports
   the rest. Surviving a genuinely large backlog is what a rollup or a paged view would be for.
-- **The AI metrics read empty tables until Phases T–W.** `ai_usage` is zeros and the sentiment
-  distribution puts every ticket in the `null` bucket, which is a real aggregation over rows that
-  do not exist yet rather than a placeholder — the response shapes are final, so Phase U fills them
-  without an API change.
+- **The AI spend numbers are real since Phase T; the sentiment distribution is still empty.** Every
+  attempt writes an `ai_usage` row, so `calls`, `failed_calls`, tokens, and `cost_usd` on
+  `/analytics/overview` are a genuine `COUNT` and `SUM` over rows that now exist. The sentiment
+  chart still puts every ticket in the `null` bucket, because the sentiment *ticket column* is Phase
+  U’s — `ai_service.analyze_sentiment` reads a sentiment and nothing stores one yet. The response
+  shapes are final, so U fills them without an API change.
+- **AI spend can read up to one TTL stale.** An `ai_usage` write does not bump the analytics version
+  integer, so `/analytics/overview`’s AI block can lag a call by up to `ANALYTICS_CACHE_TTL_SECONDS`.
+  `ai_service` cannot invalidate from where it sits — it stages rows and does not commit, and
+  invalidating before the caller’s commit lands is the race `ticket_service` comments about — so
+  **whoever commits owns the invalidation**. Phase U’s route is where that lands (ADR-027), and it is
+  why Phase T’s own integration test reads `overview` at most once per tenant per window.
+- **No embeddings and no `generate_embedding` method until Phase X.** ADR-008 puts embeddings behind
+  the same interface with a different vendor, so the method is absent rather than stubbed.
+  `EMBEDDING_MODEL` is declared in `.env.example` and read by nothing.
+- **The fake provider is test-only, and the configuration refuses it elsewhere.** `AI_PROVIDER=fake`
+  with any `ENVIRONMENT` other than `test` fails at startup (§60), asserted by a test rather than
+  trusted. That is also why the fake is not a fallback for a missing key.
+- **An AI call is not rate-limited, because there is no route to limit.** §45 names AI endpoints;
+  they arrive in Phases U–W, and the limit arrives with its consumer as every other one did.
+- **Nothing caches an AI result yet.** `ai_usage.was_cached` is written `False` on every row, and
+  §20’s "avoid regenerating" is Phase V’s — writing `True` for a call that reached the provider
+  would corrupt the measurement the column exists for.
+- **The prompt-injection defence is fencing, and fencing is not a guarantee.** Customer text is
+  delimited and told it is data, and the fence cannot be spelled by a customer, but prompt injection
+  is unsolved. The containment that does not depend on it is that an answer must be a validated
+  model, and that no model output can send anything.
+- **A retried call is three ledger rows, not one.** The ledger records attempts rather than logical
+  calls, deliberately — a failed attempt may have been billed — so an operator counting `calls` is
+  counting attempts, and nothing reconciles the two into "one call cost $0.006 across three tries".
+- **The ledger’s completeness depends on an obligation nothing enforces.** `ai_service` stages rows
+  and never commits, so a caller that rolls back loses them. It is stated in the function’s docstring
+  and in the call-path module, and the walkthrough demonstrates it, but a future caller could still
+  get it wrong.
 - **`cost_usd` renders as a decimal string**, and a zero sum renders as `"0"` rather than
   `"0.000000"`, because Postgres renders the scale from the value. A client parsing it as a float
   loses the reason it is a string.

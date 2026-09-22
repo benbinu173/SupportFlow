@@ -9,7 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import PostgresDsn, RedisDsn, field_validator
+from pydantic import Field, PostgresDsn, RedisDsn, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Repo root: config.py → core → app → backend → root. The .env lives there so a
@@ -187,6 +187,64 @@ class Settings(BaseSettings):
     # setting for something nothing sets is a guess with a name.
     ANALYTICS_CACHE_TTL_SECONDS: int = 300
 
+    # --- AI ----------------------------------------------------------------
+    # The `--- AI ---` block has been in `.env.example` since Phase C; these are the
+    # settings it was waiting to describe, arriving with the consumer per the rule the
+    # Celery, S3, WebSockets, and Analytics blocks above follow.
+    #
+    # Which implementation `app/ai/provider.py`'s protocol is bound to. A `Literal` rather
+    # than a free string so a typo is an error at startup rather than a provider that
+    # cannot be found at the first ticket.
+    AI_PROVIDER: Literal["anthropic", "fake"] = "anthropic"
+
+    # Optional, following the `SMTP_USERNAME`/`SMTP_PASSWORD` precedent rather than the
+    # S3/JWT required-and-defaultless one. The difference is that AI is a feature a
+    # deployment can simply not have: a checkout with no key should run the whole test
+    # suite, and a self-hosted installation that does not want AI should start. So the
+    # key is absent-and-legal here, and `app/ai/claude.py` refuses to build a client
+    # without one — the failure is loud at the point of use rather than at import.
+    #
+    # §4 forbids secrets in source and this is why it is read from the environment and
+    # never logged; see `app/ai/claude.py` on why an SDK error's own message is not
+    # passed along, either.
+    AI_API_KEY: str | None = None
+
+    # Validated against `app/ai/pricing.py`'s rate table below. A model whose published
+    # price is not known cannot be configured at all, because the alternative is a ledger
+    # full of `cost_usd = 0` rows that a dashboard renders as "free" — a wrong number
+    # rather than a missing one, which is the worse failure to debug.
+    AI_MODEL: str = "claude-sonnet-5"
+
+    # One answer's ceiling. §20 summaries and §21 drafts are a few hundred tokens; 1024 is
+    # several times the longest of them and still bounds the cost of a model that decides
+    # to be expansive. Reaching it is a handled failure — `claude.py` reports the
+    # truncation as an `AIOutputError` rather than half-parsing the arguments — and the
+    # fix is to raise this number, which is why the error says so.
+    AI_MAX_TOKENS: int = 1024
+
+    # A support agent is waiting for a draft and a worker is holding a slot. 30 seconds is
+    # well past a p95 answer for prompts of this size and short enough that a provider
+    # that has stopped responding is abandoned while somebody still remembers asking.
+    AI_TIMEOUT_SECONDS: float = Field(default=30.0, gt=0)
+
+    # **Three attempts, not five.** `app/workers/email_tasks.py` retries five times over
+    # minutes because an email is delivered eventually and a mail server that is down is
+    # down for a while. An AI call is different in both directions: the caller is a person
+    # watching a spinner, so the whole sequence has to fit inside a request; and the
+    # failures that actually happen are a burst rate limit or a dropped connection, which
+    # clear in seconds or not at all. Three attempts spanning roughly three seconds turns a
+    # blip into a success and gives up on a real outage instead of hammering it.
+    #
+    # Bounded below at one because zero attempts is not a policy — it is a call path that
+    # never calls anything, which fails in a way that reads like a bug in the loop.
+    AI_MAX_ATTEMPTS: int = Field(default=3, ge=1)
+
+    # The base of the exponential backoff between attempts. Small because the budget is
+    # small: attempts are at 0s, ~1s, ~3s, so the sequence fits in a request while still
+    # giving a rate limiter room to forget about us. Jittered in `ai_service` so a hundred
+    # workers throttled by the same limit do not return in lockstep.
+    AI_RETRY_BACKOFF_SECONDS: float = Field(default=1.0, ge=0)
+
     # --- CORS -------------------------------------------------------------
     # Explicit allowlist. Required because the refresh cookie is sent with
     # credentials, which forbids a wildcard origin.
@@ -225,7 +283,7 @@ class Settings(BaseSettings):
             raise ValueError("JWT_SECRET must be at least 32 characters")
         return v
 
-    @field_validator("SMTP_USERNAME", "SMTP_PASSWORD", mode="before")
+    @field_validator("SMTP_USERNAME", "SMTP_PASSWORD", "AI_API_KEY", mode="before")
     @classmethod
     def _blank_credential_is_absent(cls, v: object) -> object:
         """Treat an empty string as "not set".
@@ -237,6 +295,49 @@ class Settings(BaseSettings):
         """
         if isinstance(v, str) and not v.strip():
             return None
+        return v
+
+    @field_validator("AI_PROVIDER")
+    @classmethod
+    def _fake_provider_is_test_only(cls, v: str, info: ValidationInfo) -> str:
+        """Refuse the scripted provider outside the test environment.
+
+        §60 forbids *"fake AI results"* in the final implementation, and ADR-008 says the
+        fake *"exists for tests only"*. Both are statements about a deployment, and the
+        only place that knows what kind of deployment this is, is here. A comment on the
+        fake class would be a rule a future commit could not break; this is a rule that
+        commit fails on.
+
+        `ENVIRONMENT` is read from `info.data` rather than from a second settings object,
+        which is what makes the failure happen during validation of the very configuration
+        that asked for it.
+        """
+        if v == "fake" and info.data.get("ENVIRONMENT") != "test":
+            raise ValueError(
+                "AI_PROVIDER=fake is only allowed when ENVIRONMENT=test "
+                "(spec §60: no fake AI results in the final implementation)"
+            )
+        return v
+
+    @field_validator("AI_MODEL")
+    @classmethod
+    def _model_has_a_published_rate(cls, v: str) -> str:
+        """Refuse a model `app/ai/pricing.py` cannot price.
+
+        Imported inside the validator rather than at module scope because `app/ai/pricing.py`
+        raises `AIPermanentError` through `app/ai/errors.py`, and configuration should not
+        be the thing that makes the AI package importable at startup. The import is cheap
+        and this runs once.
+        """
+        from app.ai.errors import AIPermanentError
+        from app.ai.pricing import priced_models, rate_for
+
+        try:
+            rate_for(v)
+        except AIPermanentError as exc:
+            raise ValueError(
+                f"AI_MODEL={v!r} has no published rate. Priced models: {', '.join(priced_models())}"
+            ) from exc
         return v
 
     @property

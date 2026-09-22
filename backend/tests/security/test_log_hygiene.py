@@ -62,6 +62,14 @@ LOGGING_MODULES = (
     "app.api.websocket",
     "app.main",
     "app.core.rate_limit",
+    # Phase T. `app.ai.claude` logs the *type* and the translated *reason* of a provider
+    # failure and never the exception's text, because an SDK error can echo the request
+    # headers it was sent — and one of those headers is the API key. It is listed here
+    # because it holds a module-level logger, and the AI path's own secrets are covered in
+    # full by `tests/security/test_ai_log_hygiene.py`; this entry is the registry saying
+    # the module is known, not a claim that this file exercises it.
+    "app.ai.claude",
+    "app.services.ai_service",
     "app.services.attachment_service",
     "app.services.audit_service",
     "app.services.auth_service",

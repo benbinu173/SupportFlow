@@ -260,15 +260,19 @@ class AIUsageOperationRow(BaseModel):
 class AIUsageSummary(BaseModel):
     """§28's "AI usage".
 
-    **Empty until Phase T, and that is a real answer rather than a placeholder.** Nothing
-    writes `ai_usage` yet, so every field here is zero because a `COUNT` and a `SUM` over
-    the rows that exist say so. §8's eleventh criterion is that analytics come from real
-    aggregation queries and never hardcoded values; this is a real query, and the honest
-    number for a tenant that has made no AI calls is zero.
+    **Non-zero since Phase T**, which added the one call path that writes `ai_usage`. The
+    fields were final before anything could fill them — Phase S built this block against
+    the table Phase D had already created — and every one is still a `COUNT` or a `SUM`
+    over the rows that exist, so a tenant that has made no calls reads zeros because that
+    is the honest answer and not because the query is a placeholder.
 
     `failed_calls` is separate from `calls` because `ai_usage` records a failed call — it
     consumed quota and may have been billed. A dashboard that folded them together would
-    report spend with no way to see how much of it bought nothing.
+    report spend with no way to see how much of it bought nothing. It is a subset of
+    `calls`, and `cost_usd` includes it: a truncated answer is still an invoice.
+
+    `calls` counts only calls attributed to a ticket in the caller's row scope, because
+    `ai_usage` has no `customer_id` to scope by — see `AnalyticsRepository.ai_usage`.
     """
 
     calls: int
