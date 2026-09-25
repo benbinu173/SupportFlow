@@ -35,8 +35,12 @@ class AIUsage(UUIDPrimaryKeyMixin, OrganizationScopedMixin, Base):
     AI call including embeddings, which have no ticket. Aggregating spend from
     analyses alone would silently omit ingestion cost.
 
-    Append-only. Cost is computed at write time from the provider's published rate,
-    because rates change and a historical row must keep the price actually charged.
+    Append-only. `cost_usd` is the provider's **published rate for the model at write
+    time**, computed when the row is written and never recomputed on read, because
+    rates change and a historical row has to keep the number it was recorded with.
+    It is a list price and not an invoice: a free tier records the published rate
+    too, so the column keeps meaning "what these tokens are worth" rather than
+    collapsing to zero for every row a free account ever writes.
     """
 
     __tablename__ = "ai_usage"

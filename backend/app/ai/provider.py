@@ -20,6 +20,10 @@ job is reduced to getting a payload out of its own SDK; turning that payload int
 Pydantic model, or refusing to, happens here. So the malformed-output test needs no
 vendor at all, and a new provider inherits the §18 behaviour by using this function.
 
+**`_tool_schema` is here for the same reason, one layer up.** Both vendors ask the model to
+answer by calling a tool constrained by a JSON Schema; they differ in how the schema is
+enveloped and in nothing else. The envelope belongs to the provider. The schema does not.
+
 **Providers do not retry, do not sleep, and do not measure.** Timeout, backoff, attempt
 counts, cost, and the ledger belong to `app/services/ai_service.py`, which is the only
 caller. A provider that also retried would multiply the two policies, and the observed
@@ -29,7 +33,7 @@ attempt count would stop meaning anything. `AsyncAnthropic` is constructed with
 
 import json
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol, cast
 
 from pydantic import BaseModel, ValidationError
 
@@ -149,6 +153,50 @@ def validate_output[T: BaseModel](output: type[T], payload: object) -> T:
         raise AIOutputError(
             f"the response did not match {output.__name__}: {_failure_summary(exc)}"
         ) from exc
+
+
+def _inline(node: Any, defs: dict[str, Any]) -> Any:
+    """Replace every `$ref` in `node` with the definition it names, recursively.
+
+    Pydantic emits a non-primitive field as `{"$ref": "#/$defs/Sentiment"}` beside a
+    `$defs` block, and the tool schema actually sent to the provider should contain
+    neither: the schema is read by a model as much as by a validator, and an indirection
+    it has to chase is one more thing to get wrong. Our `Sentiment` field is the only
+    `$ref` the four schemas have, at one level of nesting.
+
+    A self-referential schema would exhaust the recursion limit rather than loop
+    forever — none of the four is, and `tests/unit/test_ai_structured_output.py` walks
+    every schema that reaches the provider.
+    """
+    if isinstance(node, list):
+        return [_inline(item, defs) for item in node]
+    if not isinstance(node, dict):
+        return node
+    ref = node.get("$ref")
+    if isinstance(ref, str):
+        return _inline(defs[ref.rsplit("/", 1)[-1]], defs)
+    return {key: _inline(value, defs) for key, value in node.items()}
+
+
+def _tool_schema(output: type[BaseModel]) -> dict[str, Any]:
+    """The JSON Schema a tool call must satisfy, with `$ref`s resolved.
+
+    **This lives here rather than in a provider, and the second provider is what proved
+    it.** It was written for Anthropic in Phase T; Groq needs the same document in its
+    own envelope, because both vendors constrain a tool call with JSON Schema. The two
+    envelopes differ — Anthropic takes `input_schema` beside `tool_choice: {"type":
+    "tool"}` and Groq takes it under `function.parameters` beside `tool_choice: {"type":
+    "function"}` — but the *schema* is the same object, and the shape of a schema is not
+    a vendor's business. A copy of this in `groq.py` would be two implementations of §18's
+    guarantee, which is the thing `validate_output` exists to prevent one layer up.
+    """
+    schema: dict[str, Any] = output.model_json_schema()
+    defs: dict[str, Any] = schema.pop("$defs", {})
+    if not defs:
+        return schema
+    # `_inline` is untyped inside because it walks an arbitrary JSON document. The cast
+    # states what is true of the entry point: given a schema it returns a schema.
+    return cast("dict[str, Any]", _inline(schema, defs))
 
 
 class AIProvider(Protocol):

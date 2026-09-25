@@ -1,8 +1,10 @@
-"""Claude — the only module in the codebase that knows the SDK exists.
+"""Claude — the only module in the codebase that knows Anthropic's SDK exists.
 
 Architecture §6: *"Application code depends on an `AIProvider` interface, never on a
 vendor SDK."* This is where that stops being a diagram: `anthropic` is imported here and
 nowhere else, and everything that escapes is one of the three types in `app/ai/errors.py`.
+`app/ai/groq.py` holds the same position for the other vendor — one module per SDK, neither
+aware of the other, both behind the protocol in `app/ai/provider.py`.
 
 **Structured output is requested as a tool call.** ADR-008 chose it, and the reason holds:
 a tool's `input_schema` is a JSON Schema the model is told to satisfy, so the constraint
@@ -31,8 +33,6 @@ API key in a header and a customer's words in the body. So a log line here gets
 own reason string, which is written in this module and quotes nothing.
 """
 
-from typing import Any, cast
-
 import structlog
 from anthropic import (
     AnthropicError,
@@ -47,7 +47,7 @@ from pydantic import BaseModel
 
 from app.ai.errors import AIError, AIOutputError, AIPermanentError, AITransientError
 from app.ai.prompts import as_untrusted
-from app.ai.provider import AIRequest, AIResult, validate_output
+from app.ai.provider import AIRequest, AIResult, _tool_schema, validate_output
 from app.core.config import get_settings
 from app.schemas.ai import (
     Classification,
@@ -163,40 +163,6 @@ def _translate(exc: AnthropicError) -> AIError:
             return _from_status(current)
         current = current.__cause__
     return AIPermanentError(type(exc).__name__)
-
-
-def _inline(node: Any, defs: dict[str, Any]) -> Any:
-    """Replace every `$ref` in `node` with the definition it names, recursively.
-
-    Pydantic emits a non-primitive field as `{"$ref": "#/$defs/Sentiment"}` beside a
-    `$defs` block, and the tool schema actually sent to the provider should contain
-    neither: the schema is read by a model as much as by a validator, and an indirection
-    it has to chase is one more thing to get wrong. Our `Sentiment` field is the only
-    `$ref` the four schemas have, at one level of nesting.
-
-    A self-referential schema would exhaust the recursion limit rather than loop
-    forever — none of the four is, and `tests/unit/test_ai_structured_output.py` walks
-    every schema that reaches the provider.
-    """
-    if isinstance(node, list):
-        return [_inline(item, defs) for item in node]
-    if not isinstance(node, dict):
-        return node
-    ref = node.get("$ref")
-    if isinstance(ref, str):
-        return _inline(defs[ref.rsplit("/", 1)[-1]], defs)
-    return {key: _inline(value, defs) for key, value in node.items()}
-
-
-def _tool_schema(output: type[BaseModel]) -> dict[str, Any]:
-    """The JSON Schema a tool call must satisfy, with `$ref`s resolved."""
-    schema: dict[str, Any] = output.model_json_schema()
-    defs: dict[str, Any] = schema.pop("$defs", {})
-    if not defs:
-        return schema
-    # `_inline` is untyped inside because it walks an arbitrary JSON document. The cast
-    # states what is true of the entry point: given a schema it returns a schema.
-    return cast("dict[str, Any]", _inline(schema, defs))
 
 
 class ClaudeProvider:

@@ -83,6 +83,27 @@ os.environ.setdefault("SMTP_TIMEOUT_SECONDS", "2")
 # depend on how fast the fan-out ran.
 os.environ.setdefault("WS_AUTH_TIMEOUT_SECONDS", "1")
 
+# AI. Assigned rather than `setdefault`, which is the one block here that breaks the pattern,
+# and the reason is that it is solving a different problem from every block above it: those
+# exist so `Settings` can be constructed at all, and this one exists so the *numbers* the
+# suite asserts do not depend on a file outside the repository.
+#
+# Four tests assert an exact `cost_usd` — `Decimal("0.003200")` is 1 200 tokens in at Sonnet
+# 5's rate plus 80 out — and those figures are only true for the model they were written
+# against. They were correct for as long as every developer's `.env` happened to say
+# `claude-sonnet-5`, and failed the first time one said `openai/gpt-oss-120b`, which is a
+# suite reporting on the reader's machine rather than on the code. The model is part of the
+# test's premise, so the test states it.
+#
+# Pinned as a **pair** because `Settings` refuses a model its provider does not serve
+# (ADR-028): pinning the model against whichever provider the environment happened to
+# supply would turn a wrong number into a suite that will not import.
+#
+# `tests/unit/test_config.py` unsets these where it asserts the defaults, for the reason
+# `test_the_upload_limit_is_on_by_default_and_tunable` gives about its own setting.
+os.environ["AI_PROVIDER"] = "anthropic"
+os.environ["AI_MODEL"] = "claude-sonnet-5"
+
 # Imported after the environment is populated, which is why this block sits below
 # the statements above. Ruff's E402 allows `os.environ` setup before imports
 # precisely because this pattern is unavoidable for test configuration.

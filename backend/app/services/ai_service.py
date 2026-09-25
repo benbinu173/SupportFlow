@@ -50,6 +50,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.ai.claude import ClaudeProvider
 from app.ai.errors import AIError, AITransientError
 from app.ai.fake import FakeProvider
+from app.ai.groq import GroqProvider
 from app.ai.pricing import cost_usd
 from app.ai.provider import AIProvider, AIRequest, AIResult
 from app.core.config import Settings, get_settings
@@ -75,20 +76,30 @@ _sleep = asyncio.sleep
 def _provider() -> AIProvider:
     """The configured provider.
 
-    Constructed per call rather than cached: neither implementation holds anything. The
-    SDK client is cached in `app/ai/claude.py` at module scope, which is the object that
-    owns a connection pool — this is one allocation.
+    Constructed per call rather than cached: none of the implementations holds anything. The
+    HTTP client is cached inside the provider module at module scope, which is the object
+    that owns a connection pool — this is one allocation.
 
     A test that wants a scripted provider patches this function, which is the seam
     `tests/unit/test_ai_retry.py` uses. `AI_PROVIDER=fake` is also honoured, but only in
     the test environment: `Settings` refuses that combination anywhere else (§60).
+
+    The table is the list of providers that exist, so adding one is one entry here and one
+    `Literal` member in `Settings` — and a value that somehow reached this line without an
+    entry fails as a `KeyError` naming it, rather than as a silent default to somebody's
+    vendor.
     """
-    if get_settings().AI_PROVIDER == "fake":
-        # Reached only under ENVIRONMENT=test. It answers nothing until it is scripted,
-        # which is deliberate: a test that forgets to script it gets an AssertionError
-        # naming the call count rather than a plausible-looking result.
-        return FakeProvider()
-    return ClaudeProvider()
+    return _PROVIDERS[get_settings().AI_PROVIDER]()
+
+
+#: Every implementation of `app/ai/provider.py`'s protocol, by the `AI_PROVIDER` value that
+#: selects it. `fake` is the scripted one, and `Settings` is what keeps it out of a real
+#: deployment — see the validator, not this comment.
+_PROVIDERS: dict[str, Callable[[], AIProvider]] = {
+    "anthropic": ClaudeProvider,
+    "groq": GroqProvider,
+    "fake": FakeProvider,
+}
 
 
 def _backoff_seconds(settings: Settings, attempt: int) -> float:

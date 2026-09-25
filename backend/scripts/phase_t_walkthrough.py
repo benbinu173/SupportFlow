@@ -42,10 +42,12 @@ rather than a failed assertion — the limiter working, not the phase:
 
     docker compose exec redis redis-cli -n 0 --scan --pattern 'ratelimit:register:*'
 
-It **spends real money**, in fractions of a cent: four calls to a small prompt and one that
-fails before generating anything. And it leaves its organizations, tickets, and ledger rows
-behind — nothing here deletes anything, because a spend record that can be tidied away is
-not a spend record.
+It **costs whatever the configured provider charges**, which on Groq's free tier is nothing:
+four calls to a small prompt and one that fails before generating anything. The ledger records
+the published rate either way, so the numbers this script reads back are non-zero regardless —
+`app/ai/pricing.py` has the argument for that. And it leaves its organizations, tickets, and
+ledger rows behind — nothing here deletes anything, because a spend record that can be tidied
+away is not a spend record.
 """
 
 # ruff: noqa: T201
@@ -61,7 +63,7 @@ import httpx
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from app.ai import claude
+from app.ai import claude, groq
 from app.ai.provider import AIRequest
 from app.core.config import Settings, get_settings
 from app.core.database import engine
@@ -79,12 +81,20 @@ from app.services import ai_service
 BASE = "http://localhost:8000/api/v1"
 PASSWORD = "correct-horse-battery-staple"
 
-#: A key that is well-formed and wrong. The provider answers `401`, which the SDK raises as
-#: `AuthenticationError` and `_translate` turns into `AIPermanentError` — one attempt, no
-#: retry, one ledger row. Deliberately not a blank string: a blank key never reaches the
-#: provider at all, so it would exercise `_shared_client`'s refusal instead of the failure
-#: this section is about.
-WRONG_KEY = "sk-ant-api03-deliberately-wrong-key-for-the-phase-t-walkthrough"
+#: Keys that are well-formed and wrong, one per vendor. The provider answers `401`, which
+#: each module's `_translate` turns into `AIPermanentError` — one attempt, no retry, one
+#: ledger row. Deliberately not a blank string: a blank key never reaches the provider at
+#: all, so it would exercise the client's refusal instead of the failure this section is about.
+#:
+#: **The shape matters.** A malformed credential is rejected as a bad *request*, which is a
+#: different status and a different translation; a wrong key of the right shape is rejected as
+#: a bad *key*, which is the failure §54's "the provider rejected the API key" describes. So
+#: the Groq one is `gsk_` plus 52 alphanumerics, the length and alphabet of a real one, and it
+#: is obviously a placeholder to a human reader at the same time.
+_WRONG_KEYS: dict[str, str] = {
+    "anthropic": "sk-ant-api03-deliberately-wrong-key-for-the-phase-t-walkthrough",
+    "groq": "gsk_" + "0" * 52,
+}
 
 #: The ticket, as a customer wrote it — including the two moves §24's threat model is
 #: about: an instruction addressed to the model, and a forged closing fence. Neither is
@@ -327,25 +337,37 @@ def run_the_four_operations(
     return results
 
 
+def _vendor() -> Any:
+    """The provider module for the configured vendor — the one whose client to repoint.
+
+    `claude` and `groq` each hold their own cached client and their own `get_settings`
+    binding, so the deliberate failure has to be aimed at whichever one is live. Returning the
+    module rather than branching twice keeps the choice in one place; the walkthrough is
+    otherwise provider-agnostic, which is the property ADR-028 is about.
+    """
+    return groq if get_settings().AI_PROVIDER == "groq" else claude
+
+
 def fail_on_purpose(context: TenantContext, ticket_id: str) -> None:
     """One call with a wrong key: a permanent failure, one attempt, one committed row.
 
-    `get_settings` is replaced on the `claude` module rather than in the environment,
-    because `Settings` is read once and cached and the process already built its client. It
-    is the same seam `tests/unit/test_ai_retry.py` uses for the same reason, and it is
-    restored in a `finally` so a later section cannot silently run on a broken key.
+    `get_settings` is replaced on the vendor module rather than in the environment, because
+    `Settings` is read once and cached and the process already built its client. It is the
+    same seam `tests/unit/test_ai_retry.py` uses for the same reason, and it is restored in a
+    `finally` so a later section cannot silently run on a broken key.
 
     **The row is committed after the exception, not instead of it.** `ai_service` stages the
     row and raises; the caller commits both the successful calls and this one. A ledger that
     only recorded successes would be a spend report that omits exactly the spend a reader
     most wants to see.
 
-    The dropped client is not closed. It owns an HTTP connection pool and this process is
-    about to exit; the alternative is a `try/finally` around `aclose` for a resource the
-    interpreter is already reclaiming.
+    The dropped client is not closed. It owns a connection pool and this process is about to
+    exit; the alternative is a `try/finally` around `aclose` for a resource the interpreter is
+    already reclaiming.
     """
     settings = get_settings()
-    real_get_settings = claude.get_settings
+    vendor = _vendor()
+    real_get_settings = vendor.get_settings
     requests = requests_for(ticket_id)
 
     async def go() -> None:
@@ -363,23 +385,23 @@ def fail_on_purpose(context: TenantContext, ticket_id: str) -> None:
             # The obligation, on the failure path: the caller commits anyway.
             await session.commit()
 
-    claude.reset_client()
-    claude.get_settings = lambda: _with_wrong_key(settings)
+    vendor.reset_client()
+    vendor.get_settings = lambda: _with_wrong_key(settings)
     try:
         quiet_engine()
         run(go())
     finally:
-        claude.get_settings = real_get_settings
-        claude.reset_client()
+        vendor.get_settings = real_get_settings
+        vendor.reset_client()
 
 
 def _with_wrong_key(settings: Settings) -> Settings:
-    """A copy of the real settings with a deliberately wrong key.
+    """A copy of the real settings with a deliberately wrong key for the configured vendor.
 
     A copy rather than a mutation: `get_settings` is process-wide and cached, and a script
     that edited the live object would leave a broken key behind for whatever ran next.
     """
-    return settings.model_copy(update={"AI_API_KEY": WRONG_KEY})
+    return settings.model_copy(update={"AI_API_KEY": _WRONG_KEYS[settings.AI_PROVIDER]})
 
 
 # ---------------------------------------------------------------------------
@@ -531,7 +553,10 @@ def the_ledger_holds_what_happened(tenant: Tenant, ticket_id: str) -> None:
 
     check("five calls were made", len(rows) == 5, f"got {len(rows)}")
     check("four succeeded and one did not", sum(row.was_successful for row in rows) == 4)
-    check("every row names the same provider", {row.provider for row in rows} == {"anthropic"})
+    check(
+        "every row names the configured provider",
+        {row.provider for row in rows} == {get_settings().AI_PROVIDER},
+    )
     check(
         "every row names the model that was configured",
         {row.model for row in rows} == {get_settings().AI_MODEL},
@@ -623,9 +648,10 @@ def main() -> None:
     if not settings.AI_API_KEY:
         print(
             "AI_API_KEY is not set, so there is nothing live to walk through.\n\n"
-            "Add a key to .env and run again:\n"
-            "  AI_API_KEY=sk-ant-...\n\n"
-            "This is a legal configuration, not a failure: `app/ai/claude.py` refuses at the\n"
+            "Add a key to .env and run again — its shape follows AI_PROVIDER:\n"
+            "  AI_PROVIDER=anthropic   AI_MODEL=claude-sonnet-5        AI_API_KEY=sk-ant-...\n"
+            "  AI_PROVIDER=groq        AI_MODEL=openai/gpt-oss-120b   AI_API_KEY=gsk_...\n\n"
+            "This is a legal configuration, not a failure: the provider module refuses at the\n"
             "point of use with 'AI_API_KEY is not configured', and the rest of the suite runs\n"
             "without one."
         )
@@ -666,10 +692,11 @@ def main() -> None:
         f"   This run's spend was {spend}; read the endpoint twice in a row and the second\n"
         "   answer is served from the cache rather than recomputed (ADR-026).\n"
         "\n"
-        "3. The three other §46 cases, deliberately broken. Already done and recorded in the\n"
-        "   phase notes: `ai_service`'s retry loop, `validate_output`'s schema check, and\n"
-        "   `claude.py`'s token re-attachment on a rejected answer were each removed in turn,\n"
-        "   and the test that pins each one failed while the others stayed green.\n"
+        "3. The four §46 cases, deliberately broken. Already done and recorded in the\n"
+        "   phase notes: `ai_service`'s retry loop, `validate_output`'s schema check, and the\n"
+        "   token re-attachment on a rejected answer in `claude.py` and again in `groq.py`\n"
+        "   were each removed in turn, and the test that pins each one failed while the\n"
+        "   others stayed green.\n"
         "\n"
         f"Left behind: two organizations ({tenant.name}, and one named Bystander), their\n"
         "tickets, and five ai_usage rows. Nothing here deletes anything."

@@ -35,6 +35,7 @@ ones and the assertions are about the real path.
 """
 
 import inspect
+import json
 from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
@@ -44,7 +45,7 @@ import pytest
 from anthropic import APIConnectionError, AuthenticationError
 from anthropic.types import ToolUseBlock
 
-from app.ai import claude
+from app.ai import claude, groq
 from app.ai.provider import AIRequest
 from app.core.exceptions import AIServiceError
 from app.core.tenancy import TenantContext
@@ -78,7 +79,10 @@ EXPECTED_EVENTS = frozenset(
 
 # The modules that hold a logger on the AI path. Listed explicitly, following
 # `test_log_hygiene.py`, so that a third module growing one is a deliberate addition.
-AI_LOGGING_MODULES = ("app.ai.claude", "app.services.ai_service")
+# `app.ai.groq` is the second vendor, and it is on the list for the same reason as the first:
+# it is the module that reads a provider's response, and a provider's response is untrusted
+# text that can be about a customer.
+AI_LOGGING_MODULES = ("app.ai.claude", "app.ai.groq", "app.services.ai_service")
 
 # A tool response the schema accepts, so the success path is reachable without a network.
 VALID_CLASSIFICATION = {
@@ -322,6 +326,155 @@ async def test_the_prompt_is_assembled_and_never_logged(
 
 
 # ---------------------------------------------------------------------------
+# The second vendor
+# ---------------------------------------------------------------------------
+
+
+def _install_groq(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    body: dict[str, Any],
+    status_code: int = 200,
+) -> None:
+    """Point `GroqProvider` at a stand-in socket, with the key in play.
+
+    Straight to HTTP rather than through an SDK, which is the whole difference between the two
+    vendors here: `_install_client` above has to fake Anthropic's client object, and this one
+    fakes the transport underneath httpx and nothing else.
+
+    `get_settings` is replaced for the same reason it is there — the credential has to be *in
+    play* for its absence from the log to mean anything.
+    """
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json=body, request=request)
+
+    monkeypatch.setattr(groq, "_client", httpx.AsyncClient(transport=httpx.MockTransport(handle)))
+    monkeypatch.setattr(
+        groq,
+        "get_settings",
+        lambda: SimpleNamespace(
+            AI_API_KEY=API_KEY, AI_MODEL="openai/gpt-oss-120b", AI_TIMEOUT_SECONDS=30.0
+        ),
+    )
+    monkeypatch.setattr(ai_service, "_provider", groq.GroqProvider)
+
+
+def _groq_completion(arguments: str) -> dict[str, Any]:
+    """A tool-calling response in Groq's shape, so the success path is reachable offline."""
+    return {
+        "id": "chatcmpl-test",
+        "model": "openai/gpt-oss-120b",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_test",
+                            "type": "function",
+                            "function": {
+                                "name": "record_classification",
+                                "arguments": arguments,
+                            },
+                        }
+                    ],
+                },
+            }
+        ],
+        "usage": {"prompt_tokens": 900, "completion_tokens": 60, "total_tokens": 960},
+    }
+
+
+async def test_a_successful_groq_call_logs_counts_and_not_the_ticket(
+    logs: LogRecorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The success path over the second vendor, watched by the same recorder.
+
+    Asserted for Groq and not just for Anthropic because the two modules hold separate
+    loggers, and a log call is a log call — the guarantee is about this codebase, not about
+    which vendor happens to be configured.
+    """
+    _install_groq(monkeypatch, body=_groq_completion(json.dumps(VALID_CLASSIFICATION)))
+
+    await ai_service.classify_ticket(_RecordingSession(), _context(), _request())
+
+    _assert_clean(logs)
+    assert "ai_call_succeeded" in logs.events
+    assert logs.events <= EXPECTED_EVENTS
+
+
+async def test_a_groq_failed_generation_neither_reaches_the_log_nor_the_reason(
+    logs: LogRecorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**The vendor-specific leak, and the reason this file watches a second module.**
+
+    Groq answers a tool call its schema rejected with HTTP 400 and a body carrying
+    `failed_generation`: the model's own attempt, which is derived from the customer's message
+    and can therefore contain it. The obvious implementation reads `error.message` into the
+    reason — it is right there, and it is the most informative-looking field in the body — and
+    that sentence then reaches a log aggregator, a retained log, and an operator's screen.
+
+    So the reason comes from an allowlist of codes this codebase named. This test is the one
+    that would fail if that ever became a passthrough.
+    """
+    _install_groq(
+        monkeypatch,
+        status_code=400,
+        body={
+            "error": {
+                "message": f"Failed to call a function. x-api-key={API_KEY}",
+                "type": "invalid_request_error",
+                "code": "tool_use_failed",
+                "failed_generation": f"{SUBJECT}\n\n{BODY}",
+            }
+        },
+    )
+
+    with pytest.raises(AIServiceError):
+        await ai_service.classify_ticket(_RecordingSession(), _context(), _request())
+
+    _assert_clean(logs)
+    text = logs.as_text()
+    # The positive control: the failure *was* reported, with our own wording for the code.
+    assert "ai_call_failed" in logs.events
+    assert "the model produced a tool call that did not match the schema" in text
+    assert "AIOutputError" in text
+    # And it cost one attempt: a 400 with a failed generation is reproducible, so retrying it
+    # three times would be §53's repeated-call waste with a schema error as the reason.
+    assert "ai_call_retrying" not in logs.events
+
+
+async def test_a_groq_transport_failure_is_clean_on_every_attempt(
+    logs: LogRecorder, no_waiting: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The retrying path over the second vendor.
+
+    httpx's own connection errors carry the request, and the request carries the
+    `Authorization` header this module put there — so `str(exc)` on this path is a credential
+    in a log line, which is exactly what `error_type=type(exc).__name__` is for.
+    """
+    _install_groq(monkeypatch, body={})
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(
+            f"Connection refused: header authorization=Bearer {API_KEY}", request=request
+        )
+
+    monkeypatch.setattr(groq, "_client", httpx.AsyncClient(transport=httpx.MockTransport(refuse)))
+
+    with pytest.raises(AIServiceError):
+        await ai_service.classify_ticket(_RecordingSession(), _context(), _request())
+
+    _assert_clean(logs)
+    assert "ai_call_retrying" in logs.events
+    assert "the provider could not be reached" in logs.as_text()
+
+
+# ---------------------------------------------------------------------------
 # The controls
 # ---------------------------------------------------------------------------
 
@@ -347,7 +500,7 @@ def test_every_ai_module_that_holds_a_logger_is_watched() -> None:
     worse than none, because it reads as coverage. This reads the two modules' own source
     and fails if one of them logs without being on the list.
     """
-    for module in (claude, ai_service):
+    for module in (claude, groq, ai_service):
         assert "logger." in inspect.getsource(module), (
             f"{module.__name__} no longer logs — remove it from AI_LOGGING_MODULES"
         )

@@ -1961,7 +1961,10 @@ beyond fencing: §24's grounding rules are RAG work. And no frontend, as in ever
 success criterion is that the backend is fully exercisable without it.
 
 **Cost.** One new runtime dependency (`anthropic`, pinned, and it ships `py.typed` so mypy `strict`
-needs no override — unlike boto3 and Celery), and `httpx` as a dev-only one for the SDK's transport.
+needs no override — unlike boto3 and Celery), and `httpx` as a dev-only one for the SDK's transport —
+which was right for this phase and wrong for the next one: httpx is the transport the second vendor
+uses directly, and the production image installs runtime dependencies only, so it moves to
+`dependencies` in ADR-028 rather than shipping an image where a provider raises `ImportError`.
 Seven settings to operate, all defaulted, and one of them (`AI_API_KEY`) is optional because every
 self-hosted installation that does not want AI starts without a key — the failure is loud at the
 point of use rather than at import, so a checkout with no key still runs the whole test suite. The
@@ -1984,14 +1987,232 @@ no earlier revision to restore from. The suite is 1209 tests, up from Phase S's 
 `alembic check` reports no new upgrade operations, which is the mechanical proof that this phase
 adds no table, column, or index.
 
-**The live end-to-end is the one claim this phase cannot make yet.**
-`scripts/phase_t_walkthrough.py` is written and its refusal path was exercised — with `AI_API_KEY`
-empty in `.env` the script prints what to add and exits `0`, and the API it needs starts cleanly
-with the new module in place — but the four real calls and the dashboard read-back it exists for
-**have not been run**, because the key this repository's `.env` is meant to hold is not in it. What
-the script would add is the two things no test in the suite can show: that a real model answers
-through `ai_service` today, and that the ledger and the endpoint agree across a process boundary.
+**The live end-to-end was outstanding when this phase closed, and ADR-028's follow-up discharged
+it.** `scripts/phase_t_walkthrough.py` was written here and its refusal path was exercised — with
+`AI_API_KEY` empty in `.env` the script prints what to add and exits `0`, and the API it needs
+starts cleanly with the new module in place — but the four real calls and the dashboard read-back it
+exists for had **not** been run, because the key this repository's `.env` is meant to hold was not in
+it. What the script adds is the two things no test in the suite can show: that a real model answers
+through `ai_service`, and that the ledger and the endpoint agree across a process boundary.
 Everything it asserts about the ledger's contents is asserted against a real database in
 `tests/integration/test_ai_usage_ledger.py`, and the endpoint's own behaviour is covered in
-`tests/api/test_analytics.py` — so the outstanding part is the provider, not the plumbing. It is
-recorded as outstanding rather than described as done.
+`tests/api/test_analytics.py` — so the outstanding part was the provider rather than the plumbing,
+exactly as recorded here rather than described as done. It ran a day later against a second vendor;
+ADR-028 carries the numbers.
+
+## ADR-028 — A second provider proves the boundary, and the rate table decides which model belongs to which vendor
+
+**Status:** accepted · Phase T follow-up
+
+**Context.** ADR-027 ended with a claim and no way to check it. *"A provider-agnostic interface"* is
+easy to assert when there is one real implementation, because a boundary with nothing on the other
+side is indistinguishable from a straight line. `ClaudeProvider` and `FakeProvider` were both written
+in the same phase by the same hand against the same assumptions, and the fake in particular was
+written *to* the interface rather than discovered through it. So when a second vendor became worth
+adding — a Groq key, free at the tier this project is deployed on — the question it actually answered
+was whether Phase T built an abstraction or a wrapper.
+
+Two things had to be true before any of it was written, and neither was.
+
+**The credential was in a committed file.** `.env` held the key correctly, and `.env.example` held the
+same live value — and `.gitignore` ends with `!.env.example`, so that file is tracked. `git status`
+listed it as modified: committing anything, including this change, would have published the key to the
+repository and to its history. `git log --all -S'gsk_'` and `git show HEAD:.env.example` both came
+back empty, which is the check that matters: because no commit had ever contained it, removing it from
+the working tree was sufficient and **no rotation was needed**. Had either returned a match, the key
+would have had to be revoked at Groq regardless of what was done to the working tree, since deleting a
+line does not delete a revision. It was removed with a regex substitution inside a process rather than
+through a command line, so the value never appeared in a shell, a log, or a transcript. A template
+file that ships in the repository carries `AI_API_KEY=` with no value; that is what it had before, and
+what `tests/unit/test_config.py` describes.
+
+**The configuration could not have worked.** `.env` had `AI_PROVIDER` unset — defaulting to
+`anthropic` — with `AI_MODEL=claude-sonnet-5`, so the first real call would have sent a `gsk_` key to
+Anthropic and been refused with a 401. The walkthrough would have ended at `failed_calls: 1` with zero
+successful calls: correct behaviour for a wrong key, and the wrong outcome for a right one.
+
+The key itself was confirmed live before any of this was planned around: `GET /openai/v1/models`
+returned 200, and a tool-calling probe of `openai/gpt-oss-120b` returned `finish_reason: tool_calls`
+with `arguments` parsing to exactly the shape `Classification` expects.
+
+**Decision 1 — a second vendor is one module, and nothing above it changed.** This is the decision the
+ADR exists to record, and the evidence is a diff rather than an argument. Adding Groq touched §17's
+protocol: no. §18's `validate_output`: no. The retry policy, the jittered backoff, the ledger's
+one-row-per-attempt rule, the error vocabulary, the fencing in `prompts.py`, `ai_service._run`: none of
+them. What was added is `app/ai/groq.py`, a `_PROVIDERS` entry in `ai_service`, and a rate table row.
+
+**The specific reason it cost nothing is worth stating, because it was not foresight.** An
+OpenAI-compatible API returns tool arguments as a JSON **string** under
+`tool_calls[0].function.arguments`, where the Anthropic SDK hands back a parsed object.
+`validate_output` has accepted a string, a mapping, or an instance since Phase T — written that way so
+`FakeProvider` could script an answer — and that tolerance is the whole of the compatibility. Had it
+been written for the Anthropic shape alone, this change would have needed a `json.loads` in the new
+module, which is §18 implemented a second time, which is the thing Decision 2 of ADR-027 forbids. A
+test asserts the string genuinely reaches the parser rather than being pre-parsed on the way in.
+
+**Decision 2 — the two schema helpers move to `provider.py`, so each vendor descends from one copy.**
+`_inline` and `_tool_schema` were `claude.py`'s. Both vendors ask their model to answer by calling a
+tool constrained by a JSON Schema, and they differ in how that schema is *enveloped* and in nothing
+else — the envelope is the vendor's (`"input_schema"` for Anthropic, `"parameters"` inside
+`{"type": "function", "function": …}` for Groq), the schema is not. Copying them would have produced
+two schemas that agree today and drift at the next enum member, so the helpers were promoted rather
+than duplicated. `provider.py`'s docstring says so at the place a reader would wonder why a
+provider-agnostic module knows what a tool schema looks like.
+
+**Decision 3 — the rate table gains a vendor column, and the pairing is refused at startup.**
+`ModelRate` gained a leading `provider: str`; `rate_for`, `cost_usd`, `is_priced` and `priced_models`
+kept their signatures, so every existing call site is untouched. `models_for(provider)` was added so
+an error message can say what to do and not only what was wrong.
+
+Then `Settings` grew a `model_validator` asserting `rate_for(AI_MODEL).provider == AI_PROVIDER`,
+skipped when the provider is `fake` (whose model is not in the table at all).
+
+**This is the check that would have caught the configuration described above, and it is why it
+exists.** A rejected credential sends its reader to look at the credential — they go and check a key
+that is perfectly good, regenerate it, and get the same 401. The mismatch is a fact about two settings
+that were never compared, so it is refused where both are in scope and the message can name them:
+
+    AI_MODEL='claude-sonnet-5' is served by 'anthropic', not by AI_PROVIDER='groq'.
+    Models for 'groq': openai/gpt-oss-120b
+
+`AI_API_KEY` stays a **single** setting rather than becoming one key per vendor, because it is the
+credential *for the configured provider*: a second variable would be a setting one of the two
+providers never reads, which is the rule this codebase applies everywhere else — a setting with no
+consumer is a guess with a name. Its shape differs by vendor (`sk-ant-…`, `gsk_…`) and that is
+documented in its comment and in `.env.example` rather than encoded as two fields.
+
+The default stays `anthropic`. A default is what a deployment gets when nobody decides, and the
+committed default should not be one machine's free-tier account.
+
+**Decision 4 — Groq answers a malformed generation with HTTP 400, and that is an output error.**
+`error.code == "tool_use_failed"` arrives with status 400, which the status table maps to
+`AIPermanentError`. The honest reading is *"the model produced an answer that does not match the
+schema"* — that is `AIOutputError`, and the distinction is not cosmetic: it is the difference between
+the ledger saying *the vendor refused us* and *the model answered badly*, which are different
+investigations. `_from_status` therefore checks the error code **before** the status code, and a test
+pins the ordering, because a later refactor that reordered those two branches would look harmless.
+
+The same body carries `failed_generation`: the model's own attempt, derived from the customer's
+message we sent it. So the reason string comes from a **small allowlist of known `error.code` values**
+— the same discipline as `_STATUS_REASONS` — and never from `error.message` or the raw body. §54's
+"no tokens in logs" and §18's "model output is untrusted data" both apply to text we *receive*, not
+only to text we send. The log-hygiene test constructs a 400 whose `failed_generation` is the
+customer's subject and body and whose `message` contains the key, and asserts neither survives.
+
+**Decision 5 — `reasoning_effort: "low"`, because a reasoning model's thinking is billed inside the
+ceiling.** `gpt-oss-120b` spends reasoning tokens from the same `max_completion_tokens` budget as its
+answer. At the default effort it can consume `AI_MAX_TOKENS` thinking and truncate before ever
+emitting the tool call — producing `finish_reason: "length"`, which is the failure mode that looks
+like a schema bug and is a configuration one. These are four narrow extraction tasks whose output is
+already constrained by the tool schema; there is nothing to reason about at length. This is recorded
+as a **vendor-specific tuning knob and not a general one**: it is set in `groq.py`'s request body, not
+in `Settings`, because it is a property of this model rather than a policy of this application.
+
+**Decision 6 — `Retry-After` is deliberately not honoured.** A 429 from a provider usually carries
+one, and honouring it is the convention. It is refused here because it belongs to the *vendor's*
+pacing and our retry budget belongs to the *caller's*: the whole sequence has to fit inside a request
+a person is waiting on, and on a free tier `Retry-After` is routinely longer than all three attempts
+combined. Blocking a support agent for sixty seconds is worse than failing fast and letting the caller
+decide what to show. Same reasoning as ADR-027 Decision 3's rejection of full jitter: the textbook
+answer is not the answer when a human is watching.
+
+**Decision 7 — `httpx` moves from dev to runtime.** It was a dev-only pin in Phase T, which was right
+then: the `anthropic` SDK pulled its own transport and httpx was there for tests. It is now the client
+`groq.py` imports directly, and `backend/Dockerfile`'s production stage installs runtime dependencies
+only — so leaving the pin where it was would have shipped an image where the Groq provider raises
+`ImportError` on its first call, in production, on the one path a test could not reach. The dev entry
+was deleted rather than duplicated, so the pin has one home. httpx ships `py.typed`, so mypy `strict`
+needs no override — unlike boto3 and Celery.
+
+**Decision 8 — `cost_usd` is a list price, and the free tier is why that has to be said out loud.**
+`AIUsage`'s docstring said the column records *"the price actually charged"*, and on Groq's free tier
+the price actually charged is zero — so either the column becomes uniformly zero, or it means
+something else. It means the **provider's published rate for the model at write time**, and the
+docstring now says so: a rate is a fact about the model, the invoice is a fact about the account, and
+what the ledger needs is the first one. The alternative was a cost panel that reads $0.00 forever on
+the plan a portfolio deployment actually runs on, which is exactly the *"hardcoded fake analytics"*
+§60 forbids wearing better clothes. `openai/gpt-oss-120b` is in the table at its published
+$0.15 / $0.60 per million tokens, read from Groq's model page with the date beside it, like every
+Anthropic row.
+
+**Decision 9 — the rejected answer is priced from the tokens it was billed, again.** This is ADR-027
+Decision 6 repeated in a second module rather than shared, and it is worth saying why it is not an
+abstraction. On the `AIOutputError` path the *exception* is the only thing that leaves the provider,
+so the token counts have to ride on it; `_structured` catches the rejection, re-raises with the counts
+it read off the response, and the ledger prices a full-length answer that was thrown away. The reason
+it is written twice is that the two modules read tokens from two different response shapes and there
+is no common place between the read and the raise. A test drives a `1.4` confidence through the real
+`GroqProvider` and asserts the row's cost equals `cost_usd` for the tokens it was billed.
+
+**What this deliberately does not do.** No new route, no Celery task, no `ai_analyses` row: §36's three
+AI endpoints are still Phases U, V, and W, and this changes no behaviour a client can observe except
+which vendor answers. No embedding provider: `EMBEDDING_MODEL` stays declared-and-unused for Phase X
+per ADR-008. **No third provider** — two implementations is what makes the boundary real, and three
+would be a plugin system nobody asked for. No rate limit on AI calls, per §45: still no endpoints. No
+provider-agnostic abstraction over the *response formats*: each module reads its own vendor's JSON,
+because a normalising layer would be a third schema that agrees with neither. And no `report_tasks.py`,
+which remains unbuilt.
+
+**Cost.** `httpx` promoted from dev to runtime, which is no new dependency at all — the pin only
+changed sections. One rate-table row and one `provider` column on `ModelRate`. One configuration
+validator, which is the first thing in this project that refuses a *combination* of settings rather
+than a value. Two vendor-specific translations (`tool_use_failed`, reasoning tokens inside the
+ceiling) that a generic OpenAI-compatible client would get wrong in ways that produce
+plausible-looking wrong answers rather than errors. And the standing cost of Decision 4: a provider's
+error body is untrusted input, so every future vendor module owes the same allowlist discipline rather
+than the obvious `error.message`.
+
+**Verification.** The suite is **1255 tests**, up from Phase T's 1209, all passing. `alembic check`
+reports *"No new upgrade operations detected"* — the mechanical proof that this adds no table, no
+column, and no index, which is what a change confined to the provider layer should look like. `ruff
+check`, `ruff format --check`, and `mypy app alembic` are clean across 113 source files.
+
+Four breaks were made deliberately, and each was confirmed to fail the test that covers it, because a
+test that cannot fail is not testing anything. Deleting the token re-attachment in `groq.py` failed
+`test_arguments_that_break_the_schema_are_refused_with_their_tokens` and nothing else. Mapping
+`tool_use_failed` by status instead of by code failed two. Removing the pairing validator from
+`Settings` failed two in `tests/unit/test_config.py`. Replacing the `error.code` allowlist with the raw
+`error` object failed five, including
+`test_a_groq_failed_generation_neither_reaches_the_log_nor_the_reason` — the one that matters, since it
+is the test that would catch a customer's own words arriving in a log line through a provider's error
+body. Each break was reverted and `groq.py` and `config.py` confirmed byte-identical to their backups.
+
+**The live end-to-end ran, and Phase T's outstanding claim is discharged.** `uvicorn` under
+`app.core.event_loop:loop_factory`, then `scripts/phase_t_walkthrough.py` against
+`openai/gpt-oss-120b`: four real calls answered, one deliberate permanent failure, and the dashboard
+read back over HTTP in another process. The script's own log, trimmed:
+
+    provider=groq model=openai/gpt-oss-120b
+    4 calls in 3.0s
+    classify said: 'Billing' / 'Duplicate Charge'
+    the call failed as intended: AIServiceError
+
+    operation         ok        in    out        cost      ms  provider/model
+    classify          no         0      0    0.000000     142  groq/openai/gpt-oss-120b
+    classify          yes      463     76    0.000115     692  groq/openai/gpt-oss-120b
+    sentiment         yes      347     54    0.000084     540  groq/openai/gpt-oss-120b
+    summarize         yes      463     74    0.000114     655  groq/openai/gpt-oss-120b
+    suggest_response  yes      591    138    0.000171     961  groq/openai/gpt-oss-120b
+
+    {'calls': 5, 'failed_calls': 1, 'prompt_tokens': 1864, 'completion_tokens': 357,
+     'cost_usd': '0.000493', ...}
+
+    **34 passed, 0 failed**
+
+Three things in that output are the point rather than the decoration. The **failed row carries zero
+tokens and zero cost** while still being a row — a 401 is refused before anything is generated, so the
+ledger records an attempt that cost nothing rather than omitting it, which is what makes
+`failed_calls` a count of attempts instead of a count of mistakes. The **latency column is real**
+(142–961 ms), which no test double can show. And the **second organization reads zeros** on every
+field while the first reads 0.000493, which is ADR-026's aggregate and §4's tenant isolation checked
+in the same request.
+
+**One pre-existing defect was found by running it, and it is not in this change.** The suite had been
+reading the developer's `.env` for two of its own premises: four tests assert an exact `cost_usd` whose
+figures are only true for `claude-sonnet-5`, and one of them pinned the provider's view of the model
+while the ledger priced from the ambient one. They were correct for exactly as long as every machine's
+`.env` said `claude-sonnet-5`, and failed the first time one said `openai/gpt-oss-120b` — a suite
+reporting on the reader's environment rather than on the code. `tests/conftest.py` now pins
+`AI_PROVIDER`/`AI_MODEL` to the committed defaults, as it already pins every other setting, and says
+why in the one block there that assigns rather than `setdefault`s. The model was always part of those
+tests' premise; now the tests state it.

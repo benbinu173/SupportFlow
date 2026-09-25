@@ -157,7 +157,10 @@ trigger (ticket created, or agent request)          ── plan: Phases U-W
 to a private `_run`: select the provider, call it with the client's timeout, retry a *transient*
 failure up to `AI_MAX_ATTEMPTS` with jittered backoff, validate the answer into its schema, and
 stage one `ai_usage` row for every attempt including the failed ones. The provider is chosen by
-`AI_PROVIDER`, and `app/ai/claude.py` is the only module in the project that imports a vendor SDK.
+`AI_PROVIDER`, and **each vendor gets exactly one module, which is the only thing in the project that
+imports its client** — `app/ai/claude.py` for the `anthropic` SDK and `app/ai/groq.py` for `httpx`.
+Two real vendors behind one interface is what makes the boundary checkable rather than asserted: the
+second one cost a module and changed nothing above it (ADR-028).
 
 Three invariants, and how each is held:
 

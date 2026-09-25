@@ -30,7 +30,7 @@ count.
 | Database | PostgreSQL 17 + pgvector |
 | Cache / messaging | Redis 8 |
 | Background jobs | Celery + beat |
-| AI | Provider-agnostic interface; Claude for generation, separate embedding provider |
+| AI | Provider-agnostic interface; Claude or Groq for generation, separate embedding provider |
 | Storage | S3-compatible (MinIO locally) |
 | Testing | pytest, Vitest, Testing Library |
 | Infrastructure | Docker Compose, GitHub Actions |
@@ -106,8 +106,8 @@ rather than falling back to something insecure.
 | `RATE_LIMIT_*` | Per-address login/registration limits and the per-user upload limit |
 | `JWT_SECRET` | Access-token signing; minimum 32 characters (required) |
 | `CORS_ORIGINS` | Comma-separated allowlist. No wildcard — the refresh cookie needs credentials |
-| `AI_API_KEY` | Generation provider credential (optional — an installation that does not want AI runs without one, and the first call is what says so) |
-| `AI_PROVIDER` / `AI_MODEL` | `anthropic` or `fake`; the fake is refused outside `ENVIRONMENT=test`. `AI_MODEL` must be a model `app/ai/pricing.py` can price, because the ledger computes cost at write time |
+| `AI_API_KEY` | Generation provider credential (optional — an installation that does not want AI runs without one, and the first call is what says so). Its shape follows the provider: `sk-ant-...` for Anthropic, `gsk_...` for Groq |
+| `AI_PROVIDER` / `AI_MODEL` | `anthropic`, `groq`, or `fake`; the fake is refused outside `ENVIRONMENT=test`. `AI_MODEL` must be a model `app/ai/pricing.py` can price *and* one the chosen provider actually serves — Groq's is `openai/gpt-oss-120b`. Startup refuses a mismatch, because a Groq key against `claude-sonnet-5` fails as a rejected credential and the key is not the problem |
 | `AI_MAX_TOKENS` / `AI_TIMEOUT_SECONDS` / `AI_MAX_ATTEMPTS` / `AI_RETRY_BACKOFF_SECONDS` | Output ceiling, per-call timeout, attempts per call, and the backoff base — see [AI](#ai) |
 | `S3_*` | Object storage for attachments |
 
@@ -1163,13 +1163,28 @@ there was anything to read (ADR-026).
 ### The provider boundary
 
 Application code depends on `AIProvider` — `classify_ticket`, `analyze_sentiment`,
-`summarize_conversation`, `generate_response` — and never on a vendor SDK.
-`app/ai/claude.py` is the only module in the project that imports one, the same boundary
-`app/core/storage.py` draws around boto3. Two implementations exist: the real one, which asks Claude
-for a **tool call** so the answer arrives as typed arguments rather than prose to be parsed, and a
-**scripted fake** that answers from a queue of outcomes. The fake is refused outside
-`ENVIRONMENT=test` by a config validator, not by a convention — §60 forbids fake AI results in the
-final implementation, and a validator is what holds that line.
+`summarize_conversation`, `generate_response` — and never on a vendor SDK. Each vendor gets exactly
+one module and that module is the only thing in the project that imports its client:
+`app/ai/claude.py` holds the `anthropic` SDK and `app/ai/groq.py` holds `httpx`, the same boundary
+`app/core/storage.py` draws around boto3. Three implementations exist behind the one interface — the
+two real vendors, each asking its model for a **tool call** so the answer arrives as typed arguments
+rather than prose to be parsed, and a **scripted fake** that answers from a queue of outcomes. The
+fake is refused outside `ENVIRONMENT=test` by a config validator, not by a convention — §60 forbids
+fake AI results in the final implementation, and a validator is what holds that line.
+
+**The second vendor cost one module and no machinery, which is the evidence the boundary is real.**
+§17's protocol, §18's `validate_output`, the retry policy, the ledger, and the error vocabulary are
+all unchanged by it. The reason is worth stating: an OpenAI-compatible API returns tool arguments as
+a JSON **string**, and `validate_output` has accepted strings since Phase T — written that way so the
+fake could script an answer — so the parse §18 requires was already in place. Adding a vendor only
+touched what is genuinely vendor-specific: which status code maps to which of the three error types,
+and two Groq behaviours a naive client gets wrong (ADR-028).
+
+`AI_PROVIDER` selects the implementation, and the choice is validated as a **pairing**: `AI_MODEL`
+must be a model that provider actually serves, checked against the rate table at startup. A `gsk_`
+key sent to `claude-sonnet-5` fails as a rejected credential, which sends the reader to check a key
+that is perfectly good — so the mismatch is refused where the message can name both halves and list
+what would work.
 
 **`generate_embedding` is deliberately not in the interface.** §17 lists five methods, and ADR-008
 puts embeddings behind the same interface with a *different* vendor. Declaring it now would give
@@ -1220,11 +1235,14 @@ exactly one place and the attempt count in the ledger means what it says.
 Every attempt writes a row into `ai_usage` — **including the ones that fail**, because a failed call
 consumed quota and may have been billed. That is why a retried call appears three times, and why
 `failed_calls` is a subset of `calls` rather than a complement. The row carries the provider's own
-token counts, its latency, whether it succeeded, and a `cost_usd` computed **at write time** from
-the published rate for that model: rates change, and a historical row has to keep the price that was
-actually charged. `AI_MODEL` is validated against that table at startup, so a model whose price is
-unknown cannot be configured at all — the alternative is a deployment quietly recording every call
-as free.
+token counts, its latency, whether it succeeded, and a `cost_usd` computed **at write time** from the
+published rate for that model: rates change, and a historical row has to keep the number it was
+recorded with. It is a list price rather than an invoice, deliberately — **Groq's free tier records
+the published rate too**, so the column keeps meaning "what these tokens are worth" instead of
+collapsing to zero for every row a free account writes, and the cost panel stays meaningful on the
+plan a portfolio deployment actually runs on. `AI_MODEL` is validated against that table at startup,
+so a model whose price is unknown cannot be configured at all — the alternative is a deployment
+quietly recording every call as free.
 
 **The caller commits, including after a failure.** `ai_service` stages rows and never commits,
 because it is called from inside a transaction a route or a task already owns. A caller that lets
@@ -1240,11 +1258,15 @@ ADR-027 (and below) rather than left as an oversight.
 
 ### Verifying it by hand
 
-    # the API, from backend/ (.env needs a real AI_API_KEY)
+    # the API, from backend/ (.env needs a real AI_API_KEY for the configured provider)
     .venv/Scripts/python.exe -m uvicorn app.main:app \
         --loop app.core.event_loop:loop_factory --port 8000
     # then, from backend/
     .venv/Scripts/python.exe scripts/phase_t_walkthrough.py
+
+The script works against either vendor, so a free Groq key is enough to run it — set
+`AI_PROVIDER=groq` and `AI_MODEL=openai/gpt-oss-120b` and the four real calls cost nothing, while the
+ledger records the published rate as described above.
 
 It registers two tenants, opens a ticket whose description contains an injected instruction and a
 forged closing fence, and drives the four operations through the real provider in one session — then
@@ -1606,7 +1628,7 @@ instead; see [Rate limiting](#rate-limiting).
   to whoever had it. That is a deliberate reading of `OPEN` as "nobody owns this", and
   the history is not lost: it is in `ticket_events`.
 - **The frontend has no screens for any of this.** Every phase since C has been
-  backend-only; the routes are exercised by 1092 tests and by a walkthrough script per phase, and
+  backend-only; the routes are exercised by the test suite and by a walkthrough script per phase, and
   the SPA still shows the Phase C scaffolding. Dashboards were the one screen the specification
   assigned to a phase and that phase (S) built the API and not the UI — §8's first success
   criterion is that the backend is exercisable without it, which is what

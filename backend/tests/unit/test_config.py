@@ -110,8 +110,16 @@ def test_the_upload_limit_is_on_by_default_and_tunable(monkeypatch: pytest.Monke
 
 
 @pytest.mark.unit
-def test_the_ai_provider_defaults_to_the_real_one() -> None:
-    """A default is what a deployment gets when nobody decides."""
+def test_the_ai_provider_defaults_to_the_real_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A default is what a deployment gets when nobody decides.
+
+    `conftest` pins this variable so the suite's cost figures do not move with a developer's
+    `.env`, and `_env_file=None` suppresses dotenv without touching the process environment —
+    so the default is only observable once the variable is unset explicitly. Same pattern and
+    same reason as `test_the_upload_limit_is_on_by_default_and_tunable` above.
+    """
+    monkeypatch.delenv("AI_PROVIDER", raising=False)
+
     assert _settings().AI_PROVIDER == "anthropic"
 
 
@@ -154,6 +162,53 @@ def test_an_unpriced_ai_model_is_refused() -> None:
 @pytest.mark.unit
 def test_a_priced_ai_model_is_accepted() -> None:
     assert _settings(AI_MODEL="claude-haiku-4-5-20251001").AI_MODEL == ("claude-haiku-4-5-20251001")
+
+
+@pytest.mark.unit
+def test_a_model_served_by_another_provider_is_refused() -> None:
+    """The check that turns a 401 into a startup error (ADR-028).
+
+    `claude-sonnet-5` *is* a priced model, so it passes the rate check above and then reaches
+    a Groq endpoint holding a Groq key — a request that fails with the provider rejecting a
+    credential which is in fact perfectly good. The reader of that error would go and check
+    their key, and the key is not the problem. So the pairing is refused here, where the
+    message can name both halves and list what would work instead.
+
+    This is not hypothetical: it is exactly the configuration that was in `.env` when the
+    Groq key was added, and it is why the failure was caught by reading rather than by a
+    500 from the first ticket.
+    """
+    with pytest.raises(
+        ValidationError, match="is served by 'anthropic', not by AI_PROVIDER='groq'"
+    ):
+        _settings(AI_PROVIDER="groq", AI_MODEL="claude-sonnet-5")
+
+
+@pytest.mark.unit
+def test_the_pairing_error_says_which_models_would_work() -> None:
+    """A validator that only reports the mismatch leaves the reader to find the rate table."""
+    with pytest.raises(ValidationError, match="openai/gpt-oss-120b"):
+        _settings(AI_PROVIDER="groq", AI_MODEL="claude-sonnet-5")
+
+
+@pytest.mark.unit
+def test_a_model_and_its_own_provider_are_accepted() -> None:
+    """The same pair, one field over — so the check is a pairing and not a ban on Groq."""
+    settings = _settings(AI_PROVIDER="groq", AI_MODEL="openai/gpt-oss-120b")
+
+    assert (settings.AI_PROVIDER, settings.AI_MODEL) == ("groq", "openai/gpt-oss-120b")
+
+
+@pytest.mark.unit
+def test_groq_is_still_optional_without_a_key() -> None:
+    """Selecting a provider is not the same as enabling AI, and the key stays optional.
+
+    A deployment that sets `AI_PROVIDER=groq` and has not yet obtained a key must still start:
+    the API is the thing that serves every other feature, and refusing to boot over an unused
+    AI credential would take the whole product down for a subsystem nobody has called. The
+    refusal belongs at the first call, which is where `app/ai/groq.py` puts it.
+    """
+    assert _settings(AI_PROVIDER="groq", AI_MODEL="openai/gpt-oss-120b").AI_API_KEY is None
 
 
 @pytest.mark.unit

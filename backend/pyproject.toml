@@ -19,6 +19,10 @@ dependencies = [
     "celery==5.6.3",
     "boto3==1.43.93",             # S3-compatible object storage for attachments
     "anthropic==1.6.0",           # ADR-008, ADR-027 — ships py.typed, so no mypy override
+    "httpx==0.28.1",              # ADR-028 — Groq's OpenAI-compatible API. A runtime
+                                  # dependency, not a dev one: Dockerfile's production stage
+                                  # installs runtime deps only, so a dev-only pin would ship an
+                                  # image where the provider raises ImportError on its first call
     "pyjwt[crypto]==2.13.0",       # ADR-002
     "pwdlib[argon2]==0.3.1",       # ADR-001
     "email-validator==2.3.0",      # required by pydantic.EmailStr
@@ -31,7 +35,6 @@ dev = [
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
     "pytest-cov==7.0.0",
-    "httpx==0.28.1",
     "ruff==0.15.1",
     "mypy==1.19.0",
 ]

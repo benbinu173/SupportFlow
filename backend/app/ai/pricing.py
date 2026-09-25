@@ -16,12 +16,29 @@ than as "unpriced" — a wrong number rather than a missing one, which is the wo
 Adding a model is therefore a code change, and that is the point: the rate has to come from
 somewhere, and this is where it is written down.
 
-**Prices are USD per million tokens**, as published. Source: Anthropic's model pricing page,
-<https://platform.claude.com/docs/en/about-claude/pricing>, read **2026-09-17**. Sonnet 5's
-$2/$10 was announced as introductory pricing through 2026-08-31 and that page now records it
-as standard — the scheduled increase did not happen. That is exactly the kind of change that
-would silently corrupt a running ledger if the rate were read from the provider at display
-time instead of recorded at write time.
+**Prices are USD per million tokens**, as published, from two sources. Anthropic's model
+pricing page, <https://platform.claude.com/docs/en/about-claude/pricing>, read **2026-09-17**
+— Sonnet 5's $2/$10 was announced as introductory pricing through 2026-08-31 and that page
+now records it as standard, so the scheduled increase did not happen. And Groq's model page,
+<https://console.groq.com/docs/model/openai/gpt-oss-120b>, read **2026-09-22**. That is
+exactly the kind of change that would silently corrupt a running ledger if the rate were read
+from the provider at display time instead of recorded at write time.
+
+**A rate names its provider, and that is load-bearing.** Before there were two vendors a model
+name was enough to identify a rate, because every name in the table belonged to the same one.
+With two, `AI_MODEL=claude-sonnet-5` beside `AI_PROVIDER=groq` is a *priced* model served by
+the *wrong* vendor — a pairing that passes a "do we know this rate?" check and then fails as a
+401 from a service that was never going to recognise the key. So `ModelRate` carries the vendor
+and `app/core/config.py` refuses a mismatch at startup, where the message can say what to
+change.
+
+**Groq's free tier bills nothing, and the number here is still its published rate.** The
+column answers "what did these tokens cost at the provider's published price", which is the
+question a cost dashboard is asked and the one that survives the tier changing underneath it.
+Recording zero because the account happens to be free would make every figure in the product
+$0.000000 — a number that is neither the charge nor the value, and therefore no use as either.
+The distinction is written down here because it is the kind of thing a reader is entitled to
+disagree with once they have seen it stated.
 
 **`Decimal` throughout, never `float`.** `cost_usd` is `Numeric(12, 6)` because it is money
 that gets summed over thousands of rows, and the third decimal place of a fraction of a cent
@@ -47,21 +64,27 @@ _SCALE = Decimal("0.000001")
 
 @dataclass(frozen=True)
 class ModelRate:
-    """One model's published price, per million tokens."""
+    """One model's published price, per million tokens, and the vendor that serves it."""
 
+    #: The `AI_PROVIDER` value that can serve this model. Config refuses a mismatch, so a
+    #: model and its vendor cannot be configured apart from each other.
+    provider: str
     input_per_mtok: Decimal
     output_per_mtok: Decimal
 
 
 # The models a support desk would plausibly configure. Not the full catalogue: a rate table
 # that lists models nobody can select is a maintenance burden with no consumer, which is the
-# same rule `Settings` follows about unused keys.
+# same rule `Settings` follows about unused keys. Groq is reachable with eleven models and
+# this table carries one of them, for the same reason — `openai/gpt-oss-120b` is the one whose
+# tool calling this project has actually verified.
 RATES: dict[str, ModelRate] = {
-    "claude-sonnet-5": ModelRate(Decimal("2"), Decimal("10")),
-    "claude-opus-5": ModelRate(Decimal("5"), Decimal("25")),
-    "claude-haiku-4-5-20251001": ModelRate(Decimal("1"), Decimal("5")),
-    "claude-fable-5-1": ModelRate(Decimal("10"), Decimal("50")),
-    "claude-fable-5": ModelRate(Decimal("10"), Decimal("50")),
+    "claude-sonnet-5": ModelRate("anthropic", Decimal("2"), Decimal("10")),
+    "claude-opus-5": ModelRate("anthropic", Decimal("5"), Decimal("25")),
+    "claude-haiku-4-5-20251001": ModelRate("anthropic", Decimal("1"), Decimal("5")),
+    "claude-fable-5-1": ModelRate("anthropic", Decimal("10"), Decimal("50")),
+    "claude-fable-5": ModelRate("anthropic", Decimal("10"), Decimal("50")),
+    "openai/gpt-oss-120b": ModelRate("groq", Decimal("0.15"), Decimal("0.60")),
 }
 
 
@@ -73,6 +96,16 @@ def is_priced(model: str) -> bool:
 def priced_models() -> tuple[str, ...]:
     """Every model that may be configured, for an error message that says what to do."""
     return tuple(sorted(RATES))
+
+
+def models_for(provider: str) -> tuple[str, ...]:
+    """Every model `provider` can serve, for the same reason and in the same voice.
+
+    Exists so the pairing check in `app/core/config.py` can answer "so what *should* I have
+    written?" — a validator that only reports the mismatch leaves the reader to find the rate
+    table, and on a first run that is the whole difficulty.
+    """
+    return tuple(sorted(model for model, rate in RATES.items() if rate.provider == provider))
 
 
 def rate_for(model: str) -> ModelRate:

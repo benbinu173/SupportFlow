@@ -24,7 +24,15 @@ from decimal import Decimal
 import pytest
 
 from app.ai.errors import AIPermanentError
-from app.ai.pricing import RATES, ModelRate, cost_usd, is_priced, priced_models, rate_for
+from app.ai.pricing import (
+    RATES,
+    ModelRate,
+    cost_usd,
+    is_priced,
+    models_for,
+    priced_models,
+    rate_for,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -59,6 +67,50 @@ def test_every_priced_model_has_a_positive_rate() -> None:
 def test_the_configured_default_model_is_priced() -> None:
     """`Settings.AI_MODEL` defaults to a model this table has to be able to price."""
     assert is_priced("claude-sonnet-5")
+
+
+def test_gpt_oss_120b_is_fifteen_and_sixty_per_million() -> None:
+    """Read from Groq's model page on 2026-09-22 (ADR-028).
+
+    Pinned for the reason the Sonnet 5 test above gives. Note that this is the *published*
+    rate and not what this project's account is billed: on Groq's free tier nothing is, and
+    `cost_usd` still records the published price so the column keeps meaning something. The
+    argument for that is in `app/ai/pricing.py`'s docstring, where a reader can disagree with
+    it; the consequence is that a dashboard's total is "what these tokens are worth", which is
+    what a cost panel is for.
+    """
+    rate = rate_for("openai/gpt-oss-120b")
+
+    assert (rate.input_per_mtok, rate.output_per_mtok) == (Decimal("0.15"), Decimal("0.60"))
+    assert rate.provider == "groq"
+
+
+def test_every_rate_names_a_provider_that_serves_it() -> None:
+    """The field exists so configuration can refuse a mismatch, which needs it to be right.
+
+    A row whose `provider` were wrong would let `AI_MODEL` and `AI_PROVIDER` disagree with a
+    clean bill of health from the pairing check — and the failure would reappear at the first
+    call, as a 401 from a vendor holding a key for somebody else, which is the exact confusion
+    the check was added to prevent.
+    """
+    for name, rate in RATES.items():
+        assert rate.provider in {"anthropic", "groq"}, name
+        assert name in models_for(rate.provider), name
+
+
+def test_models_for_partitions_the_table() -> None:
+    """Every priced model is reachable through exactly one provider, and none is orphaned."""
+    listed = [model for provider in ("anthropic", "groq") for model in models_for(provider)]
+
+    assert sorted(listed) == sorted(priced_models())
+    assert len(listed) == len(set(listed))
+
+
+def test_models_for_an_unknown_provider_is_empty() -> None:
+    """`Settings` uses this to say what *should* have been written; a provider with no models
+    is a case it has to survive, because that is what a `Literal` member added before its rate
+    would look like."""
+    assert models_for("nobody") == ()
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +155,9 @@ def test_a_half_is_rounded_away_from_zero(
     published prices — which is precisely why it is tested through a patched table rather
     than left to be discovered the day a promotional rate arrives.
     """
-    monkeypatch.setitem(RATES, "test-fractional", ModelRate(Decimal("0.5"), Decimal("0.5")))
+    monkeypatch.setitem(
+        RATES, "test-fractional", ModelRate("elsewhere", Decimal("0.5"), Decimal("0.5"))
+    )
 
     # 1 token at $0.5/MTok is 0.0000005 — a half at the seventh place.
     assert cost_usd("test-fractional", prompt_tokens=1, completion_tokens=0) == Decimal("0.000001")

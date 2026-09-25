@@ -17,9 +17,8 @@ the value**, and that the schema sent to the model carries no `$ref` for it to c
 import pytest
 from pydantic import BaseModel
 
-from app.ai.claude import _tool_schema
 from app.ai.errors import AIOutputError, AIPermanentError
-from app.ai.provider import validate_output
+from app.ai.provider import _tool_schema, validate_output
 from app.models.enums import Sentiment
 from app.schemas.ai import (
     Classification,

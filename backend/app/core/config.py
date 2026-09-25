@@ -9,7 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, PostgresDsn, RedisDsn, ValidationInfo, field_validator
+from pydantic import Field, PostgresDsn, RedisDsn, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Repo root: config.py → core → app → backend → root. The .env lives there so a
@@ -195,14 +195,23 @@ class Settings(BaseSettings):
     # Which implementation `app/ai/provider.py`'s protocol is bound to. A `Literal` rather
     # than a free string so a typo is an error at startup rather than a provider that
     # cannot be found at the first ticket.
-    AI_PROVIDER: Literal["anthropic", "fake"] = "anthropic"
+    #
+    # Two real vendors, and that is the point of the interface: Anthropic serves the
+    # `claude-*` models and Groq the `openai/*` one, and the pairing is checked below.
+    AI_PROVIDER: Literal["anthropic", "groq", "fake"] = "anthropic"
 
     # Optional, following the `SMTP_USERNAME`/`SMTP_PASSWORD` precedent rather than the
     # S3/JWT required-and-defaultless one. The difference is that AI is a feature a
     # deployment can simply not have: a checkout with no key should run the whole test
     # suite, and a self-hosted installation that does not want AI should start. So the
-    # key is absent-and-legal here, and `app/ai/claude.py` refuses to build a client
-    # without one — the failure is loud at the point of use rather than at import.
+    # key is absent-and-legal here, and the provider refuses to build a client without
+    # one — the failure is loud at the point of use rather than at import.
+    #
+    # **One key, not one per vendor.** It is the credential *for `AI_PROVIDER`*, and its
+    # shape follows from that: `sk-ant-…` for Anthropic, `gsk_…` for Groq. A second variable
+    # would be a setting one of the two providers never reads, which is the rule this file
+    # applies to every other unused key — and a deployment configures one provider at a time,
+    # so there is nothing a second variable would let it say.
     #
     # §4 forbids secrets in source and this is why it is read from the environment and
     # never logged; see `app/ai/claude.py` on why an SDK error's own message is not
@@ -212,7 +221,8 @@ class Settings(BaseSettings):
     # Validated against `app/ai/pricing.py`'s rate table below. A model whose published
     # price is not known cannot be configured at all, because the alternative is a ledger
     # full of `cost_usd = 0` rows that a dashboard renders as "free" — a wrong number
-    # rather than a missing one, which is the worse failure to debug.
+    # rather than a missing one, which is the worse failure to debug. The table also says
+    # which vendor serves each model, and that pairing is checked too — see below.
     AI_MODEL: str = "claude-sonnet-5"
 
     # One answer's ceiling. §20 summaries and §21 drafts are a few hundred tokens; 1024 is
@@ -339,6 +349,38 @@ class Settings(BaseSettings):
                 f"AI_MODEL={v!r} has no published rate. Priced models: {', '.join(priced_models())}"
             ) from exc
         return v
+
+    @model_validator(mode="after")
+    def _the_model_is_served_by_the_provider(self) -> "Settings":
+        """Refuse a model paired with a vendor that does not serve it.
+
+        **This is the check that turns a 401 into a startup error.** With one vendor, "is this
+        model priced?" was enough. With two, `AI_PROVIDER=groq` beside `AI_MODEL=claude-sonnet-5`
+        passes that check — the rate exists — and then fails at the first real call, as a
+        provider rejecting the key. The key was never the problem, and the message would have
+        sent its reader to check a credential that is perfectly good. A wrong model is a
+        configuration mistake, so it is reported by configuration, where the process refuses
+        to start at all.
+
+        Runs after the field validators, so `AI_MODEL` has already been proven priceable and
+        `rate_for` cannot raise here for the reason it exists.
+
+        The fake is exempt: it is reached only under `ENVIRONMENT=test`, it needs no vendor,
+        and a test asserting retry behaviour has no interest in which real model is configured.
+        """
+        from app.ai.pricing import models_for, rate_for
+
+        if self.AI_PROVIDER == "fake":
+            return self
+
+        served_by = rate_for(self.AI_MODEL).provider
+        if served_by != self.AI_PROVIDER:
+            raise ValueError(
+                f"AI_MODEL={self.AI_MODEL!r} is served by {served_by!r}, not by "
+                f"AI_PROVIDER={self.AI_PROVIDER!r}. Models for {self.AI_PROVIDER!r}: "
+                f"{', '.join(models_for(self.AI_PROVIDER)) or '<none>'}"
+            )
+        return self
 
     @property
     def refresh_cookie_path(self) -> str:
