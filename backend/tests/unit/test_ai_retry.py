@@ -25,11 +25,12 @@ from app.ai.errors import AIOutputError, AIPermanentError, AITransientError
 from app.ai.fake import FakeProvider
 from app.ai.pricing import cost_usd
 from app.ai.provider import AIRequest
+from app.core import event_loop
 from app.core.config import get_settings
 from app.core.exceptions import AIServiceError
-from app.core.tenancy import TenantContext
+from app.core.tenancy import TenantContext, WorkerContext
 from app.models.enums import AIOperation, UserRole
-from app.schemas.ai import SentimentResult
+from app.schemas.ai import Classification, SentimentResult
 from app.services import ai_service
 
 pytestmark = pytest.mark.unit
@@ -97,14 +98,19 @@ async def test_a_transient_error_is_retried_and_can_succeed(
         monkeypatch,
         FakeProvider(
             AITransientError("the provider rate-limited the request"),
-            {"category": "Billing", "subcategory": "Duplicate Charge", "confidence": 0.94},
+            {
+                "category": "Billing",
+                "subcategory": "Duplicate Charge",
+                "priority": "high",
+                "confidence": 0.94,
+            },
         ),
     )
     session = _RecordingSession()
 
     result = await ai_service.classify_ticket(session, _context(), _request())
 
-    assert result.category == "Billing"
+    assert result.value.category == "Billing"
     assert provider.calls == 2
     assert len(slept) == 1
 
@@ -243,7 +249,10 @@ def test_a_zero_backoff_configures_no_wait() -> None:
 async def test_a_successful_call_writes_one_row(
     monkeypatch: pytest.MonkeyPatch, slept: list[float]
 ) -> None:
-    _use(monkeypatch, FakeProvider({"category": "Billing", "confidence": 0.94}))
+    _use(
+        monkeypatch,
+        FakeProvider({"category": "Billing", "priority": "medium", "confidence": 0.94}),
+    )
     session = _RecordingSession()
     context = _context()
     ticket_id = uuid4()
@@ -269,13 +278,72 @@ async def test_the_tenant_comes_from_the_context_and_nowhere_else(
     tenant through even if it wanted to — which is the point of taking the context rather
     than an id.
     """
-    _use(monkeypatch, FakeProvider({"category": "Billing", "confidence": 0.9}))
+    _use(
+        monkeypatch,
+        FakeProvider({"category": "Billing", "priority": "medium", "confidence": 0.9}),
+    )
     session = _RecordingSession()
     context = _context()
 
     await ai_service.classify_ticket(session, context, _request())
 
     assert session.ledger[0].organization_id == context.organization_id
+
+
+async def test_a_worker_context_records_a_row_with_no_user(
+    monkeypatch: pytest.MonkeyPatch, slept: list[float]
+) -> None:
+    """The second kind of caller, and the ledger is where the difference is visible.
+
+    §18's analysis runs in a Celery task, which has no authenticated user and must not
+    invent one — `app/core/tenancy.py`'s `WorkerContext` is the type that says so, and
+    `_stage_usage` reads `user_id` conditionally rather than requiring the attribute.
+    `AIUsage.user_id`'s own comment anticipates the row: *"NULL when the system acted
+    rather than a person."*
+
+    The organization is still recorded, and that is the point of the context existing at
+    all: the spend belongs to a tenant even when no person made the call, and without it
+    `/analytics/overview` would report an AI cost no tenant could see.
+    """
+    _use(monkeypatch, FakeProvider({"category": "Billing", "priority": "low", "confidence": 0.9}))
+    session = _RecordingSession()
+    context = WorkerContext(organization_id=uuid4())
+
+    await ai_service.classify_ticket(session, context, _request())
+
+    row = session.ledger[0]
+    assert row.user_id is None
+    assert row.organization_id == context.organization_id
+
+
+async def test_the_result_carries_the_provider_token_counts(
+    monkeypatch: pytest.MonkeyPatch, slept: list[float]
+) -> None:
+    """Why the four functions return `AIResult[T]` and not `T`.
+
+    `ai_analyses.prompt_tokens` and `completion_tokens` are declared columns, and the only
+    object that knows them is the provider's result — which `_run` used to unwrap and
+    discard. Re-querying the `ai_usage` row the service just staged would read the ledger to
+    learn something the service was already holding, and would return the wrong number the
+    moment a call was retried: the ledger has a row per attempt, and the analysis has one
+    per operation.
+
+    The `value` is the validated model, unchanged — the counts ride alongside it rather than
+    wrapping it, so every existing caller reads one attribute further and nothing else.
+    """
+    _use(
+        monkeypatch,
+        FakeProvider(
+            {"category": "Billing", "priority": "medium", "confidence": 0.9},
+            prompt_tokens=1_337,
+            completion_tokens=42,
+        ),
+    )
+
+    result = await ai_service.classify_ticket(_RecordingSession(), _context(), _request())
+
+    assert (result.prompt_tokens, result.completion_tokens) == (1_337, 42)
+    assert isinstance(result.value, Classification)
 
 
 async def test_every_attempt_is_recorded_including_the_failures(
@@ -290,7 +358,7 @@ async def test_every_attempt_is_recorded_including_the_failures(
         monkeypatch,
         FakeProvider(
             AITransientError("the provider could not be reached"),
-            {"category": "Billing", "confidence": 0.9},
+            {"category": "Billing", "priority": "medium", "confidence": 0.9},
         ),
     )
 
@@ -339,7 +407,7 @@ async def test_the_row_is_priced_from_the_model_not_left_at_zero(
     _use(
         monkeypatch,
         FakeProvider(
-            {"category": "Billing", "confidence": 0.9},
+            {"category": "Billing", "priority": "medium", "confidence": 0.9},
             prompt_tokens=2_000,
             completion_tokens=500,
         ),
@@ -357,7 +425,10 @@ async def test_the_row_is_never_marked_cached(
     monkeypatch: pytest.MonkeyPatch, slept: list[float]
 ) -> None:
     """Phase T has no AI cache; claiming one would corrupt the measurement it exists for."""
-    _use(monkeypatch, FakeProvider({"category": "Billing", "confidence": 0.9}))
+    _use(
+        monkeypatch,
+        FakeProvider({"category": "Billing", "priority": "medium", "confidence": 0.9}),
+    )
     session = _RecordingSession()
 
     await ai_service.classify_ticket(session, _context(), _request())
@@ -374,7 +445,7 @@ async def test_each_operation_records_its_own_name(
 
     result = await ai_service.analyze_sentiment(session, _context(), _request())
 
-    assert isinstance(result, SentimentResult)
+    assert isinstance(result.value, SentimentResult)
     assert session.ledger[0].operation is AIOperation.SENTIMENT
     assert provider.calls == 1
 
@@ -387,7 +458,7 @@ async def test_latency_is_recorded_for_every_attempt(
         monkeypatch,
         FakeProvider(
             AITransientError("the provider did not answer within the timeout"),
-            {"category": "Billing", "confidence": 0.9},
+            {"category": "Billing", "priority": "medium", "confidence": 0.9},
         ),
     )
     session = _RecordingSession()
@@ -406,7 +477,7 @@ async def test_the_provider_token_counts_are_what_reaches_the_ledger(
     _use(
         monkeypatch,
         FakeProvider(
-            {"category": "Billing", "confidence": 0.9},
+            {"category": "Billing", "priority": "medium", "confidence": 0.9},
             prompt_tokens=1_337,
             completion_tokens=42,
         ),
@@ -428,7 +499,10 @@ async def test_the_request_reaches_the_provider_fenced(
     fencing has exactly one implementation, in the provider, where it cannot be forgotten
     or applied twice.
     """
-    provider = _use(monkeypatch, FakeProvider({"category": "Billing", "confidence": 0.9}))
+    provider = _use(
+        monkeypatch,
+        FakeProvider({"category": "Billing", "priority": "medium", "confidence": 0.9}),
+    )
     request = _request()
 
     await ai_service.classify_ticket(_RecordingSession(), _context(), request)
@@ -465,6 +539,41 @@ def test_the_sdk_retries_are_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     assert built["max_retries"] == 0
     assert built["timeout"] == 30.0
     assert claude.ClaudeProvider().name == "anthropic"
+
+
+# ---------------------------------------------------------------------------
+# The client the vendor SDK is handed
+# ---------------------------------------------------------------------------
+
+
+def test_the_shared_client_is_rebuilt_when_it_is_on_a_loop_that_has_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same trap `test_ai_groq.py` pins for HTTP, through the SDK's own client.
+
+    `AsyncAnthropic` owns an `httpx` pool underneath it, so it is loop-bound for the same
+    reason, and `event_loop.run` closes the loop it built as each Celery task returns. Both
+    vendors have to key their cache on the loop or the second analysis a worker is handed
+    fails on a connection whose loop is gone.
+    """
+    from app.ai import claude
+
+    monkeypatch.setattr(claude, "_client", None)
+    monkeypatch.setattr(claude, "_client_loop", None)
+    monkeypatch.setattr(
+        claude,
+        "get_settings",
+        lambda: SimpleNamespace(AI_API_KEY="test-key", AI_TIMEOUT_SECONDS=30.0),
+    )
+
+    async def twice() -> tuple[Any, Any]:
+        return claude._shared_client(), claude._shared_client()
+
+    first, same = event_loop.run(twice())
+    second, _ = event_loop.run(twice())
+
+    assert first is same, "a client is still reused within one loop"
+    assert first is not second, "and not across two, the first of which is now closed"
 
 
 def test_a_missing_key_fails_at_the_point_of_use_and_not_at_import(
@@ -553,7 +662,7 @@ async def test_a_rejected_answer_is_priced_from_the_tokens_it_was_billed(
     number rather than a missing one, and it is invisible in a suite that only ever
     scripts `AIOutputError` directly.
     """
-    payload = {"category": "Billing", "confidence": "very sure"}
+    payload = {"category": "Billing", "priority": "medium", "confidence": "very sure"}
     _claude_saying(monkeypatch, _tool_use(payload, input_tokens=4_242, output_tokens=311))
     session = _RecordingSession()
 

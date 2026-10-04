@@ -41,12 +41,12 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
-# Two queues now, each named for its purpose. §51's Phase P asks for "task routing", and
+# Three queues now, each named for its purpose. §51's Phase P asks for "task routing", and
 # the route table's entries are what makes each destination explicit instead of relying on
 # the default queue's name — and the line that changes when the next producer arrives. The
-# queues that will join them are `ai` (Phases T-W), `reports` (S), and `knowledge` (X) —
-# none of which is declared here, because declaring a queue nothing publishes to is a
-# worker process waiting for work that does not exist.
+# queues that will join them are `reports` (S) and `knowledge` (X) — neither of which is
+# declared here, because declaring a queue nothing publishes to is a worker process waiting
+# for work that does not exist. `ai` was on that list from Phase P until Phase U produced it.
 NOTIFICATIONS_QUEUE = "notifications"
 
 # Phase Q. Separate from `notifications` because the two have nothing in common: one holds
@@ -56,14 +56,25 @@ NOTIFICATIONS_QUEUE = "notifications"
 # other's problem.
 SLA_QUEUE = "sla"
 
+# Phase U. Separate from both for the third version of the same argument: an analysis waits
+# on an HTTP call to a language model, which is slow in a way neither a database write nor
+# the sweep is, and a provider having a bad afternoon must not delay an SLA breach alert or
+# sit in front of an email. It is also the queue a deployment is most likely to want scaled
+# or paused independently — analysis is the part of this system that costs money per call.
+AI_QUEUE = "ai"
+
 celery_app = Celery(
     "supportflow",
     broker=str(settings.CELERY_BROKER_URL),
     backend=str(settings.CELERY_RESULT_BACKEND),
-    # Both task modules, for the reason the docstring gives: a module that is not imported
+    # Every task module, for the reason the docstring gives: a module that is not imported
     # is not in the registry, and every message for it fails as `Received unregistered
     # task`, which reads like a broker fault.
-    include=["app.workers.email_tasks", "app.workers.sla_tasks"],
+    include=[
+        "app.workers.email_tasks",
+        "app.workers.sla_tasks",
+        "app.workers.ai_tasks",
+    ],
 )
 
 celery_app.conf.update(
@@ -119,6 +130,7 @@ celery_app.conf.update(
     task_routes={
         "app.workers.email_tasks.*": {"queue": NOTIFICATIONS_QUEUE},
         "app.workers.sla_tasks.*": {"queue": SLA_QUEUE},
+        "app.workers.ai_tasks.*": {"queue": AI_QUEUE},
     },
     # --- Schedule -----------------------------------------------------------
     # Beat's whole configuration, and the first entry this project has ever had: Phase P

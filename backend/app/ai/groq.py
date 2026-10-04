@@ -41,6 +41,7 @@ would turn a fast, honest failure into a hung request. The failure is translated
 and `ai_service` retries on its own schedule, which is the one place that decision belongs.
 """
 
+import asyncio
 from collections.abc import Mapping
 from typing import Any
 
@@ -52,6 +53,7 @@ from app.ai.errors import AIError, AIOutputError, AIPermanentError, AITransientE
 from app.ai.prompts import as_untrusted
 from app.ai.provider import AIRequest, AIResult, _tool_schema, validate_output
 from app.core.config import get_settings
+from app.core.event_loop import current_loop
 from app.schemas.ai import (
     Classification,
     ConversationSummary,
@@ -106,9 +108,20 @@ _REASONING_EFFORT = "low"
 
 _client: "httpx.AsyncClient | None" = None
 
+#: The loop `_client` was built on, or `None` when this process did not build it.
+#:
+#: An `httpx` client owns a connection pool bound to the loop that created it, and
+#: `event_loop.run` builds **and closes** a loop per Celery task — so a client cached across
+#: two tasks is a client whose pool points at a loop that no longer exists, and the failure
+#: arrives as `RuntimeError('Event loop is closed')` from inside the transport the first time
+#: the second task sends. `None` is the case where a test swapped `_client` for a double: a
+#: client this module did not build is not this module's to discard, and the check below skips
+#: it rather than throwing the double away.
+_client_loop: "asyncio.AbstractEventLoop | None" = None
+
 
 def _shared_client() -> "httpx.AsyncClient":
-    """The process-wide client, built on first use.
+    """The client for the running loop, built on first use on that loop.
 
     Lazy rather than module-level, for the reason `claude.py` gives: importing this module
     must not require a key to exist, or every checkout without one breaks at import. The key
@@ -117,8 +130,23 @@ def _shared_client() -> "httpx.AsyncClient":
 
     The credential goes on the client, not on each request, so the key is touched in exactly
     one place in this module and cannot be logged by a request-building path.
+
+    **The client belongs to a loop, not to the process.** It is cached per loop rather than
+    globally because the process that calls this most often is a Celery worker, where
+    `app/core/event_loop.run` builds a loop for each task and closes it when the task
+    returns. A stale client is *dropped* rather than `aclose()`d — closing it would need the
+    loop it was built on, which is the thing that is gone. `app/core/redis.py`'s
+    `scoped_client` exists for this same trap and says the same thing about a Redis pool.
     """
-    global _client
+    global _client, _client_loop
+    running = current_loop()
+    if (
+        running is not None
+        and _client is not None
+        and _client_loop is not None
+        and _client_loop is not running
+    ):
+        _client = None
     if _client is None:
         settings = get_settings()
         if not settings.AI_API_KEY:
@@ -129,13 +157,15 @@ def _shared_client() -> "httpx.AsyncClient":
             # nothing here that could quietly multiply the policy `ai_service` owns.
             timeout=settings.AI_TIMEOUT_SECONDS,
         )
+        _client_loop = running
     return _client
 
 
 def reset_client() -> None:
     """Drop the cached client. Called on shutdown, and by tests that repoint the provider."""
-    global _client
+    global _client, _client_loop
     _client = None
+    _client_loop = None
 
 
 def _as_mapping(value: object) -> Mapping[str, Any]:

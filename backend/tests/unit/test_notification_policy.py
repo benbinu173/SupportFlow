@@ -28,9 +28,8 @@ from app.models.ticket import Ticket
 from app.models.ticket_event import TicketEvent
 from app.services import notification_service
 from app.services.notification_service import (
-    DEFERRED_EVENT_TYPES,
-    SCHEDULED_EVENT_TYPES,
     SILENT_EVENT_TYPES,
+    WORKER_EVENT_TYPES,
 )
 
 pytestmark = pytest.mark.unit
@@ -156,7 +155,7 @@ _HANDLED_EVENT_TYPES = frozenset(
 )
 
 
-def test_every_event_type_is_notified_deliberately_silent_deferred_or_scheduled() -> None:
+def test_every_event_type_is_notified_silent_or_worker_produced() -> None:
     """No event type may be undecided.
 
     The failure this catches is a future phase adding a `TicketEventType` and nobody asking
@@ -166,30 +165,26 @@ def test_every_event_type_is_notified_deliberately_silent_deferred_or_scheduled(
 
     This test is not hypothetical. Written against a two-way split it failed, and the three
     types it named — `SLA_WARNING`, `SLA_BREACHED`, and `AI_ANALYSIS_COMPLETED` — were
-    exactly the ones the policy had left undecided. Two of those three were Phase Q's, and
-    this is the test Phase Q came back to: `SCHEDULED_EVENT_TYPES` is the fourth set, and
-    it exists because "a request produces this" and "a clock produces this" are different
-    answers to "who sends it" even though both send.
+    exactly the ones the policy had left undecided. Phase Q added `SCHEDULED_EVENT_TYPES`
+    for the first two; Phase U moved `AI_ANALYSIS_COMPLETED` in beside them and **deleted**
+    `DEFERRED_EVENT_TYPES`, which had been the set holding it, because a set with no
+    members is a decision that has been made rather than one waiting to be.
 
-    Four sets, not two, because "we chose not to notify", "we cannot yet", and "the
-    scheduler will" are three different things to find in the code six months from now.
-    Equality in both directions, like the route allowlists: a type removed from the enum
-    leaves a stale entry, which would excuse a new type reusing the name.
+    Three sets, not four, and each means something different: "we chose not to notify",
+    "a worker sends this and no request can". Equality in both directions, like the route
+    allowlists: a type removed from the enum leaves a stale entry, which would excuse a new
+    type reusing the name.
     """
     handled = _HANDLED_EVENT_TYPES
     silent = SILENT_EVENT_TYPES
-    deferred = DEFERRED_EVENT_TYPES
-    scheduled = SCHEDULED_EVENT_TYPES
+    worker = WORKER_EVENT_TYPES
 
-    assert handled | silent | deferred | scheduled == set(TicketEventType)
+    assert handled | silent | worker == set(TicketEventType)
     # Pairwise disjoint, so no type is in two sets and the union above is a partition
     # rather than a cover that happens to add up.
     assert not handled & silent
-    assert not handled & deferred
-    assert not handled & scheduled
-    assert not silent & deferred
-    assert not silent & scheduled
-    assert not deferred & scheduled
+    assert not handled & worker
+    assert not silent & worker
 
 
 @pytest.mark.parametrize("event_type", sorted(SILENT_EVENT_TYPES))
@@ -204,37 +199,26 @@ async def test_a_silent_event_notifies_nobody(event_type: TicketEventType) -> No
     assert await _notify(ticket, _event(event_type)) == []
 
 
-@pytest.mark.parametrize("event_type", sorted(DEFERRED_EVENT_TYPES))
-async def test_a_deferred_event_notifies_nobody_yet(event_type: TicketEventType) -> None:
-    """The deferred types are quiet today, and this is the test that keeps needing changing.
-
-    Phase Q moved `SLA_WARNING` out of this parametrization and into the scheduled set
-    below; `AI_ANALYSIS_COMPLETED` is what remains, and Phases T-W will move it the same
-    way — at which point a case has to be written for its recipient. That is the intended
-    friction: the recipient of an event nobody produces yet is a decision, not a default.
-    """
-    ticket = _ticket(assigned_agent_id=uuid.uuid4())
-
-    assert await _notify(ticket, _event(event_type)) == []
-
-
-@pytest.mark.parametrize("event_type", sorted(SCHEDULED_EVENT_TYPES))
-async def test_a_scheduled_event_notifies_nobody_from_a_request(
+@pytest.mark.parametrize("event_type", sorted(WORKER_EVENT_TYPES))
+async def test_a_worker_produced_event_notifies_nobody_from_a_request(
     event_type: TicketEventType,
 ) -> None:
-    """An SLA alert is sent by the sweep, never by a request that produced the event.
+    """A worker's event is sent by the worker, never by a request that produced the event.
 
-    The early return in `notify_for_event` is unreachable today — `sla_tasks` is the only
-    writer of these two event types and it calls `notify_sla_alert` — and this asserts the
-    behaviour that makes it safe if that ever stops being true. Without it, a request that
-    somehow produced an SLA event would stage a second set of alerts alongside the sweep's:
-    duplicate notifications are the failure that makes people stop reading them, and the
-    guard is one line.
+    The two SLA types are written by the sweep and the analysis by the queued task; each
+    calls its own staging function (`notify_sla_alert`, `notify_analysis_completed`) rather
+    than this one, because none of the three has a request and this function's job is to
+    filter the actor out of their own alert and read the event a caller just produced.
 
-    **The absence of a producer here is also the assertion**, which is why this is
-    parametrized over the set and asserts against `_NoDatabase`: a request path that
-    reached staging for one of these would have to resolve a recipient, and there is no
-    recipient of an SLA alert inside a request that could be resolved from a loaded column.
+    The early return below is unreachable today and this asserts the behaviour that makes it
+    safe if that ever stops being true. Without it, a request that somehow produced one of
+    these would stage a second set of alerts alongside the worker's: duplicate notifications
+    are the failure that makes people stop reading them, and the guard is one line.
+
+    **The absence of a producer on the request path is also the assertion**, which is why
+    this asserts against `_NoDatabase`: a request path that reached staging for one of these
+    would have to resolve a recipient, and there is no recipient of an SLA alert or of an
+    analysis completion inside a request that could be resolved from a loaded column.
     """
     ticket = _ticket(assigned_agent_id=uuid.uuid4())
 
@@ -439,3 +423,69 @@ async def test_the_body_fits_the_column_for_the_longest_subject_allowed() -> Non
 
     assert len(staged[0].body) <= 1000
     assert len(staged[0].title) <= 200
+
+
+# ---------------------------------------------------------------------------
+# The analysis, which no request produces
+# ---------------------------------------------------------------------------
+
+
+async def test_an_analysis_notifies_the_assigned_agent() -> None:
+    """§26's "AI analysis completed", addressed to whoever will review it.
+
+    §41 is why it is the agent and not the customer: model output is reviewed by a person
+    before a customer sees any of it, so "the analysis is ready" is an alert to the
+    reviewer. A notification addressed to the customer would be the first step of the
+    automatic send §21 forbids.
+    """
+    agent_id = uuid.uuid4()
+    ticket = _ticket(assigned_agent_id=agent_id, status=TicketStatus.IN_PROGRESS)
+
+    staged = await notification_service.notify_analysis_completed(
+        cast("Any", _NoDatabase()), organization_id=ticket.organization_id, ticket=ticket
+    )
+
+    assert len(staged) == 1
+    notification = staged[0]
+    assert notification.user_id == agent_id
+    assert notification.notification_type is NotificationType.AI_ANALYSIS_COMPLETED
+    assert notification.ticket_id == ticket.id
+    # The tenant passed in and not read off the ticket, matching `notify_sla_alert`: a
+    # worker's rows are stamped with the organization the task was handed, so a ticket
+    # object built from a stale snapshot cannot move the notification to another tenant.
+    assert notification.organization_id == ticket.organization_id
+
+
+async def test_an_analysis_of_an_unassigned_ticket_notifies_nobody() -> None:
+    """Nobody is working it, so there is no one person to alert.
+
+    The same reading `test_a_customer_reply_on_an_unassigned_ticket_notifies_nobody` makes,
+    and the narrower choice of the two available. `notify_sla_alert` widens to managers
+    because an SLA deadline on an unclaimed ticket is the manager's problem; an analysis of
+    one is not urgent at all — the result is sitting on the ticket for whoever takes it
+    next. Widening here would turn every auto-analyzed ticket in the queue into a
+    notification for every manager, which is how §26's list stops being read.
+    """
+    ticket = _ticket(assigned_agent_id=None, status=TicketStatus.OPEN)
+
+    staged = await notification_service.notify_analysis_completed(
+        cast("Any", _NoDatabase()), organization_id=ticket.organization_id, ticket=ticket
+    )
+
+    assert staged == []
+
+
+async def test_the_analysis_title_says_what_it_is() -> None:
+    """§41's "distinguish AI output", applied to the alert itself.
+
+    A title that said only "ticket updated" would make the reader open the ticket to find
+    out what happened, which is the work the notification existed to save them.
+    """
+    ticket = _ticket(assigned_agent_id=uuid.uuid4(), number=1042, subject="Printer on fire")
+
+    staged = await notification_service.notify_analysis_completed(
+        cast("Any", _NoDatabase()), organization_id=ticket.organization_id, ticket=ticket
+    )
+
+    assert "AI" in staged[0].title
+    assert staged[0].body == "#1042 - Printer on fire"

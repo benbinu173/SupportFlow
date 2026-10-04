@@ -261,14 +261,18 @@ def test_there_are_routes_to_check(api: FastAPI) -> None:
     not measure. The socket is counted by
     `test_the_walk_finds_the_websocket_routes` instead.
 
-    **Phase S is the first phase to move it in a while**, and it earns the move the same
+    **Phase S was the first phase in a while to move it**, and it earned the move the same
     way the router mounts above did: five routes, one whole resource area, every one of
     them guarded by a capability this file does not have to name because the walk finds
-    it. Raised to 33, keeping the ten-route margin below the real total that makes a
+    it. Raised to 33 there, keeping the ten-route margin below the real total that makes a
     failure here mean "the walk stopped finding things" rather than "a phase added a
     route".
+
+    **Phase U moved it by two**, which is the smallest step it has taken and the right one:
+    the AI area is two routes rather than a resource, and the floor moves with the surface
+    it measures. The margin below the real total is what it has always been.
     """
-    assert len(_entries(api)) >= 33
+    assert len(_entries(api)) >= 35
 
 
 def test_the_walk_finds_every_documented_route(api: FastAPI) -> None:
@@ -600,6 +604,24 @@ def test_every_route_declares_the_capability_the_matrix_assigns(api: FastAPI) ->
         ("GET", "/api/v1/tickets/{ticket_id}/messages"): {Permission.MESSAGE_READ_PUBLIC},
         ("POST", "/api/v1/tickets/{ticket_id}/messages"): {Permission.MESSAGE_POST_REPLY},
         ("POST", "/api/v1/tickets/{ticket_id}/notes"): {Permission.MESSAGE_POST_INTERNAL},
+        # --- AI -----------------------------------------------------------
+        # Two routes, one capability, and **neither is `TICKET_VIEW`**. §3 gives customers
+        # no AI access at all, so guarding these with the ticket read capability — the
+        # obvious choice, since that is what they hang off — would hand a portal caller
+        # the analysis of their own ticket, including `error_message`, whose column
+        # comment reads "surfaced to staff, never to customers: upstream errors can echo
+        # prompt content." `AI_REQUEST_ANALYSIS` gates asking and reading both, which is
+        # the same reading `/customers/{id}` → `CUSTOMER_LIST` takes above.
+        #
+        # Under `/tickets/{ticket_id}` rather than at an `/ai` root, because an analysis
+        # has no independent existence: it is reachable exactly when its ticket is
+        # (ADR-015), and there is no `/ai/analyses/{id}` to give an id to guess.
+        #
+        # The write route is the one route in this dict carrying a second dependency —
+        # `limit_ai`, §45's per-user AI limit. It declares no capability, which is why it
+        # does not appear in the set below: a rate limit is not an authorization.
+        ("POST", "/api/v1/tickets/{ticket_id}/ai/analyze"): {Permission.AI_REQUEST_ANALYSIS},
+        ("GET", "/api/v1/tickets/{ticket_id}/ai/analyses"): {Permission.AI_REQUEST_ANALYSIS},
         # --- Attachments --------------------------------------------------
         # Listing takes `ATTACHMENT_DOWNLOAD` rather than a capability of its own: §3's
         # matrix has no "list attachments" row, and a metadata list is only useful to

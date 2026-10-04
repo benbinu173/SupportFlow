@@ -1,8 +1,9 @@
 """Rate limiting — Redis fixed-window counters.
 
 Guards the endpoints where guessing is the attack: login (credential stuffing),
-registration (account-farm creation), and upload (one account filling the bucket).
-Spec §45 requires the controls, §46 requires the 429 path be tested.
+registration (account-farm creation), upload (one account filling the bucket), and the
+AI endpoints (one account spending the tenant's budget a call at a time). Spec §45
+requires the controls, §46 requires the 429 path be tested.
 
 **This limiter fails open, deliberately.** If Redis is unreachable the request is
 allowed and a warning is logged. Rate limiting is an abuse control, not an
@@ -122,3 +123,19 @@ def upload_rate_limit_key(user_id: uuid.UUID) -> str:
     avoidable rather than forced, because the identity exists.
     """
     return f"ratelimit:upload:{user_id}"
+
+
+def ai_rate_limit_key(user_id: uuid.UUID) -> str:
+    """Redis key for the analysis limiter, per *user*.
+
+    The same key as the upload limiter and for the same reason, with the cost moved from
+    the bucket to the invoice. §45 names "AI endpoints" and this is the one that spends:
+    every request that reaches the counter can become a provider call, and a provider call
+    is billed per token. Counting the address instead would reproduce ADR-014's cost #2 —
+    a shared NAT throttling everyone behind it — and, worse, would let one tenant's heavy
+    user be limited by another tenant's, since nothing here partitions by organization.
+
+    Per user is also the only key that makes the log line actionable: `rate_limited` with
+    a user id names an account somebody can ask about.
+    """
+    return f"ratelimit:ai:{user_id}"

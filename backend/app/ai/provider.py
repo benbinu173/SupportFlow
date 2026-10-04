@@ -161,8 +161,9 @@ def _inline(node: Any, defs: dict[str, Any]) -> Any:
     Pydantic emits a non-primitive field as `{"$ref": "#/$defs/Sentiment"}` beside a
     `$defs` block, and the tool schema actually sent to the provider should contain
     neither: the schema is read by a model as much as by a validator, and an indirection
-    it has to chase is one more thing to get wrong. Our `Sentiment` field is the only
-    `$ref` the four schemas have, at one level of nesting.
+    it has to chase is one more thing to get wrong. Two of the four schemas carry such a
+    field — `SentimentResult.sentiment` and, since Phase U, `Classification.priority` —
+    each at one level of nesting.
 
     A self-referential schema would exhaust the recursion limit rather than loop
     forever — none of the four is, and `tests/unit/test_ai_structured_output.py` walks

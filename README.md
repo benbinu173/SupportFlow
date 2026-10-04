@@ -120,10 +120,11 @@ pytest -m security          # tenant-isolation and authz tests only
 ruff check . && ruff format --check .
 mypy app alembic
 
-# The worker, needed for any email to actually be sent and for SLA alerts to fire.
-# `-Q` must name *every* queue in `task_routes` — see the SLA section for why a worker
-# that misses one looks perfectly healthy and silently consumes nothing.
-celery -A app.workers.celery_app worker --loglevel=info --pool=solo -Q notifications,sla
+# The worker, needed for any email to actually be sent, for SLA alerts to fire, and for
+# a ticket's AI analysis to run. `-Q` must name *every* queue in `task_routes` — see the
+# SLA section for why a worker that misses one looks perfectly healthy and silently
+# consumes nothing.
+celery -A app.workers.celery_app worker --loglevel=info --pool=solo -Q notifications,sla,ai
 
 # Beat, which is the clock the SLA sweep runs on. Exactly one process: two would
 # double every sweep. The explicit schedule path is not optional — the default writes
@@ -726,7 +727,7 @@ python -m uvicorn app.main:app --loop app.core.event_loop:loop_factory --port 80
 # 2. the worker, from backend/ — --pool=solo because fork is not available on Windows
 #    The -Q list is not optional: a worker that does not name every routed queue consumes
 #    nothing from the ones it omits, silently. See the SLA section.
-celery -A app.workers.celery_app worker --loglevel=info --pool=solo -Q notifications,sla
+celery -A app.workers.celery_app worker --loglevel=info --pool=solo -Q notifications,sla,ai
 
 # 3. beat, from backend/ — exactly one process, and it needs no API and no worker
 celery -A app.workers.celery_app beat --loglevel=info -s /tmp/celerybeat-schedule
@@ -856,7 +857,7 @@ minutes" arriving after the deadline would be worse than the miss it describes.
 
 ```bash
 # both, from backend/ — the API is not needed for beat
-celery -A app.workers.celery_app worker --loglevel=info --pool=solo -Q notifications,sla
+celery -A app.workers.celery_app worker --loglevel=info --pool=solo -Q notifications,sla,ai
 celery -A app.workers.celery_app beat   --loglevel=info -s /tmp/celerybeat-schedule
 ```
 
@@ -880,6 +881,11 @@ Celery's point of view nothing is wrong — so
 [tests/integration/test_celery_wiring.py](backend/tests/integration/test_celery_wiring.py)
 parses `docker-compose.yml` and the `Makefile` and asserts the worker command names every
 queue in `task_routes`. The two cannot drift.
+
+**Phase U makes the same trap apply to `ai`, and that is the queue it actually bites on.**
+An SLA task that never runs fires late; an analysis that never runs never happens, and the
+ticket sits with two `pending` rows that nothing will ever fill. `-Q notifications,sla,ai` is
+the command above for that reason — the same three words, in both files the wiring test reads.
 
 **Exactly one beat process.** Two would double every sweep; the guard would stop the second
 one from double-alerting, but the waste would be silent.
@@ -1151,14 +1157,18 @@ error's message embeds `REDIS_URL`, which carries a password in production.
 
 ## AI
 
-§17's foundation, and **nothing above it yet**: there is no AI route, no Celery task, and no
-`ai_analyses` row. What exists is the layer the next three phases call —
-[backend/app/ai/](backend/app/ai/) (the provider boundary), and
-[backend/app/services/ai_service.py](backend/app/services/ai_service.py) (the one call path that
-enforces the timeout, retries what is worth retrying, validates the answer, and records what it
-cost). §36's three routes are Phases U, V, and W. A count of calls and dollars is already visible
-without them: `GET /analytics/overview` reports the ledger, and Phase S built that read path before
-there was anything to read (ADR-026).
+§17's foundation plus §18's flow. [backend/app/ai/](backend/app/ai/) is the provider boundary;
+[backend/app/services/ai_service.py](backend/app/services/ai_service.py) is the one call path that
+enforces the timeout, retries what is worth retrying, validates the answer, and records what it cost;
+and [backend/app/services/ai_analysis_service.py](backend/app/services/ai_analysis_service.py) is the
+pipeline that runs it for a ticket — two routes, one queue, and a worker.
+
+**A new ticket is analyzed without anyone asking.** `POST /tickets` writes two `pending` rows, hands a
+task to the `ai` queue, and returns 201 — the model is called in another process, and §16's *"the API
+should not wait unnecessarily for the LLM"* holds structurally rather than by being careful: nothing in
+[backend/app/api/ai.py](backend/app/api/ai.py) imports a provider. §36's remaining two routes are
+Phases V and W. The ledger is still readable on its own: `GET /analytics/overview` reports calls,
+tokens, and dollars for the tenant.
 
 ### The provider boundary
 
@@ -1253,8 +1263,73 @@ asserting that it happened.
 **An `ai_usage` write does not invalidate the analytics cache**, so `/analytics/overview`'s AI block
 can read up to one TTL stale. `ai_service` cannot fix that from where it sits — invalidating before
 the caller's commit lands is a race — so whoever commits owns the invalidation, in the same place
-and at the same moment as the realtime publish. That is Phase U's route, and it is recorded in
-ADR-027 (and below) rather than left as an oversight.
+and at the same moment as the realtime publish. That is the analysis worker
+(`app/services/ai_analysis_service.py`), and it is recorded in ADR-027 and ADR-029 rather than left
+as an oversight.
+
+### The analysis flow
+
+§18's nine steps, split across two processes at the only seam that matters — the moment a language
+model is called.
+
+| | |
+|---|---|
+| `POST /api/v1/tickets/{ticket_id}/ai/analyze` | `202` with one `pending` row per operation. Body is what was **queued**, not what was concluded. Rate limited per user (§45). |
+| `GET /api/v1/tickets/{ticket_id}/ai/analyses` | The latest row per operation, so a queued or failed analysis is visible rather than silently absent. |
+
+**Both need `ai:request_analysis`, and neither needs `TICKET_VIEW`.** §3 gives customers no AI access
+at all, so guarding these with the ticket read capability — the obvious choice, since that is what
+they hang off — would hand a portal caller the analysis of their own ticket, including
+`error_message`, which the column's own comment keeps from customers because upstream errors can echo
+prompt content.
+
+**Classification and sentiment are two rows but one act.** One task runs both, so the ticket gets one
+timeline entry, one notification, and one realtime announcement — two tasks would each independently
+decide to publish. A failure is contained to its own operation: a refused sentiment call leaves the
+classification `completed` and the ticket's category field written, and the failed row carries a fixed
+sentence rather than the provider's text. Nothing is retried here; retry is `ai_service`'s policy and
+a second loop would multiply the two.
+
+**The model describes the ticket; it does not decide the priority.** `tickets.category`,
+`subcategory`, `sentiment`, both confidences, and `ai_recommended_priority` are written by the worker.
+`tickets.priority` is **not** — that is the business decision, `POST /tickets/{id}/priority` is its
+only writer, and the two columns sit side by side so the recommendation survives the override. A
+worker that applied its own suggestion would make §6's comparison vacuous.
+
+**A worker has a tenant, not a context.** `WorkerContext` carries an `organization_id` and no role, no
+`permissions`, and no `has()` — so a background job cannot authorize anything, by construction rather
+than by convention. `ai_service` is its **only** consumer: it is what the ledger records its tenant
+from, and it is accepted nowhere else — `TenantScopedRepository` still takes a `TenantContext`, so the
+worker cannot reach the request path's scoped queries at all. The analysis's timeline entry is built
+in the worker instead, with a `NULL` actor, exactly as the SLA sweep's entries are.
+
+**A redelivered task does nothing.** The task runs under at-least-once delivery, so a worker killed
+after committing its results is handed the same message again — and the guard is the row's status, not
+a lock. A row only ever leaves `pending` once.
+
+### Verifying the analysis by hand
+
+    # the API, from backend/ (.env needs a real AI_API_KEY for the configured provider)
+    .venv/Scripts/python.exe -m uvicorn app.main:app \
+        --loop app.core.event_loop:loop_factory --port 8000
+    # the worker, in a second terminal — `ai` must be in the -Q list, or the queue is never consumed
+    .venv/Scripts/python.exe -m celery -A app.workers.celery_app worker \
+        --pool=solo --loglevel=info -Q notifications,sla,ai
+
+    # then, from backend/, with a token in $TOKEN and a customer id in $CUSTOMER
+    curl -s -X POST localhost:8000/api/v1/tickets -H "Authorization: Bearer $TOKEN" \
+         -H 'Content-Type: application/json' \
+         -d "{\"subject\":\"Charged twice\",\"description\":\"Order 88213 billed twice.\",\"customer_id\":\"$CUSTOMER\"}"
+
+    # a second later, the same ticket: category and sentiment are filled, priority is not
+    curl -s localhost:8000/api/v1/tickets/$TICKET -H "Authorization: Bearer $TOKEN"
+    curl -s localhost:8000/api/v1/tickets/$TICKET/ai/analyses -H "Authorization: Bearer $TOKEN"
+    curl -s localhost:8000/api/v1/analytics/overview -H "Authorization: Bearer $TOKEN"
+
+The last three are the whole flow in one screen: `category`, `subcategory`, `sentiment`, and
+`ai_recommended_priority` are on the ticket while `priority` still reads the band it was raised with;
+both analysis rows are `completed` with their token counts; and `calls` and `prompt_tokens` have moved
+on the dashboard in the tenant that raised the ticket and nowhere else.
 
 ### Verifying it by hand
 
@@ -1470,18 +1545,20 @@ instead; see [Rate limiting](#rate-limiting).
 - **The risk list is a ranking, not a page.** `limit` caps at 50 and there is no `offset`, so a
   tenant with more than 50 tickets past due sees the 50 nearest their deadline and nothing reports
   the rest. Surviving a genuinely large backlog is what a rollup or a paged view would be for.
-- **The AI spend numbers are real since Phase T; the sentiment distribution is still empty.** Every
+- **The AI numbers are real since Phase T, and the sentiment distribution since Phase U.** Every
   attempt writes an `ai_usage` row, so `calls`, `failed_calls`, tokens, and `cost_usd` on
-  `/analytics/overview` are a genuine `COUNT` and `SUM` over rows that now exist. The sentiment
-  chart still puts every ticket in the `null` bucket, because the sentiment *ticket column* is Phase
-  U’s — `ai_service.analyze_sentiment` reads a sentiment and nothing stores one yet. The response
-  shapes are final, so U fills them without an API change.
-- **AI spend can read up to one TTL stale.** An `ai_usage` write does not bump the analytics version
-  integer, so `/analytics/overview`’s AI block can lag a call by up to `ANALYTICS_CACHE_TTL_SECONDS`.
-  `ai_service` cannot invalidate from where it sits — it stages rows and does not commit, and
-  invalidating before the caller’s commit lands is the race `ticket_service` comments about — so
-  **whoever commits owns the invalidation**. Phase U’s route is where that lands (ADR-027), and it is
-  why Phase T’s own integration test reads `overview` at most once per tenant per window.
+  `/analytics/overview` are a genuine `COUNT` and `SUM` over rows that now exist. The sentiment chart
+  fills as analyses complete, because the worker writes `tickets.sentiment` — a ticket whose analysis
+  has not run yet, or whose sentiment call failed, stays in the `null` bucket, which is what that
+  bucket describes rather than a gap.
+- **AI spend read up to one TTL stale in Phase T; the worker closes that in Phase U.** An `ai_usage`
+  write does not itself bump the analytics version integer, and `ai_service` cannot invalidate from
+  where it sits — it stages rows and does not commit, and invalidating before the caller’s commit
+  lands is the race `ticket_service` comments about — so **whoever commits owns the invalidation**
+  (ADR-027). Since Phase U that caller is `run_analysis`, which invalidates the tenant’s cache after
+  its own commit, so the analytics block is current as of the last analysis. `ai_service` called by
+  something that staged a row and never committed would still leave it stale; no production path
+  does, and the worker is what makes that true rather than the service.
 - **No embeddings and no `generate_embedding` method until Phase X.** ADR-008 puts embeddings behind
   the same interface with a different vendor, so the method is absent rather than stubbed.
   `EMBEDDING_MODEL` is declared in `.env.example` and read by nothing.

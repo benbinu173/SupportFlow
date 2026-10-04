@@ -318,6 +318,11 @@ def run_the_four_operations(
     the service's docstring states out loud. That is also why nothing here is asserted
     inside the session: the rows are read back below, in a second session, which is what
     makes them rows rather than pending objects.
+
+    **`.value`, because Phase U made the four functions return `AIResult[T]`.** The
+    envelope carries the provider's token counts, which `ai_analyses` records per operation;
+    this script wants the validated model and nothing else, so it unwraps here rather than
+    threading an envelope through the four checks below.
     """
     requests = requests_for(ticket_id)
     results: list[tuple[AIOperation, Any]] = []
@@ -326,10 +331,10 @@ def run_the_four_operations(
         factory = async_sessionmaker(bind=engine, expire_on_commit=False)
         async with factory() as session:
             for operation, call, _ in OPERATIONS:
-                value = await call(
+                result = await call(
                     session, context, requests[operation], ticket_id=uuid.UUID(ticket_id)
                 )
-                results.append((operation, value))
+                results.append((operation, result.value))
             await session.commit()
 
     quiet_engine()

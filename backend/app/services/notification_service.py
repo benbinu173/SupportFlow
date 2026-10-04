@@ -2,9 +2,9 @@
 
 Spec §26 lists the in-app notifications the product owes a user: ticket assigned,
 ticket reassigned, new customer reply, manager mention, SLA warning, AI analysis
-completed, and ticket resolved. Four of the seven have producers today; the other three
-are recorded below with the phase that brings them, so "not implemented yet" is a
-statement in the code rather than an omission a reader has to notice.
+completed, and ticket resolved. **Six of the seven have producers today**; the last is
+recorded below with the reason it has none, so "not implemented yet" is a statement in
+the code rather than an omission a reader has to notice.
 
 Two halves, and the split between them is the design
 ----------------------------------------------------
@@ -26,17 +26,16 @@ Email is the delivery mechanism, not the record. The row is the source of truth,
 is why a broker outage degrades the *email* and never the notification — see
 `enqueue_delivery`.
 
-The events that notify nobody, and the ones that notify on a schedule
---------------------------------------------------------------------
-§26 names seven triggers. The ticket timeline has twelve event types, and the ten that are
-not "handled here" split into three groups that mean different things:
+The events that notify nobody, and the ones a worker produces
+--------------------------------------------------------------
+§26 names seven triggers. The ticket timeline has twelve event types, and the nine that are
+not "handled here" split into two groups that mean different things:
 
-**Named by §26, produced on a schedule rather than by a request** — `SLA_WARNING` and
-`SLA_BREACHED`. `app/workers/sla_tasks.py` writes these from a beat task; no inbound
-request can produce one. They are the reason this module has a second entry point.
-
-**Named by §26, with no producer yet** — `AI_ANALYSIS_COMPLETED`. *Deferred*, not
-declined, and it carries the phase that brings it.
+**Named by §26, produced by a worker rather than by a request** — `SLA_WARNING`,
+`SLA_BREACHED`, and (since Phase U) `AI_ANALYSIS_COMPLETED`. `app/workers/sla_tasks.py`
+writes the first two from a beat task; `app/workers/ai_tasks.py` writes the third from a
+queued analysis. No inbound request can produce any of them, which is why this module has a
+second and third entry point.
 
 **Not named by §26 at all** — `CREATED`, `UNASSIGNED`, `PRIORITY_CHANGED`,
 `INTERNAL_NOTE_ADDED`, `ATTACHMENT_ADDED`, and `REOPENED`. Each is a deliberate no: a
@@ -47,17 +46,21 @@ the queue where assignment notifies whoever picks it up. None of that is in §26
 inventing triggers the specification does not ask for is how a notification centre becomes
 something users mute.
 
-Keeping the groups apart matters, because "we chose not to", "we have not yet", and "the
-scheduler will" are three different answers to a reader asking why nothing was sent.
+Keeping the groups apart matters, because "we chose not to" and "a worker will" are two
+different answers to a reader asking why nothing was sent.
 `tests/unit/test_notification_policy.py` walks every member of the enum and fails if one is
 in none of them or in two — which is how the division below was found to be wrong the first
 time it was written, and how Phase Q found the two entries it was holding open.
 
-**Phase Q is the answer to the two comments this module used to carry.** `SILENT_EVENT_TYPES`
-held `SLA_BREACHED` with a note saying Phase Q "will know whether the breach is a second
-alert or a correction of the first", and `DEFERRED_EVENT_TYPES` held `SLA_WARNING` naming
-this phase as its producer. Both now have one, and the decision on the breach is recorded
-on `notify_sla_alert` below.
+**Each phase has closed the comments the last one left.** Phase Q gave `SLA_WARNING` and
+`SLA_BREACHED` their producer and settled that a breach is a second alert rather than a
+correction of the first. Phase U is the answer to the third: `AI_ANALYSIS_COMPLETED` was
+the sole member of a `DEFERRED_EVENT_TYPES` set — *"named by §26, with no producer yet"* —
+and that set is gone, because a set with no members is not a decision waiting to be made,
+it is a decision that has been made. `SCHEDULED_EVENT_TYPES` became `WORKER_EVENT_TYPES` in
+the same pass: it was already documented as *"which code path sends it, not whether it is
+sent"*, and with the analysis joining it the honest name for the group is the code path
+rather than the clock.
 """
 
 import uuid
@@ -81,9 +84,9 @@ from app.services.sla_service import SLAAlert
 
 logger = structlog.get_logger(__name__)
 
-# Every event type that notifies nobody, and why. Membership in one of these three sets is
+# Every event type that notifies nobody, and why. Membership in one of these two sets is
 # the only alternative to being handled, so a new `TicketEventType` cannot arrive without
-# a decision — `tests/unit/test_notification_policy.py` asserts the four sets partition
+# a decision — `tests/unit/test_notification_policy.py` asserts the three sets partition
 # the enum.
 
 # §26 does not name these, so nothing is owed. See the module docstring for each.
@@ -98,30 +101,22 @@ SILENT_EVENT_TYPES: frozenset[TicketEventType] = frozenset(
     }
 )
 
-# §26 names these and nobody produces them yet. Deferred rather than declined, and
-# separated from the set above so "we chose not to notify" and "we cannot yet" stay
-# distinguishable when someone asks why an event was quiet.
-DEFERRED_EVENT_TYPES: frozenset[TicketEventType] = frozenset(
+# Produced by a worker, never by an inbound request. Kept separate from the handled set
+# because `notify_for_event` is the *request* policy and neither the SLA sweep nor the
+# analysis task has a request — the division says which code path sends it, not whether it
+# is sent, which is why the name is about the producer rather than the schedule.
+#
+# Two of the three arrive on a clock (`app/workers/sla_tasks.py`, via celery beat) and one
+# on a queue (`app/workers/ai_tasks.py`, via the ticket that requested it). All three are
+# addressed by their own function below, because all three have the same problem:
+# `notify_for_event` filters the actor out of their own alert and reads a `TicketEvent` a
+# caller just produced, and none of them has either.
+WORKER_EVENT_TYPES: frozenset[TicketEventType] = frozenset(
     {
-        # Phases T-W, which build the analysis this would announce. Note it is the
-        # *completion* §26 asks about: §41 requires AI output be reviewed by a person
-        # before a customer sees it, so announcing that it is ready is an alert to the
-        # agent, not to the customer.
+        TicketEventType.SLA_WARNING,
+        TicketEventType.SLA_BREACHED,
         TicketEventType.AI_ANALYSIS_COMPLETED,
     }
-)
-
-# Produced by `app/workers/sla_tasks.py` on a schedule, never by an inbound request. Kept
-# separate from `_HANDLED_EVENT_TYPES` because `notify_for_event` is the *request* policy
-# and an SLA alert has no request — the division says which code path sends it, not whether
-# it is sent.
-#
-# The two members were the last entries of the two sets above, each with a comment naming
-# this phase. `SLA_BREACHED` sat in `SILENT_EVENT_TYPES` because §26 names the warning and
-# not the breach, and the question was whether a breach is a second alert or a correction
-# of the first. It is a second alert: see `notify_sla_alert`.
-SCHEDULED_EVENT_TYPES: frozenset[TicketEventType] = frozenset(
-    {TicketEventType.SLA_WARNING, TicketEventType.SLA_BREACHED}
 )
 
 
@@ -161,15 +156,16 @@ async def notify_for_event(
     who the caller is: an agent's reply and an `AI_DRAFT` are both staff-side, and §41
     requires the draft never be mistaken for the customer having written in.
     """
-    if event.event_type in SCHEDULED_EVENT_TYPES:
-        # Unreachable from any route today — `app/workers/sla_tasks.py` is the only writer
-        # of these two event types, and it calls `notify_sla_alert` rather than this. The
-        # guard is here anyway because "unreachable" is a claim about today, and if a
+    if event.event_type in WORKER_EVENT_TYPES:
+        # Unreachable from any route today — `app/workers/sla_tasks.py` and
+        # `app/workers/ai_tasks.py` are the only writers of these three event types, and
+        # they call `notify_sla_alert` and `notify_analysis_completed` rather than this.
+        # The guard is here anyway because "unreachable" is a claim about today, and if a
         # request ever did produce one, staging zero rows is right and alerting twice is
         # not.
         return []
 
-    if event.event_type in SILENT_EVENT_TYPES or event.event_type in DEFERRED_EVENT_TYPES:
+    if event.event_type in SILENT_EVENT_TYPES:
         return []
 
     repository = NotificationRepository(session, context)
@@ -498,6 +494,69 @@ def _sla_title(notification_type: NotificationType, timer: SLATimer, due_at: dat
     if notification_type is NotificationType.SLA_BREACHED:
         return f"SLA breach: {label} was due {deadline}"
     return f"SLA warning: {label} is due {deadline}"
+
+
+# The analysis' notification type, named rather than derived, like the mapping above and
+# for the same reason: a change to one enum cannot then silently change what the other
+# means. It is not folded into `_SCHEDULED_NOTIFICATION_TYPES` because that table exists to
+# translate a *timeline* event type into a notification type, and this function already
+# knows which notification it is writing.
+_ANALYSIS_NOTIFICATION_TYPE = NotificationType.AI_ANALYSIS_COMPLETED
+
+
+async def notify_analysis_completed(
+    session: AsyncSession,
+    *,
+    organization_id: uuid.UUID,
+    ticket: Ticket,
+) -> list[Notification]:
+    """Stage the notification that an analysis finished. **Never commits.**
+
+    The third entry point into staging, and the second with no request behind it. §26 asks
+    for this notification; §41 dictates who it is for: AI output is reviewed by a person
+    before a customer sees it, so "the analysis is ready" is an alert to whoever is about to
+    do that reviewing, and never a message to the customer.
+
+    **The assignee, and nobody when the ticket is unassigned.** This follows
+    `_recipients_for`'s reading of a customer reply on an unassigned ticket — *"Nobody is
+    working it, so there is no one person to alert"* — rather than the manager fan-out
+    `notify_sla_alert` performs. The difference is what the alert is *for*. An SLA deadline
+    on a ticket nobody has picked up is the manager's problem, which is why the sweep widens
+    to them; an analysis of a ticket nobody has picked up is not urgent at all, and its
+    result is sitting on the ticket for whoever takes it next. Widening would turn every
+    auto-analyzed ticket in the queue into a notification for every manager, which is
+    precisely how §26's list stops being read.
+
+    Returns a list because `enqueue_delivery` and every caller of it take one, and because
+    the fan-out is the shape staging has — the list is simply never longer than one.
+
+    `session.add` rather than a repository, for the reason `notify_sla_alert` gives:
+    `NotificationRepository` is tenant-scoped, and constructing one from a `WorkerContext`
+    that has no role would add a constructor argument and nothing else.
+    """
+    if ticket.assigned_agent_id is None:
+        return []
+
+    notification = Notification(
+        organization_id=organization_id,
+        user_id=ticket.assigned_agent_id,
+        notification_type=_ANALYSIS_NOTIFICATION_TYPE,
+        # §41's "distinguish AI output" applied to the alert itself: the title says what
+        # this is rather than making the reader open the ticket to find out.
+        title="AI analysis ready for review",
+        body=f"#{ticket.number} - {ticket.subject}",
+        ticket_id=ticket.id,
+    )
+    session.add(notification)
+
+    logger.info(
+        "notification_staged",
+        notification_type=str(_ANALYSIS_NOTIFICATION_TYPE),
+        organization_id=str(organization_id),
+        recipient_id=str(ticket.assigned_agent_id),
+        ticket_id=str(ticket.id),
+    )
+    return [notification]
 
 
 # ---------------------------------------------------------------------------

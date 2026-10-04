@@ -10,7 +10,7 @@
 #   docker compose --profile full up --build
 #
 # On Windows the native Celery worker needs the solo pool:
-#   celery -A app.workers.celery_app worker --pool=solo --loglevel=info -Q notifications,sla
+#   celery -A app.workers.celery_app worker --pool=solo --loglevel=info -Q notifications,sla,ai
 # and the scheduler is a second process, which runs without the pool flag:
 #   celery -A app.workers.celery_app beat --loglevel=info -s /tmp/celerybeat-schedule
 
@@ -134,7 +134,7 @@ services:
     # core is what Linux is good at, and the solo pool exists on Windows only because
     # psycopg's async mode needs a selector loop the Proactor default does not provide
     # (ADR-011).
-    command: celery -A app.workers.celery_app worker --loglevel=info -Q notifications,sla
+    command: celery -A app.workers.celery_app worker --loglevel=info -Q notifications,sla,ai
 
   beat:
     profiles: ["full"]

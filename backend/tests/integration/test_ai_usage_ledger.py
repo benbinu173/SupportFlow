@@ -9,13 +9,13 @@ cannot show is that the row survives a commit, satisfies the table's constraints
 **found by the aggregate that already existed**. That needs a real database, and it is the
 only claim this file makes.
 
-**Why the service layer and not the route.** There is no AI endpoint: §36's three
-(`/ai/analyze`, `/ai/summarize`, `/ai/suggest-response`) belong to Phases U, V, and W, and
-Phase T adds no route at all. So the shipped read path under test is
-`analytics_service.overview`, and the numbers are asserted where they are computed rather
-than through HTTP. `tests/api/test_analytics.py` already covers the route's own behaviour —
-the window, the status code, the response shape — and
-`scripts/phase_t_walkthrough.py` is what proves the two halves meet over a socket.
+**Why the service layer and not the route.** Phase U shipped `/tickets/{id}/ai/analyze`, and
+the ledger it writes is still asserted here rather than through HTTP: that route queues work
+for a worker instead of calling a provider, so a request-shaped test of it would prove
+nothing about spend. What this file is for is the row *a call* leaves, and the call is
+`ai_service`'s. `tests/api/test_ai_analysis.py` covers the two routes' own behaviour — the
+status codes, the capability, the rate limit — and `scripts/phase_t_walkthrough.py` is what
+proves the two halves meet over a socket.
 
 **No `truncate_tables`, and no HTTP.** Every row is written through the async `db` fixture,
 whose outer transaction is rolled back on teardown, following
@@ -109,7 +109,13 @@ def request() -> AIRequest:
 
 
 def classify_payload() -> dict[str, Any]:
-    return {"category": "Billing", "subcategory": "Duplicate Charge", "confidence": 0.94}
+    """A well-formed answer, including `priority` — required since Phase U, §51."""
+    return {
+        "category": "Billing",
+        "subcategory": "Duplicate Charge",
+        "priority": "high",
+        "confidence": 0.94,
+    }
 
 
 def use_provider(monkeypatch: pytest.MonkeyPatch, provider: FakeProvider) -> FakeProvider:

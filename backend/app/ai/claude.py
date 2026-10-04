@@ -33,6 +33,8 @@ API key in a header and a customer's words in the body. So a log line here gets
 own reason string, which is written in this module and quotes nothing.
 """
 
+import asyncio
+
 import structlog
 from anthropic import (
     AnthropicError,
@@ -49,6 +51,7 @@ from app.ai.errors import AIError, AIOutputError, AIPermanentError, AITransientE
 from app.ai.prompts import as_untrusted
 from app.ai.provider import AIRequest, AIResult, _tool_schema, validate_output
 from app.core.config import get_settings
+from app.core.event_loop import current_loop
 from app.schemas.ai import (
     Classification,
     ConversationSummary,
@@ -78,22 +81,43 @@ _STATUS_REASONS: dict[int, str] = {
 
 _client: "AsyncAnthropic | None" = None
 
+#: The loop `_client` was built on, or `None` when this process did not build it. The SDK's
+#: client owns an `httpx` connection pool underneath it, bound to the loop that created it,
+#: and `app/core/event_loop.run` builds **and closes** a loop per Celery task — so a client
+#: cached across two tasks sends on a pool whose loop is gone and raises
+#: `RuntimeError('Event loop is closed')`. `None` is the case where a test swapped `_client`
+#: for a double: a client this module did not build is not this module's to discard.
+_client_loop: "asyncio.AbstractEventLoop | None" = None
+
 
 def _shared_client() -> "AsyncAnthropic":
-    """The process-wide client, built on first use.
+    """The client for the running loop, built on first use on that loop.
 
-    One client, not one per call: it owns a connection pool, and the TLS handshakes a
-    per-call client would repeat are a measurable part of a call whose whole cost is
-    dominated by the model thinking. Lazy rather than module-level so importing this
-    module never requires a key to exist — the test suite imports it, and a required key
-    at import time would break every checkout that has none.
+    One client per loop, not one per call: it owns a connection pool, and the TLS handshakes
+    a per-call client would repeat are a measurable part of a call whose whole cost is
+    dominated by the model thinking. Lazy rather than module-level so importing this module
+    never requires a key to exist — the test suite imports it, and a required key at import
+    time would break every checkout that has none.
 
     **The key is checked here, so the failure is loud and local.** An absent key raises
     `AIPermanentError` at the point of use rather than at import, which is why
     `AI_API_KEY` is optional in `Settings`: absent is a legal configuration for a
     deployment that has not enabled AI, and this is the line that says so.
+
+    **The pool belongs to a loop, not to the process**, which is why the cache is keyed on
+    the running one. A stale client is dropped rather than `aclose()`d, because closing it
+    would need the loop it was built on — the thing that is gone. `app/core/redis.py`'s
+    `scoped_client` answers the same trap for a Redis pool.
     """
-    global _client
+    global _client, _client_loop
+    running = current_loop()
+    if (
+        running is not None
+        and _client is not None
+        and _client_loop is not None
+        and _client_loop is not running
+    ):
+        _client = None
     if _client is None:
         settings = get_settings()
         if not settings.AI_API_KEY:
@@ -104,13 +128,15 @@ def _shared_client() -> "AsyncAnthropic":
             max_retries=0,
             timeout=settings.AI_TIMEOUT_SECONDS,
         )
+        _client_loop = running
     return _client
 
 
 def reset_client() -> None:
     """Drop the cached client. Called on shutdown, and by tests that repoint the provider."""
-    global _client
+    global _client, _client_loop
     _client = None
+    _client_loop = None
 
 
 def _reason_for_status(exc: APIStatusError) -> str:

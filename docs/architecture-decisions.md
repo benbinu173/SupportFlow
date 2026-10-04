@@ -2216,3 +2216,283 @@ reporting on the reader's environment rather than on the code. `tests/conftest.p
 `AI_PROVIDER`/`AI_MODEL` to the committed defaults, as it already pins every other setting, and says
 why in the one block there that assigns rather than `setdefault`s. The model was always part of those
 tests' premise; now the tests state it.
+
+## ADR-029 — A worker has a tenant and no context, and the model names the band, not the priority
+
+**Status:** accepted · Phase U
+
+**Context.** §18 writes the analysis out as nine steps, and until this phase every one of them was
+aspirational. Phase T built the call — one provider boundary, one call path, retry, validation, and a
+ledger that records every attempt — and deliberately shipped **no route, no task, and no
+`ai_analyses` row**: `tests/integration/test_ai_usage_ledger.py`'s first paragraph says so, and
+ADR-027's own *"What this deliberately does not do"* names §36's three AI endpoints as Phases U, V,
+and W. Phase T also left the prompt text unwritten, recording it as *"mechanism in T; text in U-W"* —
+`app/ai/prompts.py` held `defuse` and `as_untrusted` and not one sentence of instruction.
+
+Three pieces of scaffolding had been naming this phase for several phases, each with a comment saying
+so: `websocket/events.py` had `AI_ANALYSIS_COMPLETED` in `UNPUBLISHED_EVENT_TYPES` *"so that Phase T-W
+has an entry to delete"*; `notification_service.py` had it in `DEFERRED_EVENT_TYPES`, whose comment
+named *"Phases T-W, which build the analysis this would announce"*; and `celery_app.py` did not declare
+the `ai` queue, on the rule that *"declaring a queue nothing publishes to is a worker process waiting
+for work that does not exist."* This phase is the producer all three were waiting for.
+
+Everything the analysis *writes to* already existed. `AIAnalysis` has its lifecycle, its indexes, and
+the `terminal_status_has_payload` constraint; `tickets` has `category`, `subcategory`, `sentiment`,
+both confidences, `ai_recommended_priority`, and `ai_priority_score`, all nullable with the comment
+*"analysis is asynchronous, so a ticket is fully usable before any of these are populated."*
+**So this phase adds no migration** — `alembic check` staying green is the mechanical proof.
+
+Two decisions had been taken with the user before any of this was written, and both are decisions
+rather than defaults: **the model names the priority band** (the classification call returns category,
+subcategory, priority, and confidence together, rather than a fifth provider operation), and **the
+recommendation is advisory** (the worker never writes `tickets.priority`).
+
+**Decision 1 — `WorkerContext` is a type that carries a tenant and no authority.** `ai_service`'s four
+functions took a `TenantContext`, and `_stage_usage` said why: *"nothing in this function's signature
+could carry one even if a caller wanted to pass one, which is the point of taking a context rather than
+an id."* A Celery task has no request — and `sla_repository.py` refused to fabricate one in Phase Q, in
+terms that apply unchanged here: *"`role` would have no honest value at all: it decides `permissions`,
+and there is no role whose permissions describe 'the scheduler'."*
+
+`app/core/tenancy.py` therefore gains `WorkerContext`: a frozen dataclass holding one
+`organization_id`. It has **no `role`, no `permissions`, no `has()`, and no `scope_for()`** — it cannot
+answer an authorization question because it cannot be asked one, so a task cannot grant itself a
+capability by holding a value. `TenantScopedRepository` still takes a `TenantContext` and does not
+accept this, which is what keeps the worker out of the request path's row-scoped queries entirely and
+keeps `sla_repository`'s property true: the context-free queries stay small enough to count, in one
+file each.
+
+**It has exactly one consumer: `app/services/ai_service.py`**, which takes it so the ledger row can
+name the tenant that paid. Passing a bare `uuid.UUID` would compile and would work and would give up
+the property that makes a wrong tenant unpassable — a `WorkerContext` is a type that says *this tenant,
+no caller*, and an id says nothing at all.
+
+**Decision 2 — the model names the band, on the call it was already making.** §51 asks for
+classification, category, subcategory, sentiment, *priority recommendation*, and confidence.
+`Classification` gains one field, `priority: TicketPriority`, so the recommendation arrives with the
+classification rather than in an operation of its own. §17's provider interface has exactly four
+operations and a fifth would need a new `AIOperation` member — a database migration for a value the
+model can answer in a call it is already making.
+
+The rejected alternative is worth stating because it is the obvious one: a Python rule that bands a
+category and a sentiment. It was refused because `tickets.ai_recommended_priority`'s own column
+comment reads *"what the model suggested"*, and a rule's output is not a suggestion. The prompt is
+also where the four `TicketPriority` values are explained by name, which is the right home for them:
+the vocabulary is ours, so it is ours to define, and the model is being taught it rather than asked to
+guess it.
+
+**Decision 3 — the recommendation never becomes the priority.** The worker writes `tickets.category`,
+`subcategory`, `ai_recommended_priority`, and `ai_classification_confidence`; it writes
+`tickets.sentiment` and `sentiment_confidence`; and it **never** writes `tickets.priority`.
+`ticket_service.change_priority` remains its only writer, and `POST /tickets/{id}/priority` is how the
+suggestion is applied. §6 keeps the model's answer and the business decision in two columns so they can
+be compared, and that comparison is vacuous if the worker fills in both — a system that applied its own
+recommendation could never be measured against it, and §60's prohibition on AI modifying critical
+business data without validation would be met only formally.
+
+`tickets.ai_priority_score` is left **NULL with no writer**, and this is deliberate rather than
+unfinished: the band *is* the recommendation, and a second number expressing the same judgement with
+nothing reading it is the kind of column this codebase refuses elsewhere.
+
+**Decision 4 — one task runs both operations, because §18's last three steps are singular.** The ticket
+gets one timeline entry, one notification, and one realtime announcement — not one per operation. Two
+tasks would each independently decide to publish, so a client would re-read the same ticket twice and
+an agent would get two alerts for one arrival. Inside the task, however, **a failure is contained to
+its own operation**: each call is caught separately, its row is marked `failed`, and the rest of the
+run continues, which is §7's *"AI provider failure degrades gracefully"* made concrete. Nothing is
+retried here — retry is `ai_service._run`'s policy, and a second loop would multiply the two.
+
+**Decision 5 — the rows are written before the work is queued.** `request_analysis` creates one
+`pending` row per operation, stamps the configured `provider` and `model` on each, writes the audit
+entry, commits, and *then* hands the task to the broker. `AIAnalysis`'s own docstring gives the
+reason — *"a pending or failed analysis is visible rather than silently absent"* — and writing first is
+what makes it true: a client that asks and reads back immediately sees two `pending` rows rather than
+an empty list. The stamp is taken at queue time and never re-read from config, so a historical analysis
+still names the model that was asked even after a deployment changes it.
+
+The order is not allowed to invert: the task's first act is to read the rows it was handed the ids of,
+so a task that started before the commit would find nothing and quietly do nothing. And a **broker that
+is down does not fail the request** — the rows are committed and show as `pending`, the user's action
+succeeded, and only the work is late; the exception is logged by type, without a traceback, because a
+connection error's message embeds a URL that carries a password in production (§4).
+
+The rows are also **not** marked `failed` when the queue is unreachable, which is the opposite of what
+a provider failure does. A failed call is an answer about the model; a broker that is down is an answer
+about the infrastructure, and marking the row `failed` would claim the model said nothing when it was
+never asked — and would discourage the retry that is the correct response.
+
+**Decision 6 — the read route needs the AI capability, not `TICKET_VIEW`.** §36 names
+`POST /tickets/{id}/analyze` and two routes that belong to Phases V and W. This phase adds that one
+plus a second that §36 does not name — `GET /tickets/{id}/ai/analyses`, the latest row per operation —
+because `pending` and `failed` have to be observable, which is the whole reason a row exists from queue
+time. **Both are guarded by `AI_REQUEST_ANALYSIS` and neither by `TICKET_VIEW`**, and that is the
+decision rather than an implementation detail: `TICKET_VIEW` is held by every portal account, so
+guarding the pair with it — the obvious choice, since a ticket is what they hang off — would hand a
+customer the analysis of their own ticket, including `error_message`, whose column comment keeps it
+from customers because *"upstream errors can echo prompt content."* §3 gives the portal no AI access at
+all, so this is the whole capability and not a redaction.
+
+A cross-tenant read is a **404 and not a 403**, and the refusal is byte-identical to a request naming a
+uuid that never existed — asserted in full, body and headers, on both verbs. There is no
+`GET /ai/analyses/{id}` for the same reason: an analysis is addressed through the ticket that owns it,
+so there is no id to guess and none to refuse (ADR-015).
+
+**Decision 7 — the AI limit is keyed by user, and only the verb that spends money is limited.** §45
+names *"AI endpoints"* and there were none. `limit_upload`'s reading applies unchanged: this runs
+*after* authentication, the abuse is one account's, and an AI call costs money in a way a login attempt
+does not — so the key is a user id rather than an address, and an anonymous request is refused by the
+auth layer before the limiter counts anything. A fresh setting, `RATE_LIMIT_AI_PER_HOUR`, and
+`app/api/rate_limits.py` gains a row so that *"read the guards here and you have read every limit the
+API applies"* stays true.
+
+The read route is **not** limited. A guard on it would cap how often a client may look at work it has
+already paid for — a limit that makes a UI feel broken without protecting anything.
+
+**Decision 8 — the worker writes its own timeline entries, and the notification sets go from four to
+three.** §18's step 7 is a timeline entry, and the natural call is `ticket_service.record_event`. That
+function takes a `TenantContext` because it names an actor, and a worker has none. `sla_tasks._record`
+answered this in Phase Q by building the event itself, and its comment already anticipated this case by
+name: *"NULL when the system acted rather than a person — SLA breaches and completed AI analyses have
+no actor."* The analysis follows that precedent rather than widening `record_event`, so `WorkerContext`
+acquires no second consumer and `actor_user_id` is `NULL` — which is a fact about the row, not a
+missing value.
+
+The same reasoning settles the realtime event and the notification. `AI_ANALYSIS_COMPLETED` moves out
+of `UNPUBLISHED_EVENT_TYPES` into `REALTIME_FOR_EVENT`; **`DEFERRED_EVENT_TYPES` becomes empty and is
+deleted** rather than left as a set with no members awaiting a consumer; and `SCHEDULED_EVENT_TYPES`
+becomes **`WORKER_EVENT_TYPES`**, because its own docstring already said the division was *"which code
+path sends it, not whether it is sent"* — and with the analysis in it, the property is *produced by a
+worker*: on a clock for the SLA pair, on a queue for this one.
+
+The recipient is `ticket.assigned_agent_id`, and **nobody** when it is `NULL`. That is the reading
+`test_a_customer_reply_on_an_unassigned_ticket_notifies_nobody` already asserts — *"Nobody is working
+it, so there is no one person to alert"* — and an analysis of an unassigned ticket is visible on the
+ticket itself; inventing a fan-out would make it indistinguishable from the notification centre.
+
+**Decision 9 — the ledger's tenant and the analysis row's tenant come from the same value, and the
+worker's `user_id` is `NULL`.** `ai_service._stage_usage` reads `context.organization_id` for the row
+and `context.user_id` for the actor; a `WorkerContext` has no user, so the ledger row's `user_id` is
+`NULL` — which is what `AIUsage.user_id`'s column comment already anticipated: *"a background embedding
+job has neither."* The query that isolates one tenant's spend from another's is therefore the same
+column request-path calls write, and a mismatched tenant on a task is a **cross-tenant write no API
+test could reach**, since no route calls these queries. `tests/security/test_ai_isolation.py` drives
+the task directly with a deliberately wrong tenant in each direction.
+
+**Decision 10 — the worker reaches Redis through a scoped client.** `event_loop.run` builds **and
+closes** a loop per task invocation, so a client cached on the shared module would be bound to a loop
+that no longer exists by the next task — the trap `sla_tasks` documents. The worker uses
+`redis.scoped_client()`, and `cache.invalidate` gains an optional `client` parameter, exactly as
+`realtime.publish` already had one and for the same reason. Both publishes and the invalidation happen
+**after the commit** and never raise, so a Redis outage cannot turn a completed analysis into a task
+Celery retries — the rows are the durable record and they are already written. The invalidation is here
+and not in `ai_service` because the ticket's AI fields move every cached analytics figure computed over
+them, and ADR-027 records why `ai_service` cannot do it: invalidating before the caller's commit lands
+is a race, so whoever commits owns the invalidation.
+
+**Decision 11 — a provider client belongs to a loop, not to the process.** Decision 10 is right, and
+this phase's live end-to-end proved it was not applied everywhere it needed to be. The first
+`analyze_ticket` a worker received succeeded in 2.1s; the second, fifteen seconds later, raised
+`RuntimeError('Event loop is closed')` from inside `httpx`'s transport — after the request had been
+built and before it was sent. `app/ai/groq.py` and `app/ai/claude.py` both cached their client in a
+module global, and `event_loop.run` builds **and closes** a loop per task, so the client the first task
+built pointed at a loop the second task could not use. The failure is worth stating precisely because of
+its shape: it is invisible to the entire suite (where one loop serves every test) and it appears only on
+the *second* task, so a single-call smoke test passes and production fails on every ticket after the
+first. Decision 10's own reasoning, applied to the other two caches in the worker's path.
+
+The fix is a cache keyed on the running loop, asked through a new `event_loop.current_loop()`, which
+returns `None` outside one. A stale client is **dropped, never `aclose()`d** — closing it would need the
+loop it was built on, which is the thing that is gone — so the fix trades a small resource leak for
+correctness on the path that runs. The three alternatives were each rejected: building a client **per
+call** repeats a TLS handshake inside a call whose latency is dominated by the model thinking, which is
+what the cache exists to avoid; **resetting it from `ai_tasks`** would leak provider internals into the
+worker, which is the boundary ADR-028 is about, and there will be a third vendor in Phase X;
+**holding the loop weakly and rebuilding on collection** is the same check with a slower way of asking.
+`current_loop()` lives in `app/core/event_loop.py` rather than in either vendor, because that is the
+module that *creates* the loops and its docstring is already where the build-and-close lifecycle is
+explained — a vendor module importing it is a vendor module asking the loop owner a question about the
+loop, which is the right direction.
+
+**What this deliberately does not do.** No summarization, no suggested replies, no RAG — §20, §21, and
+§22 are Phases V, W, and X, and `AIOperation.SUMMARIZE`, `SUGGEST_RESPONSE`, `EMBED`, and
+`KNOWLEDGE_ANSWER` stay declared-and-unused as the other phases left them. **No retry sweep for stuck
+analyses**: `ix_ai_analyses_pending` is partial on exactly `pending` and `processing`, so the index is
+already built for one, but nothing reclaims a row whose worker died mid-run. That is recorded here as
+the next phase's problem rather than hidden — the row is visible and the index that finds it exists.
+**No `ai_priority_score`**, per Decision 3. **No embeddings** — `EMBEDDING_MODEL` stays
+declared-and-unused for Phase X per ADR-008, and `generate_embedding` is still absent from the protocol.
+**No report tasks**; `report_tasks.py` remains unbuilt and is still nobody's business this phase.
+
+**Cost.** No new dependency, no migration, and no new setting beyond `RATE_LIMIT_AI_PER_HOUR`. Two new
+modules (`ai_repository.py`, `ai_analysis_service.py`), one task module, one route module, and one
+schema — plus the standing cost of `WorkerContext`: every future background task owes the same
+discipline, and `ai_service` is now the one function in the codebase whose signature accepts two
+context types, which is a union a reader has to hold. The union is the price of not fabricating an
+identity, and it is paid once, at the boundary where the ledger is written.
+
+**Verification.** The suite is **1322 tests**, all passing — 1255 at ADR-028's close, 65 for this
+phase's own surface, and 2 for the defect the live run below turned up. `alembic check` reports *"No new
+upgrade operations detected"*, which is the mechanical proof of this phase's central claim: it writes six
+`tickets` columns, an `ai_analyses` lifecycle, a ledger row, and a timeline entry, and every one of them
+already existed. `ruff check`, `ruff format --check` (187 files), and `mypy app alembic` are clean across
+118 source files.
+
+**Four breaks were made deliberately, and each was confirmed to fail the test that covers it** — the
+alternative being a test suite that would have passed before the phase started. Swapping the terminal-status
+filter in `run_analysis` for `list(analyses)` failed `test_a_redelivered_task_does_nothing` and nothing else,
+with the model being asked a third time on a two-outcome script: *"FakeProvider was called 3 times but only
+2 outcomes were scripted."* Adding `ticket.priority = classification.priority` beside the recommendation
+failed `test_the_recommendation_never_becomes_the_priority` and nothing else. Moving the read route from
+`AI_REQUEST_ANALYSIS` to `TICKET_VIEW` failed two — the API test that a portal customer is refused, and
+`test_every_route_declares_the_capability_the_matrix_assigns`, which is the one that makes the capability
+matrix a checked statement rather than a document. And deleting the loop check Decision 11 describes failed
+`test_the_shared_client_is_rebuilt_when_it_is_on_a_loop_that_has_gone` alone in each vendor's file —
+`assert <httpx.AsyncClient object at 0x...> is not <httpx.AsyncClient object at 0x...>`, the same object
+compared with itself, which is precisely the bug. Each was reverted and all five touched files confirmed
+byte-identical by SHA-256 against hashes taken before the first break.
+
+**The live end-to-end ran against a real key, and it found the bug Decision 11 records.** `uvicorn` under
+`app.core.event_loop:loop_factory`, a Celery worker on `--pool=solo -Q notifications,sla,ai`, and
+`scripts/phase_u_walkthrough.py` raising a real ticket, against the real `openai/gpt-oss-120b`:
+
+    provider=groq model=openai/gpt-oss-120b
+    1. §18 steps 1-2: the ticket is raised, and the analysis is a message
+      ok    the ticket was created
+      ok    nothing has been concluded yet
+      queued: ['classify', 'sentiment']
+      ok    two rows exist, one per operation
+      ok    they name the provider and model that will be asked
+    2. §18 steps 3-7: the worker classifies it, in another process
+      settled after 2.1s: {'classify': 'completed', 'sentiment': 'completed'}
+      category: 'Billing'   subcategory: 'Duplicate Charge'   sentiment: 'negative'
+      sentiment_confidence: 0.99   ai_recommended_priority: 'high'
+    3. §6: the model's band lands beside the priority, never on it
+      ok    the priority is the one the customer's ticket was created with
+      priority='low' vs recommended='high' -- the model recommended something else
+    5. §28: the ledger grew, read in a third process
+      {'calls': 2, 'failed_calls': 0, 'prompt_tokens': 1660, 'completion_tokens': 124,
+       'cost_usd': '0.000323', ...}
+    7. §6: a second analysis adds rows rather than overwriting them
+      ok    the button answers 202
+      ok    the rows served now are new ones
+      ok    and they finished too
+    34 passed, 0 failed
+
+The first run of that script **failed**, and the failure is the most useful thing this phase produced. The
+worker's first `analyze_ticket` succeeded in 2.1s; the second, fifteen seconds later, was received and died
+152ms after — `RuntimeError('Event loop is closed')`, raised inside `httpx`'s transport after the request
+was built and before it was sent, because both vendor modules cached their client on the process while
+`event_loop.run` closes each task's loop. **No test in the suite could have found it**: one loop serves
+every test, so the cache is never stale there, and the failure needs a *second* task, so a single-call
+smoke test passes and every ticket after the first fails in production. After the fix, the same script
+against the same key produced three tasks and three successes in the worker's own log — the third being the
+regenerated analysis of the same ticket, which is exactly the case that had died:
+
+    11:57:24 ai_analysis_complete completed=2 failed=0 ... ticket_id=6366dafe-0966-4bb4-b401-f736023e7a2d
+    11:57:41 ai_analysis_complete completed=2 failed=0 ... ticket_id=6366dafe-0966-4bb4-b401-f736023e7a2d
+
+Two things the script states it cannot show for itself, and they are recorded rather than papered over: the
+timeline entry (written with a `NULL` actor by a code path that has no route, so it is read in `psql`), and
+§6's separation *deterministically* — section 3 asserts `priority` was untouched, but a run where the model
+happened to recommend the band the ticket already had cannot tell the two columns apart, which is why the
+deliberate break above is what pins it.

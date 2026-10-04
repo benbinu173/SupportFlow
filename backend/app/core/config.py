@@ -127,6 +127,14 @@ class Settings(BaseSettings):
     # `app/api/rate_limits.py`, which is the whole limit surface in one file.
     RATE_LIMIT_UPLOAD_PER_HOUR: int = 60
 
+    # Also per user, and the tightest of the three despite being the same window shape.
+    # The argument is §53 rather than §45: an upload costs object storage and an AI call
+    # costs money per token, so the number that a runaway client can spend in an hour is
+    # the thing being bounded. 30 is above what a person reviewing tickets reaches by
+    # hand — the route is a button, and a ticket already analyzes itself on creation —
+    # and far below what a loop over a ticket id would reach.
+    RATE_LIMIT_AI_PER_HOUR: int = 30
+
     # --- Object storage ---------------------------------------------------
     # MinIO locally, any S3-compatible service in production. The endpoint and region
     # carry defaults because neither is a secret and both have an obvious local value;

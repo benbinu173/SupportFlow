@@ -178,6 +178,10 @@ def test_the_ticket_lifecycle_is_recorded_action_by_action(
     Driven in one test rather than five so the *sequence* is visible: the trail is read
     to establish what happened in what order, and a set of rows that is individually
     correct but collectively out of order would still answer the question wrongly.
+
+    Phase U added a row that is not a lifecycle step: `create_ticket` asks for the ticket's
+    analysis, so `ai_analysis_requested` lands beside it. The list below carries it for the
+    reason the test exists — the assertion is about what the trail says, and it says that.
     """
     org = register_org()
     agent = org.add_user("agent")
@@ -230,6 +234,7 @@ def test_the_ticket_lifecycle_is_recorded_action_by_action(
         "ticket_status_changed",
         "ticket_priority_changed",
         "ticket_assigned",
+        "ai_analysis_requested",
         "ticket_created",
     ], "newest first, and a step in the wrong place is a step that did not happen"
 

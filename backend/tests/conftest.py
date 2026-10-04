@@ -51,6 +51,12 @@ os.environ.setdefault("S3_REGION", "us-east-1")
 os.environ.setdefault("RATE_LIMIT_LOGIN_PER_MINUTE", "100000")
 os.environ.setdefault("RATE_LIMIT_REGISTER_PER_HOUR", "100000")
 os.environ.setdefault("RATE_LIMIT_UPLOAD_PER_HOUR", "100000")
+# Phase U as well, for the same reason and with one more: `POST /tickets` now queues an
+# analysis, so every test that raises a ticket passes through the AI counter. Left at the
+# real 30 it would start answering 429 somewhere past the thirtieth ticket in a run, which
+# is a failure whose cause is in a different file from its symptom.
+# `tests/api/test_ai_analysis.py` lowers it back down to prove the wiring.
+os.environ.setdefault("RATE_LIMIT_AI_PER_HOUR", "100000")
 
 # Celery. `Settings` gives both a default, so these are set for the opposite reason to
 # the block above: to make it obvious that the suite *is* pointed at a test broker. The
@@ -339,6 +345,37 @@ def queued_emails(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     ids: list[str] = []
     monkeypatch.setattr(email_tasks.send_notification_email, "delay", ids.append)
     return ids
+
+
+@pytest.fixture(autouse=True)
+def queued_analyses(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, list[str]]]:
+    """Record the analyses queued for a worker, and queue none. **Autouse.**
+
+    Phase U made `POST /tickets` queue an analysis, so every test in this suite that raises
+    a ticket now reaches `enqueue_analysis` — the same reason `queued_emails` above is
+    autouse, and the same consequence if it were not: hundreds of unrelated tests
+    publishing real messages to whatever Redis `CELERY_BROKER_URL` names.
+
+    **The signature is the task's, and it is recorded rather than flattened.** `delay` takes
+    a ticket id, an organization id, and the analysis ids, and a recorder that kept only the
+    first would make `test_the_queued_task_names_the_tenant` unable to ask its question. The
+    values are converted to strings by the call site, so these are exactly what a worker
+    would receive over the wire rather than what the caller happened to hold.
+
+    A list rather than a counter, so a test can assert that a second identical request
+    queued *nothing* — which is §16's duplicate guard, and the one claim here that is about
+    absence.
+    """
+
+    from app.workers import ai_tasks
+
+    queued: list[tuple[str, str, list[str]]] = []
+
+    def record(ticket_id: str, organization_id: str, analysis_ids: list[str]) -> None:
+        queued.append((ticket_id, organization_id, analysis_ids))
+
+    monkeypatch.setattr(ai_tasks.analyze_ticket, "delay", record)
+    return queued
 
 
 @dataclass

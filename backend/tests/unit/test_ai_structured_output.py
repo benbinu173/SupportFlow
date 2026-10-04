@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 from app.ai.errors import AIOutputError, AIPermanentError
 from app.ai.provider import _tool_schema, validate_output
-from app.models.enums import Sentiment
+from app.models.enums import Sentiment, TicketPriority
 from app.schemas.ai import (
     Classification,
     ConversationSummary,
@@ -46,28 +46,42 @@ ALL_SCHEMAS: tuple[type[BaseModel], ...] = (
 
 
 def test_a_model_shaped_mapping_validates() -> None:
-    """§18's own example, verbatim."""
+    """§18's own example, extended with the one field §51 asks for beyond it.
+
+    The spec's example answer is a category, a subcategory, and a confidence; §51's priority
+    recommendation rides on the same call (see `Classification`'s docstring), so a real
+    answer has four fields and this is what one looks like.
+    """
     result = validate_output(
         Classification,
-        {"category": "Billing", "subcategory": "Duplicate Charge", "confidence": 0.94},
+        {
+            "category": "Billing",
+            "subcategory": "Duplicate Charge",
+            "priority": "high",
+            "confidence": 0.94,
+        },
     )
 
     assert isinstance(result, Classification)
     assert result.category == "Billing"
     assert result.subcategory == "Duplicate Charge"
+    assert result.priority is TicketPriority.HIGH
     assert result.confidence == 0.94
 
 
 def test_a_json_string_validates() -> None:
     """A provider that hands back text instead of a decoded object is still answerable."""
-    result = validate_output(Classification, '{"category": "Billing", "confidence": 0.94}')
+    result = validate_output(
+        Classification,
+        '{"category": "Billing", "priority": "low", "confidence": 0.94}',
+    )
 
     assert result.category == "Billing"
 
 
 def test_an_instance_is_returned_unchanged() -> None:
     """The short circuit the fake provider relies on — see `validate_output`'s docstring."""
-    given = Classification(category="Billing", confidence=0.94)
+    given = Classification(category="Billing", priority=TicketPriority.MEDIUM, confidence=0.94)
 
     assert validate_output(Classification, given) is given
 
@@ -77,8 +91,16 @@ def test_an_absent_subcategory_is_allowed() -> None:
 
     A model forced to choose would invent one, and an invented `"General"` is
     indistinguishable from a real answer in a way `null` is not.
+
+    **`priority` is not optional, and the contrast is the point.** A ticket always has a
+    band, so a model that left it out did not decline to answer — it failed to. Making it
+    defaulted would let that failure pass validation as a quiet `medium`, which is a
+    fabricated recommendation wearing the model's name, and §6's comparison between the
+    suggestion and the business decision would be reading a number nobody chose.
     """
-    result = validate_output(Classification, {"category": "Billing", "confidence": 0.5})
+    result = validate_output(
+        Classification, {"category": "Billing", "priority": "medium", "confidence": 0.5}
+    )
 
     assert result.subcategory is None
 
@@ -103,22 +125,29 @@ def test_sentiment_uses_the_database_enum() -> None:
         # JSON, but not an object — a bare array or scalar from a model that lost the plot.
         ("[1, 2, 3]", "not an object"),
         ('"Billing"', "not an object"),
-        # An object missing the field the schema requires.
+        # An object missing the fields the schema requires. `priority` is absent too, so
+        # this is the "answered nothing at all" case rather than a single-field one.
         ({"confidence": 0.94}, "missing"),
+        # `priority` alone, absent: the field §51 added, on an answer that is otherwise
+        # well-formed. This is the case that would pass silently if it had a default.
+        ({"category": "Billing", "confidence": 0.94}, "priority: missing"),
         # A confidence outside the range, in the two ways a model produces it: a
         # percentage, and a negative.
-        ({"category": "Billing", "confidence": 1.4}, "less_than_equal"),
-        ({"category": "Billing", "confidence": -0.1}, "greater_than_equal"),
+        ({"category": "Billing", "priority": "high", "confidence": 1.4}, "less_than_equal"),
+        ({"category": "Billing", "priority": "high", "confidence": -0.1}, "greater_than_equal"),
         # A field of the wrong type entirely.
-        ({"category": "Billing", "confidence": "very high"}, "float_parsing"),
+        ({"category": "Billing", "priority": "high", "confidence": "very high"}, "float_parsing"),
         # A field the schema does not have. `extra="forbid"` is what makes this a
         # rejection rather than a value that silently disappears.
-        ({"category": "Billing", "confidence": 0.9, "urgency": "high"}, "extra_forbidden"),
+        (
+            {"category": "Billing", "priority": "high", "confidence": 0.9, "urgency": "x"},
+            "extra_forbidden",
+        ),
         # A category past the column's own width, so the failure lands here and not in a
         # transaction that has already spent the tokens.
-        ({"category": "B" * 101, "confidence": 0.9}, "string_too_long"),
+        ({"category": "B" * 101, "priority": "high", "confidence": 0.9}, "string_too_long"),
         # An empty category — a model that answered with nothing.
-        ({"category": "", "confidence": 0.9}, "string_too_short"),
+        ({"category": "", "priority": "high", "confidence": 0.9}, "string_too_short"),
         # `null`, from a model that returned an explicit nothing.
         (None, "not an object"),
     ],
@@ -139,6 +168,21 @@ def test_an_invented_enum_member_is_rejected() -> None:
     """`Sentiment` is the database's vocabulary; a model may not add to it."""
     with pytest.raises(AIOutputError, match="sentiment: enum"):
         validate_output(SentimentResult, {"sentiment": "furious", "confidence": 0.9})
+
+
+def test_an_invented_priority_is_rejected() -> None:
+    """`TicketPriority` likewise, and the reason is stronger than for sentiment.
+
+    A priority a model invented is a band the tenant's SLA policies have no row for — §27's
+    targets are keyed by `priority` — so accepting `"critical"` here would move the failure
+    from a validation error to a lookup that finds nothing, in a worker, after the tokens
+    were spent. `Classification.priority` is an enum for the same reason `tickets.priority`
+    is: the prompt teaches the four values by name, so a fifth is a model that did not read.
+    """
+    with pytest.raises(AIOutputError, match="priority: enum"):
+        validate_output(
+            Classification, {"category": "Billing", "priority": "critical", "confidence": 0.9}
+        )
 
 
 def test_output_error_is_not_a_permanent_error() -> None:
@@ -162,7 +206,11 @@ def test_the_rejection_never_quotes_the_value() -> None:
     with pytest.raises(AIOutputError) as caught:
         validate_output(
             Classification,
-            {"category": "Refund for order 88213", "confidence": "extremely likely"},
+            {
+                "category": "Refund for order 88213",
+                "priority": "high",
+                "confidence": "extremely likely",
+            },
         )
 
     message = str(caught.value)
@@ -201,9 +249,12 @@ def test_no_schema_reaches_the_provider_with_a_ref(schema: type[BaseModel]) -> N
     """`$defs` and `$ref` are Pydantic's, not the provider's.
 
     Every one of these schemas is read by a model as much as by a validator, and an
-    indirection it has to chase is one more thing to get wrong. `Sentiment` is the only
-    `$ref` the four have, which is why this is a parameterised test over all of them rather
-    than a check on the one that currently needs it.
+    indirection it has to chase is one more thing to get wrong. This is a parameterised
+    test over all four rather than a check on the one that currently needs it, because
+    the set of schemas carrying a `$ref` is a property of the current field types and not
+    a fixed list — Phase T had one (`Sentiment`), and `Classification.priority` made it
+    two in the same schema. A test written for `SentimentResult` alone would have gone on
+    passing while `Classification` started shipping a `$ref` to a model.
     """
     rendered = str(_tool_schema(schema))
 
@@ -216,6 +267,20 @@ def test_the_inlined_enum_keeps_its_members() -> None:
     sentiment = _tool_schema(SentimentResult)["properties"]["sentiment"]
 
     assert sentiment["enum"] == ["positive", "neutral", "negative"]
+
+
+def test_both_enums_in_one_schema_are_inlined() -> None:
+    """`Classification` carries two, and each has to arrive whole.
+
+    A model reads the enum members as the vocabulary it may answer in. An inliner that
+    resolved the first reference and left the second — or that collapsed both to the same
+    definition — would hand the model a schema that asks for a priority from the sentiment
+    list, and the rejection would land on a model that answered exactly as instructed.
+    """
+    rendered = _tool_schema(Classification)["properties"]
+
+    assert rendered["priority"]["enum"] == ["low", "medium", "high", "urgent"]
+    assert "enum" not in rendered["category"]
 
 
 def test_the_schema_forbids_unlisted_fields() -> None:

@@ -63,6 +63,7 @@ from typing import Any
 
 import structlog
 from pydantic import BaseModel, ValidationError
+from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from app.core.permissions import TICKET_SCOPE_BY_ROLE, RowScope
@@ -170,7 +171,7 @@ async def get_version(organization_id: uuid.UUID) -> int:
         return 0
 
 
-async def invalidate(organization_id: uuid.UUID) -> None:
+async def invalidate(organization_id: uuid.UUID, *, client: Redis | None = None) -> None:
     """Move the tenant's version forward, making every existing entry unreachable.
 
     Called from the ticket writers, beside the realtime publish and in the same post-commit
@@ -181,9 +182,16 @@ async def invalidate(organization_id: uuid.UUID) -> None:
     number* rather than a lost write, and it is bounded by the TTL; the alternative is
     failing the write itself, which would be a data-loss bug in exchange for a fresher
     dashboard.
+
+    **`client` is for a caller that does not own a long-lived event loop.** `get_client`'s
+    own docstring is explicit that the shared client is correct only in the API, and
+    `app/workers/ai_tasks.py` reaches this through `event_loop.run`, which builds *and
+    closes* a loop per invocation — so the task passes the `redis.scoped_client()` it is
+    already holding for its publish, exactly as `realtime.publish` lets it. The default
+    keeps every request-path call site unchanged and correct.
     """
     try:
-        await get_client().incr(_version_key(organization_id))
+        await (client or get_client()).incr(_version_key(organization_id))
     except (RedisError, OSError) as exc:
         logger.warning(
             "analytics_invalidate_failed",

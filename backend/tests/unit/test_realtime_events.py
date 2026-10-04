@@ -154,7 +154,7 @@ def test_unpublished_events_are_reported_as_unpublishable() -> None:
     something declared silent.
     """
     assert events.realtime_type_for(TicketEventType.SLA_WARNING) is None
-    assert events.realtime_type_for(TicketEventType.AI_ANALYSIS_COMPLETED) is None
+    assert events.realtime_type_for(TicketEventType.SLA_BREACHED) is None
 
     for event_type, expected in events.REALTIME_FOR_EVENT.items():
         assert events.realtime_type_for(event_type) is expected

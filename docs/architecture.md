@@ -135,22 +135,32 @@ AI-review rules structural rather than conventional.
 
 ## 6. AI flow
 
-The lower half of this section is implemented; the upper half is a plan. **Phase T (ADR-027)**
-built the provider abstraction, the call path, and the ledger, and deliberately built no route and
-no Celery task — the work those would carry is Phase U's, V's, and W's.
+The lower half of this section is implemented; the upper half is partly so. **Phase T (ADR-027)**
+built the provider abstraction, the call path, and the ledger. **Phase U (ADR-029)** built §18's flow
+around them for the first two operations — classification and sentiment — with the route, the queue,
+and the worker. Summarization (§20) and suggested replies (§21) are Phases V and W, and the flow below
+gains a line each when they land.
 
 ```
-trigger (ticket created, or agent request)          ── plan: Phases U-W
-   → enqueue task, return immediately                    ── plan: U, and `celery_app.py`'s undeclared `ai` queue
-   → worker loads ticket within tenant scope             ── plan: U
-   → build prompt from a versioned template              ── mechanism in T (`app/ai/prompts.py`); text in U-W
+trigger (ticket created, or agent request)          ── ✅ U
+   → enqueue task, return immediately                    ── ✅ U, on the `ai` queue
+   → worker loads ticket within tenant scope             ── ✅ U (`ai_repository.py`, tenant in the WHERE)
+   → build prompt from a versioned template              ── mechanism in T (`app/ai/prompts.py`); classification and sentiment text in U; summarization and replies in V-W
    → provider call with timeout and bounded retry        ── ✅ T
    → parse into a Pydantic model  ── invalid ──▶ handled failure, no result  ✅ T
    → persist AI_USAGE (one row per attempt)              ── ✅ T
-   → persist AI_ANALYSIS                                 ── plan: U
-   → update ticket AI fields                             ── plan: U
-   → publish event → clients update live                 ── plan: U
+   → persist AI_ANALYSIS                                 ── ✅ U
+   → update ticket AI fields                             ── ✅ U (never `tickets.priority`)
+   → publish event → clients update live                 ── ✅ U
 ```
+
+**What Phase U added on top of T.** Two routes under the ticket that owns them (ADR-029 Decision 6),
+`WorkerContext` — a tenant with no authority, so a task cannot authorize anything by construction
+(Decision 1) — and `ai_analysis_service.py`, which owns the `ai_analyses` rows: they are written
+`pending` at request time so the queue is visible, the task flips them to `processing` before it calls
+anything, and a redelivered task finds them terminal and does nothing. Both operations run in **one**
+task, so the ticket gets one timeline entry, one notification, and one announcement, because §18's
+last three steps are singular; a failure inside the run is still contained to its own operation.
 
 **What runs today.** `app/services/ai_service.py` is the single call path — `classify_ticket`,
 `analyze_sentiment`, `summarize_conversation`, `generate_response` — and every one of them reduces

@@ -35,6 +35,22 @@ a call that reached the provider would corrupt exactly that measurement.
 surface, and the three internal types are not it. The distinction between transient,
 permanent, and malformed survives in the log, where an operator can act on it, and not in
 the response, where a client's only correct action is to try again either way.
+
+**A caller passes a context, and there are exactly two kinds.** On the request path it is a
+`TenantContext`, built in `app/api/deps.py` from the authenticated user. In a Celery task it
+is a `WorkerContext`, built in `app/workers/ai_tasks.py` from the ticket's organization. Both
+are accepted; neither can be spelled from a request body, and the tenant still comes from a
+context in every case — §4's *"never trust organization_id supplied by the frontend"* is
+unweakened. The two kinds differ in what they *say*, not in what they can carry: a
+`WorkerContext` has no role and no permissions, so it cannot authorize anything, and these
+functions do not ask it to.
+
+**The four public functions return `AIResult[T]`, not `T`.** An `AIAnalysis` row records the
+prompt and completion tokens a call was billed, and the only object that knows them is the
+provider's `AIResult` — this module holds it and would otherwise discard it, leaving three
+declared columns permanently empty. Callers read `.value`. The alternative, re-querying the
+ledger row this function just staged, reads the ledger to learn something the service was
+already holding.
 """
 
 import asyncio
@@ -55,7 +71,7 @@ from app.ai.pricing import cost_usd
 from app.ai.provider import AIProvider, AIRequest, AIResult
 from app.core.config import Settings, get_settings
 from app.core.exceptions import AIServiceError
-from app.core.tenancy import TenantContext
+from app.core.tenancy import TenantContext, WorkerContext
 from app.models.ai_usage import AIUsage
 from app.models.enums import AIOperation
 from app.schemas.ai import (
@@ -120,7 +136,7 @@ def _backoff_seconds(settings: Settings, attempt: int) -> float:
 
 def _stage_usage(
     session: AsyncSession,
-    context: TenantContext,
+    context: TenantContext | WorkerContext,
     *,
     operation: AIOperation,
     provider: str,
@@ -133,10 +149,12 @@ def _stage_usage(
 ) -> None:
     """Append one ledger row for one attempt. **Never commits.**
 
-    `organization_id` comes from the `TenantContext` and nowhere else. §4: *"Never trust
+    `organization_id` comes from the context and nowhere else. §4: *"Never trust
     organization_id supplied by the frontend"* — nothing in this function's signature could
     carry one even if a caller wanted to pass one, which is the point of taking a context
-    rather than an id.
+    rather than an id. The context may be a `WorkerContext`, which is the same guarantee
+    expressed differently: it is built from a ticket's organization by a task, never from
+    anything a client sent.
 
     Built here rather than through a repository, following `sla_tasks._record`: the ledger
     is append-only, written from exactly this one place, and a repository whose only method
@@ -147,6 +165,11 @@ def _stage_usage(
     are nullable by design — a background embedding job has neither. Both are `SET NULL`
     foreign keys, so the row outlives the ticket it was about: spend that disappears when a
     ticket is deleted cannot be reconciled.
+
+    `user_id` is `None` for a `WorkerContext` because there is no user. The agent who
+    clicked "analyze" is recorded by the `AI_ANALYSIS_REQUESTED` audit row at request time,
+    which is where §34 puts "who asked"; the ledger answers "which tenant spent what",
+    which is a different question and one a task can answer.
     """
     session.add(
         AIUsage(
@@ -162,7 +185,7 @@ def _stage_usage(
                 model, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens
             ),
             ticket_id=ticket_id,
-            user_id=context.user_id,
+            user_id=context.user_id if isinstance(context, TenantContext) else None,
             latency_ms=latency_ms,
             was_successful=was_successful,
             was_cached=False,
@@ -172,15 +195,18 @@ def _stage_usage(
 
 async def _run[T: BaseModel](
     session: AsyncSession,
-    context: TenantContext,
+    context: TenantContext | WorkerContext,
     *,
     operation: AIOperation,
     provider: AIProvider,
     call: Callable[[AIRequest], Awaitable[AIResult[T]]],
     request: AIRequest,
     ticket_id: uuid.UUID | None,
-) -> T:
-    """Call once, retry the retryable, ledger every attempt, and return the validated value.
+) -> AIResult[T]:
+    """Call once, retry the retryable, ledger every attempt, and return the result.
+
+    Returns the provider's `AIResult` rather than its `value` so the caller can record what
+    the call cost — see the module docstring.
 
     The retry loop is the whole of §17's "timeout handling" and "retry strategy": the
     timeout is the client's (see `app/ai/claude.py`), and what this adds is the decision
@@ -291,7 +317,7 @@ async def _run[T: BaseModel](
                 completion_tokens=result.completion_tokens,
                 latency_ms=latency_ms,
             )
-            return result.value
+            return result
 
     # `AI_MAX_ATTEMPTS` is bounded below at 1 in `Settings`, so the loop always either
     # returns or raises. This is unreachable and exists so the function has a return path
@@ -301,12 +327,15 @@ async def _run[T: BaseModel](
 
 async def classify_ticket(
     session: AsyncSession,
-    context: TenantContext,
+    context: TenantContext | WorkerContext,
     request: AIRequest,
     *,
     ticket_id: uuid.UUID | None = None,
-) -> Classification:
-    """§18 — classify a ticket into a category, a subcategory, and a confidence.
+) -> AIResult[Classification]:
+    """§18 — classify a ticket into a category, a subcategory, a priority, and a confidence.
+
+    Returns the whole `AIResult`: `.value` is the `Classification`, and the token counts
+    beside it are what `ai_analysis_service` writes onto the `AIAnalysis` row it is filling.
 
     The caller commits the ledger row this stages, including when it raises.
     """
@@ -324,11 +353,11 @@ async def classify_ticket(
 
 async def analyze_sentiment(
     session: AsyncSession,
-    context: TenantContext,
+    context: TenantContext | WorkerContext,
     request: AIRequest,
     *,
     ticket_id: uuid.UUID | None = None,
-) -> SentimentResult:
+) -> AIResult[SentimentResult]:
     """§19 — read the customer's sentiment and how confident that reading is.
 
     The caller commits the ledger row this stages, including when it raises.
@@ -347,11 +376,11 @@ async def analyze_sentiment(
 
 async def summarize_conversation(
     session: AsyncSession,
-    context: TenantContext,
+    context: TenantContext | WorkerContext,
     request: AIRequest,
     *,
     ticket_id: uuid.UUID | None = None,
-) -> ConversationSummary:
+) -> AIResult[ConversationSummary]:
     """§20 — summarize a conversation.
 
     The caller commits the ledger row this stages, including when it raises.
@@ -370,11 +399,11 @@ async def summarize_conversation(
 
 async def generate_response(
     session: AsyncSession,
-    context: TenantContext,
+    context: TenantContext | WorkerContext,
     request: AIRequest,
     *,
     ticket_id: uuid.UUID | None = None,
-) -> SuggestedReply:
+) -> AIResult[SuggestedReply]:
     """§21 — draft a reply for an agent to review, edit, and send themselves.
 
     **Nothing here sends anything.** §21's *"AI must NEVER automatically send a

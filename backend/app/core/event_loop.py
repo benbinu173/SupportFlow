@@ -57,6 +57,30 @@ def run[T](coro: Coroutine[Any, Any, T]) -> T:
     For entrypoints that own the loop themselves — Celery tasks under the solo
     pool, and management scripts. Anything reaching the database from synchronous
     code must go through here rather than calling `asyncio.run` directly.
+
+    **Runs on a loop it then closes.** That is the whole reason `current_loop`
+    below exists: a connection pool cached in a module global outlives the task
+    that built it, and the second task finds it pointing at a loop that is gone.
     """
     with asyncio.Runner(loop_factory=loop_factory) as runner:
         return runner.run(coro)
+
+
+def current_loop() -> asyncio.AbstractEventLoop | None:
+    """The loop this call is running on, or `None` when there is none.
+
+    For caches of objects that belong to a loop — a connection pool, an HTTP
+    client's transport — rather than to the process. Combined with `run` above,
+    which builds one loop per Celery task and closes it on return, the answer
+    differs between two consecutive tasks in the same worker process, which is
+    exactly what such a cache has to notice before it hands back a dead client.
+
+    `None` rather than an exception outside a loop because a synchronous caller
+    is a legal caller: `reset_client` and the tests that construct a client to
+    assert what it was built with both run here. It is not a "no loop, so
+    anything goes" answer — it is "no loop, so nothing can be keyed on one".
+    """
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None

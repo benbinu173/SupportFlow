@@ -39,7 +39,7 @@ the column.
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.models.enums import Sentiment
+from app.models.enums import Sentiment, TicketPriority
 
 # Shared by all four below. See the module docstring for why `forbid` is not optional.
 _STRICT = ConfigDict(extra="forbid")
@@ -54,6 +54,25 @@ class Classification(BaseModel):
     to satisfy a required field is worse than `null` — the first is indistinguishable
     from a real answer and the second is not.
 
+    **`priority` rides on the classification call rather than getting one of its own.**
+    §51 asks for a priority recommendation and §17's provider interface has exactly four
+    operations; a fifth would mean a new `AIOperation` member, which is `ALTER TYPE` on a
+    PostgreSQL enum — a migration for a value the model can answer in the call it is
+    already making, from the same reading of the same ticket, at no extra cost.
+
+    **It is the model's judgement and that is what makes the column it feeds honest.**
+    `tickets.ai_recommended_priority`'s comment says it holds *"what the model suggested"*,
+    and the alternative — a Python rule banding a category and a sentiment into a priority
+    — would produce a number that is a rule's output wearing a recommendation's name.
+    §6 keeps this separate from `tickets.priority` precisely so the business decision and
+    the suggestion can be compared; a fabricated suggestion makes that comparison
+    meaningless. `ticket_service.change_priority` is the only writer of `tickets.priority`
+    and this field never reaches it.
+
+    `TicketPriority` is reused from `app/models/enums.py` for the reason the module
+    docstring gives about `Sentiment`: the value is destined for a column typed by that
+    enum object, and restating its members is how the two stop matching.
+
     The lengths match `tickets.category` and `tickets.subcategory`, both `String(100)`.
     """
 
@@ -61,6 +80,7 @@ class Classification(BaseModel):
 
     category: str = Field(min_length=1, max_length=100)
     subcategory: str | None = Field(default=None, max_length=100)
+    priority: TicketPriority
     confidence: float = Field(ge=0, le=1)
 
 

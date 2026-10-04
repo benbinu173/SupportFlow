@@ -80,6 +80,7 @@ class RealtimeEventType(StrEnum):
     TICKET_NOTE_ADDED = "ticket.note_added"
     TICKET_ATTACHMENT_ADDED = "ticket.attachment_added"
     TICKET_REOPENED = "ticket.reopened"
+    TICKET_AI_ANALYSIS_COMPLETED = "ticket.ai_analysis_completed"
     NOTIFICATION_CREATED = "notification.created"
 
 
@@ -97,25 +98,31 @@ REALTIME_FOR_EVENT: Mapping[TicketEventType, RealtimeEventType] = {
     TicketEventType.INTERNAL_NOTE_ADDED: RealtimeEventType.TICKET_NOTE_ADDED,
     TicketEventType.ATTACHMENT_ADDED: RealtimeEventType.TICKET_ATTACHMENT_ADDED,
     TicketEventType.REOPENED: RealtimeEventType.TICKET_REOPENED,
+    # §25's fifth event type, publishable since Phase U built the analysis it announces.
+    # It is a genuine ticket change rather than a clock moving: the row a client is
+    # rendering gains a category, a sentiment, and a recommended priority. Published to
+    # every socket that can see the ticket, including a customer's — the analysis of a
+    # ticket is already on `TicketRead` for every role that can read the ticket at all,
+    # so this is the existing shape of the data rather than a new disclosure.
+    TicketEventType.AI_ANALYSIS_COMPLETED: RealtimeEventType.TICKET_AI_ANALYSIS_COMPLETED,
 }
 
-# Timeline entries that produce no `ticket.*` envelope. Two reasons, and the comment names
-# which is which because they expire differently:
+# Timeline entries that produce no `ticket.*` envelope. One reason, and the comment says
+# why the set is now down to two: the SLA pair notifies somebody, and that notification is
+# published as `notification.created`. What they do not have is a ticket event worth
+# announcing — the change is to a clock, not to a field a client is rendering, and the
+# sweep touches every candidate on every pass. Phase Q's `SCHEDULED_EVENT_TYPES` is the
+# same division from the notification side.
 #
-#   * The SLA pair — a warning and a breach do notify somebody, and that notification is
-#     published as `notification.created`. What they do not have is a ticket event worth
-#     announcing: the change is to a clock, not to a field a client is rendering, and the
-#     sweep touches every candidate on every pass. Phase Q's `SCHEDULED_EVENT_TYPES` is the
-#     same division from the notification side.
-#   * `AI_ANALYSIS_COMPLETED` — §25 lists "AI analysis completion" as a realtime event, and
-#     nothing produces it yet. It is named here rather than omitted so that Phase T-W has an
-#     entry to delete, and so that the partition test below does not silently pass while the
-#     spec's fifth event type is unpublishable.
+# **`AI_ANALYSIS_COMPLETED` left this set in Phase U**, which is what the comment here
+# used to say it was waiting for. It sat in `UNPUBLISHED_EVENT_TYPES` through Phases R-T
+# on purpose — "named here rather than omitted so that Phase T-W has an entry to delete" —
+# because a partition test with the entry absent would have passed while §25's fifth event
+# type was silently unpublishable.
 UNPUBLISHED_EVENT_TYPES: frozenset[TicketEventType] = frozenset(
     {
         TicketEventType.SLA_WARNING,
         TicketEventType.SLA_BREACHED,
-        TicketEventType.AI_ANALYSIS_COMPLETED,
     }
 )
 

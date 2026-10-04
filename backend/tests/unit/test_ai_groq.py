@@ -30,6 +30,7 @@ import pytest
 from app.ai import groq
 from app.ai.errors import AIOutputError, AIPermanentError, AITransientError
 from app.ai.provider import AIRequest
+from app.core import event_loop
 from app.schemas.ai import Classification
 
 pytestmark = pytest.mark.unit
@@ -41,9 +42,11 @@ MODEL = "openai/gpt-oss-120b"
 API_KEY = "gsk_this-key-must-never-be-logged-4c81"
 
 #: §18's own example, as Groq returns it: a JSON **string** under `function.arguments`, which
-#: is the OpenAI shape and the one `validate_output` has accepted since Phase T.
+#: is the OpenAI shape and the one `validate_output` has accepted since Phase T. The
+#: `priority` is Phase U's — §51's recommendation, on the classification call.
 CLASSIFICATION_ARGUMENTS = (
-    '{"category": "Billing", "subcategory": "Duplicate charge", "confidence": 0.97}'
+    '{"category": "Billing", "subcategory": "Duplicate charge",'
+    ' "priority": "high", "confidence": 0.97}'
 )
 
 
@@ -174,7 +177,9 @@ async def test_arguments_are_a_json_string_rather_than_an_object(wire: Wire) -> 
     this asserts that the shape genuinely reaches it, because a change that started
     `json.loads`-ing in this module instead would be §18 implemented a second time.
     """
-    wire.answers(_completion(arguments='{"category": "Technical", "confidence": 0.5}'))
+    wire.answers(
+        _completion(arguments='{"category": "Technical", "priority": "medium", "confidence": 0.5}')
+    )
 
     result = await groq.GroqProvider().classify_ticket(_request())
 
@@ -554,3 +559,40 @@ def test_the_shared_client_carries_the_key_as_a_header(
 
     assert client.headers["authorization"] == f"Bearer {API_KEY}"
     assert groq._shared_client() is client
+
+
+def test_the_shared_client_is_rebuilt_when_it_is_on_a_loop_that_has_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The trap a Celery worker walks into, reproduced without a worker.
+
+    `event_loop.run` builds a loop for each task and closes it on the way out, which is what
+    the solo pool does for every `analyze_ticket`. A client cached on the process rather than
+    on the loop therefore outlives the loop its connection pool belongs to, and the *second*
+    task meets `RuntimeError('Event loop is closed')` from inside the transport — after the
+    first task has already succeeded, so the failure looks intermittent. `app/core/redis.py`'s
+    `scoped_client` exists for this same trap and answers it the same way.
+
+    Both halves are asserted, because a cache that rebuilt unconditionally would satisfy the
+    second one on its own: `_shared_client` is one client *per loop*, not one per call.
+    """
+    monkeypatch.setattr(groq, "_client", None)
+    monkeypatch.setattr(groq, "_client_loop", None)
+    monkeypatch.setattr(
+        groq,
+        "get_settings",
+        lambda: SimpleNamespace(AI_API_KEY=API_KEY, AI_TIMEOUT_SECONDS=30.0),
+    )
+
+    async def twice() -> tuple[Any, Any]:
+        return groq._shared_client(), groq._shared_client()
+
+    first, same = event_loop.run(twice())
+    second, _ = event_loop.run(twice())
+
+    assert first is same, "a client is still reused within one loop"
+    assert first is not second, "and not across two, the first of which is now closed"
+
+    # Neither is closed, and neither can be: `aclose()` needs the loop its pool was built
+    # on, and both loops are gone. That is why the stale client is dropped rather than
+    # closed, and it is the one loose end this fix leaves.

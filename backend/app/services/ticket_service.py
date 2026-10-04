@@ -55,7 +55,7 @@ from app.schemas.ticket import (
     TicketSortKey,
     TicketStatusUpdate,
 )
-from app.services import audit_service, notification_service
+from app.services import ai_analysis_service, audit_service, notification_service
 from app.websocket import manager as realtime
 
 logger = structlog.get_logger(__name__)
@@ -257,6 +257,18 @@ async def create_ticket(
     # the cached analytics entries are invalidated in the same post-commit position. The
     # invalidation is a counter rather than a deletion — see `app/core/cache.py`.
     await cache.invalidate(context.organization_id)
+
+    # §18 steps 1 and 2: the ticket is queued for analysis, and every new ticket is. This is
+    # the only place that decides so — `POST /tickets/{id}/ai/analyze` is the same call for a
+    # ticket that already exists, and both go through the same in-flight guard, so a ticket
+    # created and immediately re-analyzed by hand does not pay for the work twice.
+    #
+    # The analysis service commits its own rows, which is why this is here rather than folded
+    # into the transaction above: those rows have to be visible before the task that fills
+    # them can read them, and the task is queued from inside that service. Nothing in this
+    # request path calls a provider — §16's *"the API should not wait unnecessarily for the
+    # LLM"* is satisfied by the analysis being a message to a broker and nothing more.
+    await ai_analysis_service.request_analysis(session, context, ticket, origin=origin)
 
     logger.info(
         "ticket_created",

@@ -88,6 +88,7 @@ AI_LOGGING_MODULES = ("app.ai.claude", "app.ai.groq", "app.services.ai_service")
 VALID_CLASSIFICATION = {
     "category": "Billing",
     "subcategory": "Duplicate Charge",
+    "priority": "high",
     "confidence": 0.94,
 }
 
@@ -143,9 +144,13 @@ def _install_client(
 ) -> None:
     """Point `ClaudeProvider` at a stand-in socket, answering with one of two behaviours.
 
-    `_client` is reset because `_shared_client` caches process-wide, and `get_settings` is
-    replaced so the key under test is the one the client would be built with — the
-    credential has to be *in play* for its absence from the log to mean anything.
+    Both halves of the cached client are reset — the client and the loop it was built on —
+    because `_shared_client` caches per loop rather than per process, and this helper's
+    tests each run on their own. Leaving the loop behind would make a later test that
+    replaces `_client` with a double look like a client built on a loop that is now gone,
+    and it would be discarded. `get_settings` is replaced so the key under test is the one
+    the client would be built with — the credential has to be *in play* for its absence
+    from the log to mean anything.
     """
 
     async def create(**kwargs: Any) -> Any:
@@ -167,6 +172,7 @@ def _install_client(
         )
 
     monkeypatch.setattr(claude, "_client", None)
+    monkeypatch.setattr(claude, "_client_loop", None)
     monkeypatch.setattr(
         claude,
         "AsyncAnthropic",

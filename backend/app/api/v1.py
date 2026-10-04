@@ -8,6 +8,7 @@ environment can move it without touching the routes.
 
 from fastapi import APIRouter
 
+from app.api.ai import router as ai_router
 from app.api.analytics import router as analytics_router
 from app.api.attachments import router as attachments_router
 from app.api.audit import router as audit_router
@@ -29,6 +30,11 @@ router.include_router(tickets_router, prefix="/tickets", tags=["tickets"])
 # reachable exactly when its ticket is, and the URL says so. Its paths carry the
 # `{ticket_id}` segment themselves.
 router.include_router(messages_router, prefix="/tickets", tags=["messages"])
+# The same mounting argument, for the same shape of resource: an analysis is reachable
+# exactly when its ticket is. §36 writes the paths as `/tickets/{ticket_id}/ai/analyze`,
+# so the `{ticket_id}` segment is on every route inside the module rather than coming
+# from the prefix.
+router.include_router(ai_router, prefix="/tickets", tags=["ai"])
 # No prefix, because this router holds both shapes: the list is
 # `/tickets/{ticket_id}/attachments` and the download is `/attachments/{id}`. Both paths
 # are written in full, which is what lets the download exist at all — a download has only

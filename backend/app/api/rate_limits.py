@@ -20,11 +20,16 @@ Keying is per-endpoint and deliberate, not uniform — see each guard, and
 | `limit_login` | client IP | 60s | `RATE_LIMIT_LOGIN_PER_MINUTE` |
 | `limit_register` | client IP | 3600s | `RATE_LIMIT_REGISTER_PER_HOUR` |
 | `limit_upload` | user id | 3600s | `RATE_LIMIT_UPLOAD_PER_HOUR` |
+| `limit_ai` | user id | 3600s | `RATE_LIMIT_AI_PER_HOUR` |
 
 The first two are per address because they run *before* authentication, where no
-identity exists yet and the attack is spread across many accounts. The third is per user
-because it runs *after* authentication, where identity exists and the abuse is one
-account's — see `upload_rate_limit_key`.
+identity exists yet and the attack is spread across many accounts. The last two are per
+user because they run *after* authentication, where identity exists and the abuse is one
+account's — see `upload_rate_limit_key` and `ai_rate_limit_key`.
+
+`limit_ai` is the one guard whose subject is not an attack but a bill: §53 names repeated
+AI calls as waste, and every request it admits can become a provider call charged per
+token. It is stated here because the module's rule is that every limit is stated here.
 
 Nothing here holds a logger: `RateLimiter.enforce` does the logging, including the
 warning that makes fail-open audible (ADR-014).
@@ -36,6 +41,7 @@ from app.api.deps import Context, client_ip
 from app.core.config import get_settings
 from app.core.rate_limit import (
     RateLimiter,
+    ai_rate_limit_key,
     login_rate_limit_key,
     register_rate_limit_key,
     upload_rate_limit_key,
@@ -79,5 +85,28 @@ async def limit_upload(context: Context) -> None:
     await _limiter.enforce(
         upload_rate_limit_key(context.user_id),
         limit=settings.RATE_LIMIT_UPLOAD_PER_HOUR,
+        window_seconds=3600,
+    )
+
+
+async def limit_ai(context: Context) -> None:
+    """Count one analysis request against the authenticated user.
+
+    Keyed by user for the same reason as `limit_upload`, and it is the same key shape on
+    purpose: this runs after authentication because it must — the caller has to hold
+    `AI_REQUEST_ANALYSIS`, which is a decision about a role, and there is no role before
+    the token is verified.
+
+    **What it protects is a budget, not a credential.** The other three guards here keep
+    an attacker out; this one keeps a client from spending the tenant's AI allowance by
+    looping over a ticket id, which §53 names as waste and which the provider would bill
+    for every time. It is a dependency rather than a check inside the handler so the
+    counter is incremented before the rows are written — a request refused at 429 must
+    leave no `pending` analysis behind, or the refusal would itself queue work.
+    """
+    settings = get_settings()
+    await _limiter.enforce(
+        ai_rate_limit_key(context.user_id),
+        limit=settings.RATE_LIMIT_AI_PER_HOUR,
         window_seconds=3600,
     )

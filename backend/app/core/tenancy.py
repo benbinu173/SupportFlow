@@ -90,6 +90,46 @@ class TenantContext:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkerContext:
+    """The tenant a background task acts for. **Carries no authority.**
+
+    A Celery task has no request and so no `TenantContext` — but the work it does is still
+    tenant-owned, and `AIUsage.organization_id` has to say which tenant paid for a call.
+    This is that value and nothing else.
+
+    **What it deliberately does not have is the point.** No `role`, no `permissions`, no
+    `has()`, no `scope_for()`. It cannot answer an authorization question because it cannot
+    be asked one, so a task cannot grant itself a capability by holding one — the guarantee
+    is structural rather than a convention somebody has to remember. `sla_repository.py`
+    refused to invent a `TenantContext` in Phase Q for exactly this reason: *"`role` would
+    have no honest value at all: it decides `permissions`, and there is no role whose
+    permissions describe 'the scheduler'."* A fabricated identity is the class of thing
+    ADR-009 and §4 exist against, and this is the honest alternative — a value that says
+    "this tenant" and is silent on "as whom".
+
+    It follows that `TenantScopedRepository` does not accept one. A worker reaches the
+    database through module-level functions that take `organization_id` explicitly
+    (`app/repositories/sla_repository.py`, `app/repositories/ai_repository.py`), which keeps
+    the set of context-free queries small enough to count — in one place, per the reasoning
+    those modules give. It also writes its own timeline entries rather than calling
+    `ticket_service.record_event`, which needs a `TenantContext` to name its actor;
+    `app/workers/sla_tasks.py` made that call in Phase Q and its comment already names
+    *"completed AI analyses"* among the events with no actor.
+
+    **One consumer, and that is the whole list:** `app/services/ai_service.py`, which takes
+    it so the ledger row can say which tenant the spend belongs to. Passing a bare
+    `uuid.UUID` there would compile and would work, and would give up the property that
+    makes a wrong tenant unpassable — a `WorkerContext` is a *type* that says "this tenant,
+    no caller", and an id says nothing at all.
+    """
+
+    organization_id: uuid.UUID
+
+    def __repr__(self) -> str:
+        return f"<WorkerContext org={self.organization_id}>"
+
+
+@dataclass(frozen=True, slots=True)
 class RequestOrigin:
     """Where a request came from, as far as the socket and the headers can say.
 
