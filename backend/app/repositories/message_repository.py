@@ -10,6 +10,7 @@ hides — so the default is the restrictive one.
 import uuid
 from collections.abc import Sequence
 
+from app.models.enums import SenderType
 from app.models.message import Message
 from app.repositories.base import TenantScopedRepository
 
@@ -57,3 +58,28 @@ class MessageRepository(TenantScopedRepository[Message]):
         )
         result = await self.session.execute(statement)
         return result.scalars().all()
+
+    async def find_draft(self, ticket_id: uuid.UUID, draft_id: uuid.UUID) -> Message | None:
+        """The unsent AI draft `draft_id` names on this ticket, if there is one.
+
+        Three predicates, and all three are the access rule: the id, the ticket the caller has
+        already resolved through `require_visible_ticket`, and `sender_type = AI_DRAFT`. A
+        message id from another ticket, from another tenant, or belonging to an ordinary reply
+        therefore all produce `None`, which the caller renders as one 404.
+
+        **That a non-draft is refused here rather than by a check at the call site is the
+        point.** "This message is not a draft" and "there is no such draft" are the same answer
+        to a caller outside the tenant, and answering them differently would confirm that a
+        guessed message id exists — the oracle ADR-009 refuses.
+
+        The tenant predicate comes from `_select`, so a draft id belonging to another
+        organization is unreachable even if the `ticket_id` passed in were somehow wrong.
+        """
+        result = await self.session.execute(
+            self._select(
+                Message.id == draft_id,
+                Message.ticket_id == ticket_id,
+                Message.sender_type == SenderType.AI_DRAFT,
+            )
+        )
+        return result.scalar_one_or_none()

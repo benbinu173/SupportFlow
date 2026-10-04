@@ -135,18 +135,19 @@ AI-review rules structural rather than conventional.
 
 ## 6. AI flow
 
-The lower half of this section is implementation, and the flow has one operation left to gain. **Phase
-T (ADR-027)** built the provider abstraction, the call path, and the ledger. **Phase U (ADR-029)** built
-§18's flow around them for the first two operations — classification and sentiment — with the route, the
-queue, and the worker. **Phase V (ADR-030)** added §20's summary on the same worker and a rule that
-decides when it does not need to run at all. Suggested replies (§21) are Phase W, and the flow gains its
-last line when they land.
+The lower half of this section is implementation, and every operation `AIProvider` declares now has a
+line on it. **Phase T (ADR-027)** built the provider abstraction, the call path, and the ledger. **Phase
+U (ADR-029)** built §18's flow around them for the first two operations — classification and sentiment —
+with the route, the queue, and the worker. **Phase V (ADR-030)** added §20's summary on the same worker
+and a rule that decides when it does not need to run at all. **Phase W (ADR-031)** added §21's suggested
+reply, which is the fourth and last method on the protocol. What remains for the AI half of the system
+is retrieval (Phase X), and that adds an *input* to a prompt rather than a line to this diagram.
 
 ```
 trigger (ticket created, or agent request)          ── ✅ U; ✅ V by request, when the conversation moved
    → enqueue task, return immediately                    ── ✅ U, on the `ai` queue
    → worker loads ticket within tenant scope             ── ✅ U (`ai_repository.py`, tenant in the WHERE)
-   → build prompt from a versioned template              ── mechanism in T (`app/ai/prompts.py`); classification and sentiment text in U; summarization text in V; replies in W
+   → build prompt from a versioned template              ── mechanism in T (`app/ai/prompts.py`); classification and sentiment text in U; summarization text in V; reply text in W
    → provider call with timeout and bounded retry        ── ✅ T
    → parse into a Pydantic model  ── invalid ──▶ handled failure, no result  ✅ T
    → persist AI_USAGE (one row per attempt)              ── ✅ T; ✅ V records a served-from-storage answer as a row with `was_cached`
@@ -173,6 +174,30 @@ the saving is a count of rows rather than an estimate, and `/analytics/overview`
 to read it. The flow above changes in exactly two places: the trigger can now be a request against a
 ticket that is already analyzed, and one of §18's steps writes nothing — a summary stores a result and
 touches no ticket field, which is why a summary-only run announces without notifying.
+
+**What Phase W added on top of V.** §21's suggested reply as a **third entry point on the same worker**,
+and the one operation whose result a person can put in front of a customer. The draft is **two records
+and no new column**: the model's own output goes in an `ai_analyses` row exactly as every other
+operation's does, and a second row — a `messages` row with `sender_type = AI_DRAFT`, `is_internal = true`
+— puts it in the thread, which is what makes §21's *"explicit UI distinction between AI generated draft
+and human-authored response"* a field already on `MessageRead`. `ai_draft_is_internal` (Phase D) makes
+the customer half of that structural: a draft that is not internal is refused by the database, not by a
+service. **§41's three verbs are a route and an audit trail, and nothing else.** *Regenerate* is asking
+again — the request path writes `AI_RESPONSE_REGENERATED` instead of `AI_ANALYSIS_REQUESTED` when a
+completed draft already exists, so no second route and no `?force=` is needed, and deliberately **no
+freshness rule**: Phase V's rule says a summary is reusable because the same input has one right answer,
+while a second draft request is a person asking for a *different* one. *Edit* is the client's text box,
+and only the text that actually went out is persisted. *Accept* is its own route under the ticket, not a
+field on the reply body, because it carries two capabilities at once — `AI_REQUEST_SUGGESTION` and
+`MESSAGE_POST_REPLY` — the way `app/api/messages.py` already refuses to fold a public reply and an
+internal note into one endpoint. Accepting **re-authors** the draft: a new `agent` message goes out
+through the ordinary reply path, with the same `first_response_at`, notification, socket publish, and
+cache invalidation as any other reply, and the draft row stays behind internal and untouched. The
+before/after pair in `AI_RESPONSE_ACCEPTED` is where §34's *"where appropriate"* finally has a case it
+was written for — the draft's body against the body that was sent, with `edited` saying whether they
+differ. And **§21's "relevant knowledge" step is not here**: that retrieval is §22's, and a parameter W
+always passed empty would be a stub with no caller, which is the same reasoning ADR-008 used to keep
+`generate_embedding` off the protocol. The change is additive and lands in one function in Phase X.
 
 **What runs today.** `app/services/ai_service.py` is the single call path — `classify_ticket`,
 `analyze_sentiment`, `summarize_conversation`, `generate_response` — and every one of them reduces

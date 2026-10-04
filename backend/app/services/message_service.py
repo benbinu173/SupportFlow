@@ -15,6 +15,10 @@ Two things hang off posting a message besides the row itself:
   the central mapping in `app/core/permissions.py`.
 * **`first_response_at`.** Set the first time a member of staff posts a public reply,
   and never by an internal note, which by definition did not reach the customer.
+* **Acceptance.** A reply that names an AI draft — §41's "accept" — stages one
+  `AI_RESPONSE_ACCEPTED` audit row in the same transaction. The rest of the reply is
+  unchanged, because an accepted draft *is* an ordinary reply that happens to have come
+  from somewhere; what the draft adds is a record of what was offered and what went out.
 """
 
 import uuid
@@ -24,15 +28,15 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import cache
-from app.core.exceptions import ValidationError
+from app.core.exceptions import ErrorCode, NotFoundError, ValidationError
 from app.core.permissions import SENDER_TYPE_BY_ROLE, Permission
-from app.core.tenancy import TenantContext
-from app.models.enums import SenderType, TicketEventType, TicketStatus
+from app.core.tenancy import RequestOrigin, TenantContext
+from app.models.enums import AuditAction, SenderType, TicketEventType, TicketStatus
 from app.models.message import Message
 from app.models.ticket import Ticket
 from app.repositories.message_repository import MessageRepository
 from app.schemas.message import MessageCreate
-from app.services import notification_service, ticket_service
+from app.services import audit_service, notification_service, ticket_service
 from app.websocket import manager as realtime
 
 logger = structlog.get_logger(__name__)
@@ -77,6 +81,9 @@ async def post_reply(
     context: TenantContext,
     ticket_id: uuid.UUID,
     payload: MessageCreate,
+    *,
+    draft_id: uuid.UUID | None = None,
+    origin: RequestOrigin | None = None,
 ) -> Message:
     """Post a customer-facing reply.
 
@@ -88,13 +95,66 @@ async def post_reply(
     A public reply from staff is the ticket's first response, if it has not had one.
     Recorded here because this is the moment it becomes true; reconstructing it from the
     thread later would mean the timestamp was never authoritative.
+
+    **`draft_id` is §41's accept, and it changes what is recorded rather than what is sent.**
+    Given one, the draft is resolved on this ticket and this tenant, and a single
+    `AI_RESPONSE_ACCEPTED` row is staged *in this transaction* — §34's before/after carrying
+    the draft's body and the body that went out, and `metadata["edited"]` saying whether the
+    two differ. §41's remaining verb, *edit*, is that comparison rather than a field: the
+    client sends the text it wants sent, and this function cannot tell an edited body from a
+    faithful one except by looking.
+
+    **The draft row is never modified.** Accepting re-authors the text as an agent message
+    rather than promoting the draft, which is `Message`'s own docstring — *"an AI draft is
+    never customer-visible until an agent sends it, at which point it is re-authored as an
+    agent message"* — and it is what keeps `messages` append-only, the property Phase V's
+    freshness watermark rests on. The draft stays behind as an internal record of what the
+    model offered.
+
+    **A `draft_id` naming nothing on this ticket is a 404, and so is one naming a message that
+    is not an `ai_draft`.** The two are deliberately the same answer: distinguishing them would
+    confirm that a guessed message id exists (ADR-009), and a caller outside the tenant has no
+    business telling a draft from a reply in someone else's thread.
+
+    **Accepting the same draft twice is allowed, deliberately.** The draft is an offer rather
+    than a claim on the reply; an agent may send the same words twice, and each acceptance is
+    its own audit row. Preventing it would need a column recording that a draft had been used
+    — a second place recording what the trail already records.
+
+    `origin` exists only so that an acceptance's audit row can name the request it came from.
+    An ordinary reply writes no audit row at all, because §34's list has no "message posted"
+    entry, so it is `None` for every caller that is not accepting a draft.
     """
     ticket = await ticket_service.require_visible_ticket(session, context, ticket_id)
 
     if ticket.status is TicketStatus.CLOSED:
         raise ValidationError("This ticket is closed. Reopen it to reply.")
 
+    # Resolved before the message is staged, so a bad `draft_id` cannot leave a pending
+    # message behind for a transaction that is about to be refused.
+    draft = None
+    if draft_id is not None:
+        draft = await MessageRepository(session, context).find_draft(ticket.id, draft_id)
+        if draft is None:
+            raise NotFoundError(ErrorCode.AI_DRAFT_NOT_FOUND)
+
     message = _post(session, context, ticket, payload, is_internal=False)
+
+    if draft is not None:
+        # Staged into this transaction and not one of its own: the audit service's docstring is
+        # explicit that a trail written separately *"can disagree with the data it describes"*,
+        # and an accepted draft and the message it produced are exactly the pair that would.
+        audit_service.record_for(
+            session,
+            context,
+            AuditAction.AI_RESPONSE_ACCEPTED,
+            target_type="ticket",
+            target_id=ticket.id,
+            before=draft.body,
+            after=payload.body,
+            metadata={"draft_id": str(draft.id), "edited": draft.body != payload.body},
+            origin=origin,
+        )
 
     if message.sender_type is SenderType.AGENT and ticket.first_response_at is None:
         ticket.first_response_at = datetime.now(UTC)

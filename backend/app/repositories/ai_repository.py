@@ -18,10 +18,11 @@ they were handed.
 **Whether a function takes a `Ticket` or an `organization_id` says which side calls it.**
 `load_ticket`, `load_analyses` and `load_conversation` are called by
 `app/workers/ai_tasks.py` alone, and take `organization_id` as an explicit argument that no
-request ever supplies. `latest_by_operation`, `latest_completed_summary` and
-`conversation_watermark` *are* reached from a request — `GET /tickets/{id}/ai/analyses` and
-`POST /tickets/{id}/ai/summarize` — and they therefore take a **`Ticket` instance rather
-than a ticket id**. That is the whole of their access control: on the request path a `Ticket`
+request ever supplies. `latest_by_operation`, `latest_completed_summary`,
+`conversation_watermark` and `has_completed_suggestion` *are* reached from a request —
+`GET /tickets/{id}/ai/analyses`, `POST /tickets/{id}/ai/summarize` and
+`POST /tickets/{id}/ai/suggest-response` — and they therefore take a **`Ticket` instance
+rather than a ticket id**. That is the whole of their access control: on the request path a `Ticket`
 can only be obtained through
 `require_visible_ticket`, which has already resolved the caller's row scope and returns 404
 for a ticket in another tenant. A function that took an id and an `organization_id` would be
@@ -229,6 +230,38 @@ async def latest_completed_summary(session: AsyncSession, *, ticket: Ticket) -> 
         .limit(1)
     )
     return result.scalar_one_or_none()
+
+
+async def has_completed_suggestion(session: AsyncSession, *, ticket: Ticket) -> bool:
+    """Whether `ticket` has ever had a **completed** suggested reply.
+
+    The one question `request_suggested_response` asks of the past, and it is a boolean rather
+    than a row because the answer is used for a single decision: §41's regenerate is a second
+    request, so the audit action is `AI_RESPONSE_REGENERATED` when a draft has been completed
+    before and `AI_ANALYSIS_REQUESTED` when this is the first. **Nothing is reused** — a draft
+    has many right answers and §41 lists regenerate as an action a person may take on purpose,
+    so unlike `latest_completed_summary` this deliberately does not hand a stored answer back.
+
+    `COMPLETED` and not "any row": a draft that failed is not a draft, and a first request
+    arriving after a failure is the first request, not a regeneration. A `pending` or
+    `processing` row is not this function's business either — `in_flight_analyses` is what
+    answers "is work already on its way", and the caller checks it first.
+
+    `SELECT id` with `LIMIT 1` rather than the row: the caller needs existence and nothing
+    else, and `EXISTS`-shaped reads are what `ix_ai_analyses_ticket_operation_created` —
+    `(ticket_id, operation, created_at)` — serves without touching the heap for anything but
+    the answer. Takes the `Ticket` and not an id — see the module docstring.
+    """
+    result = await session.execute(
+        select(AIAnalysis.id)
+        .where(
+            AIAnalysis.ticket_id == ticket.id,
+            AIAnalysis.operation == AIOperation.SUGGEST_RESPONSE,
+            AIAnalysis.status == ProcessingStatus.COMPLETED,
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none() is not None
 
 
 async def conversation_watermark(session: AsyncSession, *, ticket: Ticket) -> ConversationWatermark:

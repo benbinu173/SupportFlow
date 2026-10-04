@@ -1161,15 +1161,15 @@ error's message embeds `REDIS_URL`, which carries a password in production.
 [backend/app/services/ai_service.py](backend/app/services/ai_service.py) is the one call path that
 enforces the timeout, retries what is worth retrying, validates the answer, and records what it cost;
 and [backend/app/services/ai_analysis_service.py](backend/app/services/ai_analysis_service.py) is the
-pipeline that runs it for a ticket — three routes, one queue, and a worker.
+pipeline that runs it for a ticket — five routes, one queue, and a worker.
 
 **A new ticket is analyzed without anyone asking.** `POST /tickets` writes two `pending` rows, hands a
 task to the `ai` queue, and returns 201 — the model is called in another process, and §16's *"the API
 should not wait unnecessarily for the LLM"* holds structurally rather than by being careful: nothing in
-[backend/app/api/ai.py](backend/app/api/ai.py) imports a provider. §36's remaining route is §21's
-suggested reply, which is Phase W. The ledger is still readable on its own: `GET /analytics/overview`
-reports calls, tokens, and dollars for the tenant — and, since Phase V, how many of those calls were
-answered from a stored result and cost nothing at all.
+[backend/app/api/ai.py](backend/app/api/ai.py) imports a provider. §36's three AI routes are all built:
+§18's analysis, §20's summary, and §21's suggested reply. The ledger is still readable on its own:
+`GET /analytics/overview` reports calls, tokens, and dollars for the tenant — and, since Phase V, how
+many of those calls were answered from a stored result and cost nothing at all.
 
 ### The provider boundary
 
@@ -1277,13 +1277,17 @@ model is called.
 |---|---|
 | `POST /api/v1/tickets/{ticket_id}/ai/analyze` | `202` with one `pending` row per operation. Body is what was **queued**, not what was concluded. Rate limited per user (§45). |
 | `POST /api/v1/tickets/{ticket_id}/ai/summarize` | `202` with **one** row — `pending` when a summary was queued, `completed` when the stored one was already current. Same limit. |
+| `POST /api/v1/tickets/{ticket_id}/ai/suggest-response` | `202` with **one** `pending` row. The draft itself arrives on the thread as an `ai_draft` message once the worker has run. Same limit. |
+| `POST /api/v1/tickets/{ticket_id}/ai/drafts/{draft_id}/accept` | `201` with the message that was sent. **Not** rate limited by `limit_ai` — it calls no model. |
 | `GET /api/v1/tickets/{ticket_id}/ai/analyses` | The latest row per operation, so a queued or failed analysis is visible rather than silently absent. |
 
-**All three need `ai:request_analysis`, and none needs `TICKET_VIEW`.** §3 gives customers no AI access
-at all, so guarding these with the ticket read capability — the obvious choice, since that is what
-they hang off — would hand a portal caller the analysis of their own ticket, including
-`error_message`, which the column's own comment keeps from customers because upstream errors can echo
-prompt content.
+**The first three and the read need `ai:request_analysis` (or `ai:request_suggestion` for §21's route),
+and none of them needs `TICKET_VIEW`.** §3 gives customers no AI access at all, so guarding these with
+the ticket read capability — the obvious choice, since that is what they hang off — would hand a portal
+caller the analysis of their own ticket, including `error_message`, which the column's own comment
+keeps from customers because upstream errors can echo prompt content. **Accepting declares two
+capabilities**, `ai:request_suggestion` and `message:post_reply`, because it is two acts: it records an
+AI fact and it writes a customer-visible message, and neither capability alone describes the request.
 
 **Classification and sentiment are two rows but one act.** One task runs both, so the ticket gets one
 timeline entry, one notification, and one realtime announcement — two tasks would each independently
@@ -1340,6 +1344,55 @@ worse summary — and §21's draft is not something anybody said. A summary-only
 column, so it announces on the socket and writes its timeline entry but sends **no notification**;
 the person who asked for the summary is the person reading it.
 
+### Suggested replies, and the moment a person sends one
+
+§21 on the same worker: a draft written for an agent to review, and §41's three verbs — *regenerate*,
+*edit*, *accept*.
+
+    # ask for a draft
+    curl -s -X POST localhost:8000/api/v1/tickets/$TICKET/ai/suggest-response \
+         -H "Authorization: Bearer $TOKEN"
+
+    # read it back out of the thread — sender_type is how a draft is told from a reply
+    curl -s "localhost:8000/api/v1/tickets/$TICKET/messages?limit=100" \
+         -H "Authorization: Bearer $TOKEN"
+
+    # send it, editing it in the same request (the body is whatever the agent wants sent)
+    curl -s -X POST localhost:8000/api/v1/tickets/$TICKET/ai/drafts/$DRAFT/accept \
+         -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+         -d '{"body":"Hello Ada, we have found the fault on our side and are replacing the file store."}'
+
+**A draft is a message nobody sent, and it is two records.** The `ai_analyses` row holds the model's own
+output in `result`, like every other operation; a `messages` row with `sender_type = ai_draft` and
+`is_internal` set puts it in the thread. Phase D's `ai_draft_is_internal` constraint makes an
+external `ai_draft` impossible to store, and `MESSAGE_READ_INTERNAL` is what decides whether a caller
+sees it — so §21's *"explicit UI distinction between AI generated draft / human-authored response"* is
+`MessageRead.sender_type`, a field already on the response, and §21's *"AI must NEVER automatically send
+a customer-facing response"* is a property of the data rather than of a policy. The customer's own
+portal session reads the same thread endpoint and does not get the draft; a staff session does.
+
+**Accepting re-authors; it does not promote.** A new `agent`, public `messages` row goes out through the
+ordinary reply path — same `first_response_at`, same `MESSAGE_ADDED` timeline entry, same notifications,
+same socket event, same cache invalidation — and the draft stays behind, unchanged and still internal.
+Nothing customer-visible is ever mutated, which is what keeps `messages` append-only and Phase V's
+freshness watermark sound.
+
+**The three verbs, and where each one lives.** *generated* is the `SUGGEST_RESPONSE` row;
+*accepted* is `AI_RESPONSE_ACCEPTED` in the audit trail, with §34's `before` and `after` carrying the
+draft's text and the text that went out, and `metadata["edited"]` saying whether the two differ — which
+is *edit*, and which is why there is no edit endpoint: the client sends the text it wants sent, and the
+server compares. *regenerated* is `AI_RESPONSE_REGENERATED`, written instead of `AI_ANALYSIS_REQUESTED`
+when a completed draft already exists for the ticket. Both asks answer `202` with a `pending` row and
+both produce a completed draft, so nothing a client reads tells them apart — deliberately, because from
+the caller's point of view asking again *is* regenerating, and the trail is where the two are kept
+distinct.
+
+**There is no suggestion cache, and that is the opposite of §20's rule.** A summary is reused when
+nothing changed because the same input has one right answer; a second request for a draft is a person
+asking for a *different* one, so every request makes a real call. A request that arrives while a draft
+is still in flight answers with that row and queues nothing (§16), which is the same guard a
+double-click gets everywhere else in this module.
+
 ### Verifying the analysis by hand
 
     # the API, from backend/ (.env needs a real AI_API_KEY for the configured provider)
@@ -1390,6 +1443,22 @@ The rows themselves are worth reading once:
       "SELECT operation, provider, model, prompt_tokens, completion_tokens, \
               cost_usd, latency_ms, was_successful \
          FROM ai_usage ORDER BY created_at"
+
+§20's and §21's flows have their own end-to-end scripts, each driving the real provider through the
+real routes with the worker running on `-Q notifications,sla,ai`:
+
+    .venv/Scripts/python.exe scripts/phase_v_walkthrough.py   # a summary, and the call that never happens
+    .venv/Scripts/python.exe scripts/phase_w_walkthrough.py   # a draft nobody sent, and the moment a person sends it
+
+The Phase W script registers two tenants, posts a complaint, a follow-up and an internal note over
+HTTP, asks for a draft, and then asserts the containment from the only side that can: **the customer's
+own portal login reads the same thread endpoint and does not get the draft**, while an admin session
+does. It regenerates once and reads the audit trail to show the second ask is recorded as a
+regeneration rather than a request; it accepts with an edited body and checks the reply is public, the
+draft is untouched and still internal, the customer now has the reply and still not the model's text,
+and `/audit-logs` carries `ai_response_accepted` with both bodies and `edited: true`; and it reads
+`/analytics/overview` either side of the acceptance to show `calls` and `cost_usd` did not move —
+§41's accept calls no model, which is also why it carries no `limit_ai`.
 
 ## Security posture
 

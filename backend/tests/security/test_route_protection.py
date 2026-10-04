@@ -277,8 +277,15 @@ def test_there_are_routes_to_check(api: FastAPI) -> None:
     area rather than a new one, so the route count moves by exactly one and the number here
     moves by exactly one. A phase that moved the floor by more than it added routes would be
     the drift this assertion exists to catch.
+
+    **Phase W moved it by two**, and both are §21: `/ai/suggest-response` asks for a draft and
+    `/ai/drafts/{draft_id}/accept` sends one. They are two routes rather than one for the
+    reason `app/api/messages.py` gives about the note, and the accept route is the first in
+    the API to declare **two** capabilities — `AI_REQUEST_SUGGESTION` and
+    `MESSAGE_POST_REPLY` — because it performs two acts at once and neither one alone
+    describes it.
     """
-    assert len(_entries(api)) >= 36
+    assert len(_entries(api)) >= 38
 
 
 def test_the_walk_finds_every_documented_route(api: FastAPI) -> None:
@@ -611,7 +618,7 @@ def test_every_route_declares_the_capability_the_matrix_assigns(api: FastAPI) ->
         ("POST", "/api/v1/tickets/{ticket_id}/messages"): {Permission.MESSAGE_POST_REPLY},
         ("POST", "/api/v1/tickets/{ticket_id}/notes"): {Permission.MESSAGE_POST_INTERNAL},
         # --- AI -----------------------------------------------------------
-        # Three routes, one capability, and **none is `TICKET_VIEW`**. §3 gives customers
+        # Five routes, two capabilities, and **none is `TICKET_VIEW`**. §3 gives customers
         # no AI access at all, so guarding these with the ticket read capability — the
         # obvious choice, since that is what they hang off — would hand a portal caller
         # the analysis of their own ticket, including `error_message`, whose column
@@ -625,16 +632,32 @@ def test_every_route_declares_the_capability_the_matrix_assigns(api: FastAPI) ->
         #
         # The write routes are the only ones in this dict carrying a second dependency —
         # `limit_ai`, §45's per-user AI limit. It declares no capability, which is why it
-        # does not appear in the sets below: a rate limit is not an authorization.
+        # does not appear in the sets below: a rate limit is not an authorization. The
+        # **accept** route is the one member of this dict with two capabilities and no
+        # limiter: it calls no model, so there is nothing to bill, and it performs two acts
+        # at once — recording an AI fact and writing a customer-visible message — so
+        # neither `AI_REQUEST_SUGGESTION` nor `MESSAGE_POST_REPLY` alone describes it.
         #
-        # §20's summarize route is the third and takes the same capability as §18's two —
-        # summarizing is a form of asking for an analysis of the ticket, and the thing it
-        # reads that `/analyses` does not is the conversation, whose internal notes are
-        # staff-only. A capability weaker than `AI_REQUEST_ANALYSIS` here would be the
-        # first route in this file whose guard was narrower than what it returns.
+        # §20's summarize route takes the same capability as §18's two — summarizing is a
+        # form of asking for an analysis of the ticket, and the thing it reads that
+        # `/analyses` does not is the conversation, whose internal notes are staff-only. A
+        # capability weaker than `AI_REQUEST_ANALYSIS` here would be the first route in this
+        # file whose guard was narrower than what it returns.
+        #
+        # §21's two hang off a draft rather than an analysis and take
+        # `AI_REQUEST_SUGGESTION`, which §3 gives to the same three staff roles and to no
+        # portal account — the same shape of guard, under the capability §3's matrix names
+        # for it.
         ("POST", "/api/v1/tickets/{ticket_id}/ai/analyze"): {Permission.AI_REQUEST_ANALYSIS},
         ("POST", "/api/v1/tickets/{ticket_id}/ai/summarize"): {Permission.AI_REQUEST_ANALYSIS},
         ("GET", "/api/v1/tickets/{ticket_id}/ai/analyses"): {Permission.AI_REQUEST_ANALYSIS},
+        ("POST", "/api/v1/tickets/{ticket_id}/ai/suggest-response"): {
+            Permission.AI_REQUEST_SUGGESTION
+        },
+        ("POST", "/api/v1/tickets/{ticket_id}/ai/drafts/{draft_id}/accept"): {
+            Permission.AI_REQUEST_SUGGESTION,
+            Permission.MESSAGE_POST_REPLY,
+        },
         # --- Attachments --------------------------------------------------
         # Listing takes `ATTACHMENT_DOWNLOAD` rather than a capability of its own: §3's
         # matrix has no "list attachments" row, and a metadata list is only useful to

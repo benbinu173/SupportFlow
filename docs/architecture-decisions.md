@@ -2797,3 +2797,397 @@ comparison** found the conversation unmoved, so the script cannot itself manufac
 summary in the same instant to probe the boundary — the deterministic proof is the integration file,
 which scripts the provider and controls both timestamps.
 
+---
+
+## ADR-031 — A draft is a message nobody sent, and accepting it is re-authoring it
+
+**Status:** accepted · Phase W
+
+**Context.** §21 is a five-line workflow and three sentences — *"The AI should generate a draft reply
+for the support agent"*, *"AI must NEVER automatically send a customer-facing response in the default
+implementation"*, and *"Add an explicit UI distinction between: AI generated draft / human-authored
+response."* The chain above them fixes the shape of the phase: `Customer message → Ticket context →
+Relevant knowledge → AI → Suggested response → Agent reviews/edits → Agent manually sends`. §41 lists
+what a person may do with what comes out of it — *"Allow: regenerate / edit / accept"* — and Phase W's
+own block names the four facts to track, *"generated, edited, accepted, regenerated"*. §36 names one
+route, `POST /api/v1/tickets/{id}/ai/suggest-response`, between the summary route Phase V built and the
+knowledge routes Phase X will.
+
+Everything below the route already existed, and had since Phase D: `SenderType.AI_DRAFT`
+(`app/models/enums.py:92`), the `ai_draft_is_internal` CHECK (`app/models/message.py:76-79`),
+`AuditAction.AI_RESPONSE_ACCEPTED` and `AI_RESPONSE_REGENERATED` (`app/models/enums.py:142-143`) — both
+already named among §34's examples, which is why §41's verbs needed no new action — `AIOperation.
+SUGGEST_RESPONSE`, `Permission.AI_REQUEST_SUGGESTION`, `SuggestedReply` (`app/schemas/ai.py:119`),
+`AIProvider.generate_response`, and `ai_service.generate_response` with its retry policy, its schema
+validation, and its ledger row. **So this phase adds no migration** — the third in a row — and
+`alembic check` staying green is the mechanical proof rather than a claim. What Phase W wrote is an
+entry point, an instruction, a route that accepts, and the assertions that the customer never sees the
+draft and always sees the reply.
+
+Four pieces of scaffolding named this phase and are discharged rather than left standing. `app/ai/
+prompts.py` said *"§21's draft reply is what remains, which is why a fourth is not written yet"* — the
+fourth is written, and the module now says why there is no fifth: `AIProvider` declares four methods,
+so what is left to write is an *input* rather than an instruction. `ai_analysis_service`'s comment on
+`ANALYSIS_OPERATIONS` said suggested replies *"are §21 and Phase W"*; the tuple **stays two members** and
+the comment now says why (Decision 1). `_execute`'s *"unimplemented operation"* docstring named
+`SUGGEST_RESPONSE`; it no longer does. And `app/api/ai.py`'s *"`AI_REQUEST_SUGGESTION` … belong to Phases
+W, X"* now reads Phase X alone.
+
+**Decision 1 — the four verbs need no new column, table, or enum member.**
+
+| Verb | Where it lives | Why that is the right home |
+|---|---|---|
+| **generated** | an `ai_analyses` row, `operation = SUGGEST_RESPONSE`, `status = completed` | `AIAnalysis` is already operation-agnostic and `AIAnalysisRead` already serves `result`, so the model's own output is readable at `GET /tickets/{id}/ai/analyses` with no new endpoint. The request is recorded as `AI_ANALYSIS_REQUESTED` with `metadata = {"operations": ["suggest_response"]}` — the exact shape `request_summary` already writes. |
+| **edited** | `AI_RESPONSE_ACCEPTED`'s `before`/`after` | §34 asks for *"before/after values where appropriate"*, and this is the case it was written for: the draft's body against the body that went out. `metadata` carries `draft_id` and `edited: bool`. |
+| **accepted** | `AuditAction.AI_RESPONSE_ACCEPTED`, staged in the reply's own transaction | §34 names this member, and the row has to share the commit with the message it describes (§34's trail would otherwise be able to disagree with its data). |
+| **regenerated** | `AuditAction.AI_RESPONSE_REGENERATED` | Named at §34, written *instead of* `AI_ANALYSIS_REQUESTED` when a completed draft already exists for the ticket (Decision 6). |
+
+The alternative was a `drafts` table. It was refused because every fact §41 asks to track is already a
+fact one of two existing rows has, or a fact the audit trail has: the draft's text and whether it was
+edited are the analysis row and the audit row, who sent it is a `messages` row, and "regenerated" is an
+action name. A third table would be a second place recording the same four things, and the second place
+is the one that goes stale.
+
+`ANALYSIS_OPERATIONS` stays two members and stays §18's. The tuple means *"what one analyze request
+does"* — classification and sentiment, run together, writing ticket fields — and a suggested reply is
+not that: it is a third entry point over the same worker with its own route and its own row, exactly as
+§20's summary is a second one. Adding `SUGGEST_RESPONSE` to the tuple would make "an analysis run" mean
+three things and would make `notify_analysis_completed` fire for a draft (Decision 7).
+
+**Decision 2 — the draft is two records, and `app/schemas/ai.py` already says which is which.** That
+module's `SuggestedReply` docstring states the split: *"the schema says what the model wrote, and the
+sender type says who is claiming it."* So the shape follows the sentence:
+
+- the **`ai_analyses` row** holds the model's own output in `result`, like every other operation;
+- a **`messages` row with `sender_type = AI_DRAFT`, `is_internal = true`** holds it in the thread, which
+  is where a reply goes and where the agent will read it. §21's *"explicit UI distinction between AI
+  generated draft and human-authored response"* is then `MessageRead.sender_type`, a field already on
+  the response, and `message_repository.list_for_ticket(include_internal=True)` already returns it to
+  staff. No new endpoint, and no flag invented for the UI to read.
+
+The rejected alternative is one record — a message row with an `is_ai` flag — and it fails on the thing
+that makes the two records different: they are the *answer* and the *offer*. The analysis row is what
+the model said, at a moment, and never changes; the message row is what the agent was shown and may
+accept. Collapsing them means accepting has to rewrite the row that holds the model's own output, which
+destroys the comparison §34's before/after exists to record, at the exact moment somebody wants to make
+it.
+
+**Decision 3 — accepting re-authors the draft, and nothing customer-visible is ever mutated.**
+`Message`'s own docstring already said it: *"An AI draft is never customer-visible until an agent sends
+it, at which point it is re-authored as an agent message."* Accepting writes a **new** `messages` row
+(`sender_type = AGENT`, `is_internal = false`) through the same `post_reply` an ordinary reply uses, and
+the draft row stays behind internal and untouched. Nothing customer-visible is mutated, so the
+append-only property Phase V's watermark rests on is not approached — and it would not matter if it
+were, because `_CONVERSATION_SENDERS` already excludes `AI_DRAFT` from the conversation on both the
+watermark side and the prompt side.
+
+Because the reply path is reused and not re-implemented, every side effect a reply has happens for an
+accepted draft as well: `first_response_at`, the `MESSAGE_ADDED` timeline entry, `notify_for_event`, the
+socket publish, and the analytics cache invalidation. An accepted draft *is* an ordinary reply that
+happens to have come from somewhere, and the phase's whole economy is that it costs one branch in
+`post_reply` rather than a parallel send path that would have to remember all five.
+
+**There is no message-edit route, deliberately.** §41's "edit" is the client's text box: the agent edits
+the draft on screen and sends the edited text, and only the text that went out is persisted. The
+difference between the two is recorded in the audit row rather than in a mutable column. This codebase
+has no message-mutation path today and does not need its first one to serve a text box — and a mutable
+message would be the end of the append-only property the summary watermark depends on.
+
+**Decision 4 — accept is its own route under the ticket, and it carries two capabilities.**
+`POST /api/v1/tickets/{ticket_id}/ai/drafts/{draft_id}/accept`, answering `201` and the `MessageRead` it
+created. `app/api/messages.py`'s own docstring settles why it is not a `draft_id` field on the reply
+body: *"writing an internal note and writing a public reply are different actions, and giving them one
+endpoint would mean the endpoint's declared capability no longer described the request."* Accepting is a
+different action again — it carries an AI capability and records an AI fact — so folding it into the
+reply route behind a field is exactly the move that docstring refuses.
+
+It requires **two** capabilities, `AI_REQUEST_SUGGESTION` and `MESSAGE_POST_REPLY`, because it performs
+two actions at once and neither alone describes it: the first is what makes it an AI-lifecycle act, the
+second is what makes it the write of a customer-visible message. Today every role that holds the first
+holds the second, so nothing turns on it — which is exactly why it should be stated rather than assumed,
+and why `tests/security/test_route_protection.py`'s matrix carries both.
+
+A `draft_id` that names nothing on this ticket, or names a message that is not an `ai_draft`, is a
+**404** (`AI_DRAFT_NOT_FOUND`) — ADR-009's rule, indistinguishable from a draft that does not exist. A
+message that is not a draft is never a draft, and saying *which* is not a distinction a caller outside
+the tenant is entitled to.
+
+**Accepting the same draft twice is allowed, deliberately.** The draft row is the offer, not a claim on
+the reply; an agent may legitimately send the same text twice, and each acceptance is its own audit row.
+Preventing it would need a column that says "used", which is a second place recording what the audit
+trail already records.
+
+**Decision 5 — there is no suggestion cache, and Phase V's freshness rule deliberately does not apply.**
+A summary is reused when nothing changed because the same input has one right answer. A second request
+for a draft is a person asking for a *different* one — §41 lists regenerate as an allowed action, and
+Phase W's block lists "regenerated" as a fact to track — so every request makes a real call. There is no
+`was_cached` row for this operation and there should not be: the flag exists to measure a saving, and
+there is no saving here to measure. Applying the watermark would turn the one verb the spec names into a
+no-op, and a user pressing Regenerate and receiving the identical draft is the failure §41 was written
+to prevent.
+
+**Decision 6 — a regeneration is recorded in the audit trail, because the response cannot say it.**
+There is no `?force=` and no second route, and the reason is that both asks *are* the regeneration. A
+first request and a repeat answer `202` with a `pending` row, and both produce a completed draft; the
+response cannot distinguish them, and it should not, because asking again is regenerating. So the
+difference lives where §34 puts it: `request_suggested_response` reads stored state — whether a
+completed `SUGGEST_RESPONSE` row already exists for this ticket — and writes
+`AuditAction.AI_RESPONSE_REGENERATED` instead of `AI_ANALYSIS_REQUESTED`. The route decides from stored
+state, exactly as `request_summary` decides cached-versus-queued from stored state, and the response
+stays one shape.
+
+**A note for anyone reading the trail.** A ticket's creation writes its own `ai_analysis_requested` row
+for §18's classification and sentiment, so §21's rows cannot be told apart from §18's by their action
+alone. What is unique to a draft request is the operation it names —
+`metadata = {"operations": ["suggest_response"]}`, the shape `request_summary` already writes — and that
+is what the tests filter on. This is the third route to write `AI_ANALYSIS_REQUESTED` for a different
+reason; the action is shared on purpose and the operation is the discriminator. A test that counted the
+action would count the ticket's own creation as a draft request, which is how the first version of this
+phase's integration test was wrong.
+
+**Decision 7 — the draft is internal, and the database is what says so.** `sender_type = AI_DRAFT` with
+`is_internal = true` is not a convention a service is asked to honour: `ai_draft_is_internal` refuses any
+draft row written with `is_internal = false`, so the customer-facing half of §21's containment is
+structural — the same shape `tickets`' status-transition rules and the AI-review constraints take. The
+tests assert it from the customer's own side, because that is the property that matters: the draft must
+be **absent from the portal session's own message read**, not merely marked internal in a table the
+portal never reads. Asserting on `sender_type` in a query the test wrote would pass even if the
+visibility filter were missing entirely.
+
+Two consequences fall out of *"a draft is internal and writes no ticket column"*:
+
+- **A suggestion-only run announces without alerting.** `run_analysis`'s `notify_analysis_completed`
+  fires only when an operation in `ANALYSIS_OPERATIONS` completed, and `SUGGEST_RESPONSE` is not a
+  member (Decision 1). The alert exists so somebody looks at a ticket whose fields an AI changed; a
+  draft changes no field and exists to be read by the person who asked for it, so alerting them would
+  interrupt them about a page they are on. The timeline entry and the socket event still happen —
+  `_record_completion` writes `AI_ANALYSIS_COMPLETED` for any operation — so the run is quiet rather
+  than silent.
+- **An empty conversation is not refused**, unlike §20's summary. `create_ticket` writes the description
+  onto the ticket and creates no `Message`, so a freshly raised ticket — the case a draft reply is most
+  useful for — has a conversation of length zero, and `draft_content` has the description to work from.
+  Refusing here would refuse the most ordinary use of the feature.
+
+**Decision 8 — §21's "relevant knowledge" step waits for Phase X, and W's prompt is built from the two
+blocks that exist.** The workflow diagram puts retrieval between "ticket context" and the model. That
+step is §22's, and the codebase already made this call once by the same reasoning: ADR-008 refuses to
+put `generate_embedding` on the provider protocol until Phase X, because a method with no caller is the
+stub this codebase refuses everywhere else. A knowledge parameter that W always passed empty would be
+that stub. So `draft_content` composes the two builders that exist — `prompts.ticket_content` and
+`prompts.conversation_content` — into one user message rather than adding a second implementation of
+either, and X adds a third block to one function with its tests. The change is additive because the seam
+is a function, which is also why W's instruction is the fourth and last: what remains to be written on
+this path is an input, not an instruction.
+
+**What this deliberately does not do.**
+
+- **No knowledge base, embeddings, or retrieval.** §22 is Phase X; `AIOperation.EMBED` and
+  `KNOWLEDGE_ANSWER` stay declared-and-unused, per Decision 8 and ADR-008.
+- **No automatic sending, ever.** The only path from a draft to a customer-visible row runs through a
+  route a person called, and `SuggestedReply` has a body and nothing else — no confidence, no status,
+  no sender — so the types cannot express "sent". §41's *"Never make the user believe an AI suggestion
+  was written by a human"* is the UI's job, and it is helped by the schema: the draft carries a
+  `SenderType` that is not `agent`.
+- **No confidence on a draft.** §41 says *"Show confidence where meaningful"*, and an edited draft is
+  the case where it is not: the number would describe the model's certainty about text a person is
+  about to change. The column stays `NULL`, as Phase V's summaries already left it.
+- **No "dismiss" verb.** §41 lists regenerate, edit, and accept; a discarded draft is an `ai_draft` row
+  that was never accepted, which is what it looks like.
+- **No message-edit route**, per Decision 3.
+- **No per-tenant prompt tuning, no temperature or model override on the request**, and no `?force=` —
+  the route takes no body at all beyond the ticket, so there is nothing to configure away from
+  `AI_MODEL`.
+
+**Cost.** No new dependency, no migration, and no new setting. One entry point
+(`ai_analysis_service.request_suggested_response`), one branch in `_execute`, one instruction and one
+content builder in `app/ai/prompts.py`, two route functions, two keyword-only parameters on
+`message_service.post_reply`, and one repository lookup (`MessageRepository.find_draft`). The standing
+cost is the one `app/api/messages.py` already pays and this phase now pays twice: a route that performs
+two acts carries two capabilities, so a reader has to check both to know who may accept — which is
+cheaper than a route whose declared capability does not describe its request.
+
+The other standing cost is context. A draft's user message is the longest on the path after §20's
+summary, because it carries the ticket's two text fields *and* every eligible turn of the conversation;
+that is what §21's diagram asks for ("ticket context" and "previous conversation" both), and the
+alternative — drafting from the description alone — answers the question that opened the ticket and
+ignores everything said since, which is the one thing a reply is most likely to get wrong.
+
+**Verification.** The suite is **1398 tests**, all passing — 1357 at ADR-030's close, so 41 for this
+phase's own surface. `alembic check` reports *"No new upgrade operations detected"*, the third phase in
+a row to do so and the mechanical proof of the claim above: every column this phase writes — a
+`messages` row's `sender_type` and `is_internal`, an `ai_analyses` row's `operation` and `result`, a
+ledger row — has existed since Phase D. `ruff check`, `ruff format --check` (195 files), and `mypy app
+alembic scripts` (128 files) are clean.
+
+**Three breaks were made deliberately, and each failed the tests that cover it.** They are worth
+recording individually, because they fail in three different ways.
+
+*The draft made public.* Flipping the worker's draft row to `is_internal = False` failed **seventeen
+tests** across `tests/integration/test_ai_suggestion.py` and `tests/api/test_ai_suggestion.py` — and the
+way they failed is the point. Not one failed an assertion; all seventeen failed the same
+`psycopg.errors.CheckViolation` on `ck_messages_ai_draft_is_internal`, at the `INSERT`. §21's
+containment is a database constraint, and this is what that looks like from a test: the row is never
+written, so every test that expected a draft to exist reports a *missing* row rather than a leak. A
+service-level check would have produced the leak — and there is no service-level check, which is why
+this is the shape the break takes.
+
+*The accept that sends the draft itself.* Replacing the new reply row with the draft row —
+`message = draft if draft is not None else _post(...)` — failed **seven** tests, and the first is the
+one the phase exists for: `test_the_customer_sees_the_reply_and_never_the_draft`, because a "reply" that
+*is* the internal `ai_draft` row reaches no customer at all. `test_the_draft_row_itself_is_untouched`,
+`test_accepting_sends_the_text_as_the_agents_own_reply`, `test_accepting_the_same_draft_twice_sends_twice`,
+and three API tests failed with it. This is the whole reason Decision 3 says **re-authored** and not
+*marked*.
+
+*The regeneration dropped.* Removing the branch so `request_suggested_response` always writes
+`AI_ANALYSIS_REQUESTED` failed **exactly one test** —
+`test_the_first_request_is_audited_as_requested_and_the_second_as_regenerated` — and left the rest of
+the file green. That is the right shape for a decision whose only observable is an audit row: §41's
+regenerate has no response to inspect (Decision 6), so the one test that reads the trail is the one test
+that can fail. A break that took more of the file down would mean the trail were load-bearing for
+something it is not.
+
+Each break was reverted, and the reverts confirmed by re-running the affected files green (61 tests,
+0 failures).
+
+**The live end-to-end ran against a real key.** `uvicorn` under
+`app.core.event_loop:loop_factory`, a Celery worker on `--pool=solo -Q notifications,sla,ai`, and
+`scripts/phase_w_walkthrough.py` raising a real ticket with a real conversation, asking for a draft over
+HTTP, and accepting it — all of it against the real configured model:
+
+    provider=groq model=openai/gpt-oss-120b
+
+    1. §21 sentences 1-2: a ticket with a conversation, and nothing drafted yet
+      ok    the ticket was created
+      customer: Ada Lovelace  ticket: 1
+      the ticket's own §18 analysis settled: completed
+      ok    a customer message and an internal note were posted
+      the note is staff-only, and it is in the prompt -- the model reads it as context.
+      ok    no draft exists yet
+      ok    and no ai_draft message is in the thread
+      queued: suggest_response  status=pending
+      ok    the route accepted the request
+      ok    it answered with one row, queued or already done
+      ok    the row names the model that will be asked
+      ok    the response is not the reply -- nothing has been sent
+
+    2. §21 sentence 1: the worker drafts it, in another process -- and it is staff-only
+      settled after 2.1s: status=completed
+      ok    the draft completed
+      draft: 'I'm sorry you're unable to download your policy document. Our file storage
+      service is currently experiencing degraded performance and is returning 503 errors,
+      which is why the download isn't starting. Our engineering team is actively working
+      on a fix. I'll let you know as soon as the service is back up and the document can
+      be downloaded. Thank you for your patience.'
+      ok    it is a real reply somebody could send
+      ok    the row carries no confidence
+      ok    the call was billed for its tokens
+      ok    the draft changed nothing on the ticket
+      ok    the worker wrote one ai_draft row into the thread
+      ok    it is internal, and it was written by nobody in the tenant
+      ok    its body is the model's own text
+      ok    the customer's own read does not contain the draft
+      ok    and it does not contain the draft's text
+      ok    but the customer's own message is still there, so this is a filter and not an empty list
+      thread as staff: 3 rows, one of them the draft.
+      thread as the customer: 1 rows, none of them the draft.
+
+    3. §41's regenerate: asking again is a second draft, and the trail says which
+      ok    no regeneration has been recorded yet
+      queued: suggest_response  status=pending
+      ok    a second row was queued rather than the first one served
+      ok    and it is a fresh one
+      ok    the second ask is recorded as a regeneration
+      ok    and it names the operation, not just the ticket
+      ok    the first ask is still recorded as a request
+      ok    the regenerated draft completed
+      draft: 'I'm sorry you're unable to download your policy document. Our system is
+      currently experiencing a service issue that is affecting file downloads and
+      returning a 503 error. Our engineering team is aware of the problem and is working
+      to resolve it. I'll let you know as soon as the download functionality is back up.
+      Thank you for your patience.'
+      ok    both drafts are in the thread
+      the superseded draft is still there -- §6 keeps it for comparison, and the read
+      route serves the newest row per operation, which is why only one shows above.
+
+    4. §41's accept: a person sends it, and the draft stays behind
+      accepting draft 6ce4c5a7-ee14-4882-b9e0-ce17f5afc4d2
+      before: calls=4 cached=0 cost=0.000748
+      ok    the acceptance answered 201
+      ok    it is a public message
+      ok    and it is the agent's own reply, not the model's
+      ok    carrying the text the person wrote
+      after:  calls=4 cached=0 cost=0.000748
+      ok    the acceptance made no model call
+      ok    and spent nothing at all
+      ok    the draft row is still in the thread
+      ok    and it is unchanged -- same body, still internal
+      ok    the customer now has the reply
+      ok    and still no draft
+      ok    and still not the model's text
+      ok    the acceptance is in the audit trail
+      ok    it records what the model offered
+      ok    and what actually went out
+      ok    and that the agent edited it
+      ok    and which draft it came from
+
+    5. §53: the same ticket id, asked by another tenant
+      ok    the stranger's request is a 404
+      ok    and it names no ticket
+      ok    the owner still reads their own drafts
+
+    46 passed, 0 failed
+
+Sections 2 and 4 are the phase in two lines each, and they are the same line twice: *thread as staff:
+3 rows, one of them the draft* against *thread as the customer: 1 rows, none of them the draft*. The
+containment §21 asks for is not a rule anywhere in the application — the customer's **own portal
+session** asks for the thread and the filter answers, and section 4 repeats it after the reply has gone
+out so that the absence cannot be read as "nothing has happened yet". Section 4's `cost=0.000748` is
+identical either side of the acceptance, to the cent: §41's accept cost no model call because a person
+wrote the text and the model was paid for when the draft was asked for.
+
+The second draft in section 3 is a different piece of writing from the first, which is Decision 5 in the
+only form a reader can check it: the same ticket, the same conversation, a second call, and a
+different answer. Had Phase V's freshness rule been applied here the two blocks would be the same
+sentence and the verb §41 names would do nothing.
+
+One thing the run found rather than confirmed: the second response opens *"Our system is currently
+experiencing a service issue"* where the first said *"Our file storage service is currently
+experiencing degraded performance and is returning 503 errors"*. Both are grounded in the agent's
+internal note — the note is what told the model the file store returns 503s — which is Decision 3 of
+ADR-030 still holding on this path: the draft prompt reads people, the note included, and the note is
+where the actual cause was written down.
+
+**The notification absence was then checked in the database rather than left as an argument:**
+
+    notifications_for_that_ticket
+    ------------------------------
+                                0
+          event_type       | count
+    -----------------------+-------
+     created               |     1
+     message_added         |     2
+     internal_note_added   |     1
+     ai_analysis_completed |     3
+
+Three `ai_analysis_completed` timeline entries — the ticket's own §18 run and the two drafts — and zero
+notifications, which is Decision 7's *"quiet rather than silent"*: the entry is written by
+`_record_completion` for any operation, and the alert is skipped because `SUGGEST_RESPONSE` is not in
+`ANALYSIS_OPERATIONS`. **That zero is weaker than it looks, for ADR-030's reason and worth restating:**
+this ticket was never assigned, and `notify_analysis_completed` sends to the assignee and to managers,
+so §18's run would have produced nothing either. What actually carries Decision 7 is
+`test_a_draft_only_run_announces_without_alerting`, which assigns an agent, runs a draft-only
+suggestion, and asserts the notification list is empty anyway.
+
+The script's own closing note records four things it cannot show for itself, and all four are covered
+elsewhere rather than papered over. **The notification that is *not* sent** has no HTTP surface at all,
+so the script prints the `psql` query above rather than pretending to assert on an absence. **§41's
+`edited: false` case** would need a second, redundant reply to the same customer — the script edits
+deliberately — and is asserted instead in `tests/integration/test_ai_draft_acceptance.py`, which
+controls both bodies. **§21's "relevant knowledge" step** is Phase X's and is recorded as absent rather
+than stubbed (Decision 8). And **a draft of a ticket nobody has replied to** cannot be staged here
+because every ticket the script raises has a conversation; the scripted provider in the integration
+suite makes that case deterministic, which is where it is tested.
+
+
+

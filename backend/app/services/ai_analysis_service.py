@@ -42,6 +42,15 @@ where `request_analysis` writes two. Everything below the entry point is shared:
 the same ledger. A second worker path would be a second place for §16's duplicate guard to
 be missing from.
 
+**§21's suggested reply is a third, and it is the one that writes a message.** It is a second
+entry point in exactly the sense above — its own route, one operation, and no place in
+`ANALYSIS_OPERATIONS` — and it differs from both in what it leaves behind: the `SUGGEST_RESPONSE`
+row holds the model's draft, and an `ai_draft` `Message` puts it into the thread, because §41's
+distinction between a draft and a reply is one `SenderType` already makes. It shares the
+summary's property of writing no column on the ticket, and it deliberately does **not** share
+the summary's cache: §41 lists regenerate as an action a person may take, so a second request
+is a request for a *different* draft rather than a repeat of one question.
+
 **§20's "avoid regenerating after every tiny message if unnecessary" is a comparison between
 two stored timestamps, not a cache.** When a summary is asked for and no message has arrived
 since the last one was made, the stored summary *is* the answer: `request_summary` returns
@@ -78,6 +87,7 @@ from app.models.enums import (
     AIOperation,
     AuditAction,
     ProcessingStatus,
+    SenderType,
     TicketEventType,
 )
 from app.models.message import Message
@@ -85,7 +95,12 @@ from app.models.notification import Notification
 from app.models.ticket import Ticket
 from app.models.ticket_event import TicketEvent
 from app.repositories import ai_repository
-from app.schemas.ai import Classification, ConversationSummary, SentimentResult
+from app.schemas.ai import (
+    Classification,
+    ConversationSummary,
+    SentimentResult,
+    SuggestedReply,
+)
 from app.services import ai_service, audit_service, notification_service
 from app.websocket import manager as realtime
 
@@ -94,9 +109,11 @@ logger = structlog.get_logger(__name__)
 #: The operations one "analyze this ticket" request performs. §51's list, minus the parts
 #: that are other requests: **summarization is §20 and it deliberately did not join this
 #: tuple** — Phase V gave it `request_summary` and `/ai/summarize`, and the conversation that
-#: reads is not the ticket text these two read. Suggested replies are §21 and Phase W, the
-#: knowledge base is §22 and Phase X, and neither belongs here either. The tuple is ordered
-#: because the rows are written in this order and a client reading them back sees it.
+#: reads is not the ticket text these two read. **Suggested replies are §21, and Phase W gave
+#: them `request_suggested_response` and `/ai/suggest-response` for the same reason**: the
+#: material is the ticket *and* the conversation, and the answer is a draft rather than a field
+#: on the row. The knowledge base is §22 and Phase X, and it is not here either. The tuple is
+#: ordered because the rows are written in this order and a client reading them back sees it.
 ANALYSIS_OPERATIONS: tuple[AIOperation, ...] = (
     AIOperation.CLASSIFY,
     AIOperation.SENTIMENT,
@@ -124,6 +141,12 @@ _CONTENT_LABEL = "the customer's support ticket"
 #: reason above, and separate from `_CONTENT_LABEL` because the two describe different things:
 #: a summary is asked about a thread of replies, not about the description that opened it.
 _CONVERSATION_LABEL = "the support conversation so far"
+
+#: The same, for §21's block — which is both of the above in one user message, so the label
+#: names both. Still the caller's own words and never anything a customer wrote, which is the
+#: rule `app/ai/prompts.py` states and the reason it is a constant here rather than a string
+#: built from the ticket's subject.
+_DRAFT_LABEL = "the customer's support ticket and the conversation so far"
 
 #: Stored on a row whose operation this build has no implementation for. See `_execute`.
 _NO_IMPLEMENTATION = "This analysis operation is not implemented in this version."
@@ -393,6 +416,95 @@ async def request_summary(
     return created
 
 
+async def request_suggested_response(
+    session: AsyncSession,
+    context: TenantContext,
+    ticket: Ticket,
+    *,
+    origin: RequestOrigin | None = None,
+) -> AIAnalysis:
+    """Queue a draft reply for this ticket. **Commits.**
+
+    §21 in one row and §41's four verbs in two of them. *"generated"* is this: a
+    `SUGGEST_RESPONSE` row, `pending` and then `completed`, holding the model's own output in
+    `result` like every other operation. *"regenerated"* is a second call to this function,
+    and the trail says which of the two happened — the audit action is
+    `AI_RESPONSE_REGENERATED` when a completed `SUGGEST_RESPONSE` row already exists for the
+    ticket and `AI_ANALYSIS_REQUESTED` otherwise. **The decision is read from stored state
+    here**, exactly as `request_summary` decides cached-versus-queued, which is why §41 needs
+    neither a second route nor a `?force=`: asking again *is* regenerating.
+
+    **No cache, and the difference from `request_summary` above is the point.** §20 reuses a
+    summary when nothing has changed because one conversation has one right answer. A draft
+    has many, and §41 lists regenerate as something a person may do on purpose — so every
+    request that is not already in flight makes a real call and writes a real row. A
+    `was_cached` entry for this operation would be a cache defeating the feature it sits in.
+    `app/repositories/ai_repository.py` therefore has no `latest_completed_suggestion` and
+    needs none: the only question asked of the past here is *"has there ever been one"*.
+
+    **In flight is not queued twice.** §16's duplicate guard, applied as in both functions
+    above and for their reason: two clicks must not be two provider calls for a draft that is
+    already on its way.
+
+    **`edited` and `accepted` are the other two verbs and neither is here.** Both happen when
+    a person sends a draft rather than when one is asked for, so they live on
+    `message_service.post_reply` — `AuditAction.AI_RESPONSE_ACCEPTED`, carrying §34's
+    before/after, which is the mechanism those two verbs were written for.
+
+    Takes the `Ticket` and not an id, like its two siblings and for their reason: both callers
+    have one, resolving it again would be a second query for the route, and this function
+    would gain an authorization decision its callers have already made.
+    """
+    in_flight = [
+        queued
+        for queued in await ai_repository.in_flight_analyses(session, ticket=ticket)
+        if queued.operation is AIOperation.SUGGEST_RESPONSE
+    ]
+    if in_flight:
+        logger.info(
+            "ai_suggestion_already_queued",
+            ticket_id=str(ticket.id),
+            organization_id=str(context.organization_id),
+        )
+        return in_flight[0]
+
+    regenerating = await ai_repository.has_completed_suggestion(session, ticket=ticket)
+
+    settings = get_settings()
+    created = AIAnalysis(
+        organization_id=context.organization_id,
+        ticket_id=ticket.id,
+        operation=AIOperation.SUGGEST_RESPONSE,
+        status=ProcessingStatus.PENDING,
+        # Stamped at queue time for the reason `request_analysis` gives: config changes, and a
+        # historical row has to keep naming the model it asked.
+        provider=settings.AI_PROVIDER,
+        model=settings.AI_MODEL,
+    )
+    session.add(created)
+    audit_service.record_for(
+        session,
+        context,
+        AuditAction.AI_RESPONSE_REGENERATED if regenerating else AuditAction.AI_ANALYSIS_REQUESTED,
+        target_type="ticket",
+        target_id=ticket.id,
+        metadata={"operations": [str(AIOperation.SUGGEST_RESPONSE)]},
+        origin=origin,
+    )
+    await session.commit()
+
+    enqueue_analysis(ticket.id, context.organization_id, analysis_ids=[created.id])
+
+    logger.info(
+        "ai_suggestion_queued",
+        ticket_id=str(ticket.id),
+        organization_id=str(context.organization_id),
+        actor_id=str(context.user_id),
+        regenerated=regenerating,
+    )
+    return created
+
+
 def enqueue_analysis(
     ticket_id: uuid.UUID, organization_id: uuid.UUID, *, analysis_ids: Sequence[uuid.UUID]
 ) -> int:
@@ -605,19 +717,19 @@ async def _execute(
 
     Returns `None` for an operation this build has no implementation for, which the caller
     records as a failure. That case is unreachable while the operations a route can queue are
-    exactly the three implemented below — and reachable the moment they are not, because a
+    exactly the four implemented below — and reachable the moment they are not, because a
     task is handed ids over a broker and a deployment mid-rollout can deliver a row from a
-    version that knew an operation this one does not. §21's `SUGGEST_RESPONSE` and §22's
-    `KNOWLEDGE_ANSWER` are already declared and unimplemented, so the case has a name today.
-    Failing the row says so on the ticket where a person will see it, rather than dying in a
-    worker log.
+    version that knew an operation this one does not. §22's `KNOWLEDGE_ANSWER` is already
+    declared and unimplemented, so the case has a name today. Failing the row says so on the
+    ticket where a person will see it, rather than dying in a worker log.
 
     **The ticket is written here, per operation, and not from the row afterwards.** The
     mapping from a validated model to the columns it feeds is the one place this module and
-    `app/schemas/ai.py` have to agree, and writing it as two typed branches means a field
-    renamed on one side is a mypy error rather than a column that silently stops being
-    written. **§20's summary is the branch that writes nothing**: a summary is stored, not
-    applied, and the row's own `result` is where it lives.
+    `app/schemas/ai.py` have to agree, and writing it as typed branches means a field renamed
+    on one side is a mypy error rather than a column that silently stops being written.
+    **§20's summary and §21's draft are the two branches that write nothing onto the ticket**:
+    a summary is stored rather than applied, and a draft is stored as a message rather than
+    sent — the row's own `result` is where each lives.
     """
     if analysis.operation is AIOperation.CLASSIFY:
         classified = await ai_service.classify_ticket(
@@ -654,6 +766,39 @@ async def _execute(
         # is where it lives. It is also what makes a summary-only run the one completion that
         # announces without notifying — see `run_analysis`.
         return _reduced(summarized)
+
+    if analysis.operation is AIOperation.SUGGEST_RESPONSE:
+        conversation = await ai_repository.load_conversation(
+            session, context.organization_id, ticket_id=ticket.id
+        )
+        drafted = await ai_service.generate_response(
+            session, context, _draft_request(ticket, conversation), ticket_id=ticket.id
+        )
+        # §41's distinction as a row rather than as a flag. The model's draft becomes a
+        # `Message` with `sender_type = AI_DRAFT`, which `ai_draft_is_internal` (Phase D) makes
+        # impossible for a customer to read and `MessageRepository.list_for_ticket` already
+        # returns to staff — so §21's "explicit UI distinction between AI generated draft and
+        # human-authored response" is a field the message read already carries.
+        #
+        # Built and added directly rather than through `MessageRepository`: that repository is
+        # constructed from a `TenantContext`, and this is the worker path with a
+        # `WorkerContext` and no authority to widen. `_record_completion` below adds a
+        # `TicketEvent` the same way, for the same reason.
+        #
+        # **Nothing is written onto the ticket**, which is what makes a suggestion-only run
+        # announce without alerting. `sender_user_id` is NULL because the model is not a user
+        # — who asked for the draft is on the `ai_analyses` row and in the audit trail.
+        session.add(
+            Message(
+                organization_id=context.organization_id,
+                ticket_id=ticket.id,
+                sender_type=SenderType.AI_DRAFT,
+                sender_user_id=None,
+                body=drafted.value.body,
+                is_internal=True,
+            )
+        )
+        return _reduced(drafted)
 
     logger.error(
         "ai_operation_unimplemented",
@@ -701,8 +846,30 @@ def _summary_request(conversation: Sequence[Message]) -> AIRequest:
     )
 
 
+def _draft_request(ticket: Ticket, conversation: Sequence[Message]) -> AIRequest:
+    """The §21 call for one ticket and its conversation.
+
+    Its own function for `_summary_request`'s reason: `_request_for` takes a `Ticket` and
+    reads its two text fields, and this one is handed both. `max_tokens` comes from settings
+    in all three, for the reason `AIRequest`'s docstring gives — it has one home.
+
+    The fence is still the provider's. `prompts.draft_content` assembles the ticket's words and
+    the conversation's and stops there, which is what keeps one implementation of the mechanism
+    rather than three.
+    """
+    return AIRequest(
+        instruction=prompts.SUGGESTED_REPLY_INSTRUCTION,
+        content=prompts.draft_content(ticket, conversation),
+        content_label=_DRAFT_LABEL,
+        max_tokens=get_settings().AI_MAX_TOKENS,
+    )
+
+
 def _reduced(
-    result: AIResult[Classification] | AIResult[SentimentResult] | AIResult[ConversationSummary],
+    result: AIResult[Classification]
+    | AIResult[SentimentResult]
+    | AIResult[ConversationSummary]
+    | AIResult[SuggestedReply],
 ) -> _Outcome:
     """One provider result reduced to what the analysis row stores.
 
@@ -712,10 +879,11 @@ def _reduced(
     a property of this function rather than of every future field.
 
     **`confidence` is read only from the schemas that have one.** §18's classification and
-    §19's sentiment each carry a confidence and §20's summary deliberately does not — §20
-    asks for a summary rather than a judgement, and the column's own check constraint already
-    allows NULL. Naming the two types is what keeps that a property of the schemas rather
-    than of a `getattr` that would hand back `None` for a field somebody misspelled.
+    §19's sentiment each carry a confidence and §20's summary and §21's draft deliberately do
+    not — a summary is a description rather than a judgement, and a draft is edited rather than
+    scored. The column's own check constraint already allows NULL, and naming the two types is
+    what keeps the absence a property of the schemas rather than of a `getattr` that would hand
+    back `None` for a field somebody misspelled.
     """
     value = result.value
     confidence = value.confidence if isinstance(value, (Classification, SentimentResult)) else None

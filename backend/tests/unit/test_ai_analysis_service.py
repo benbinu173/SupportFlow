@@ -8,12 +8,12 @@ real one in `tests/integration/test_ai_summary.py`, and over HTTP in
 `tests/api/test_ai_summary.py`. Nothing here reaches for a session, and the builders below
 are unsaved models, following `test_notification_policy.py`.
 
-**The claim worth testing is that §20's summary is a third kind of answer rather than a
-degraded first one.** A summary has no confidence, and the shortest way to support it would
-have been to write a `0.0` into the column or to reach for `getattr(value, "confidence",
-None)`. Both would let §19's schemas silently lose their confidence, and neither would fail.
-So `_reduced` is tested against all three schemas here, and the column's `None` is asserted
-to be *absence* rather than a made-up number.
+**The claim worth testing is that §20's summary and §21's draft are kinds of answer rather
+than degraded versions of the first two.** Neither has a confidence, and the shortest way to
+support that would have been to write a `0.0` into the column or to reach for
+`getattr(value, "confidence", None)`. Both would let §19's schemas silently lose their
+confidence, and neither would fail. So `_reduced` is tested against all four schemas here, and
+the column's `None` is asserted to be *absence* rather than a made-up number.
 """
 
 import uuid
@@ -27,7 +27,12 @@ from app.models.enums import AIOperation, SenderType, Sentiment, TicketPriority
 from app.models.message import Message
 from app.models.ticket import Ticket
 from app.repositories import ai_repository
-from app.schemas.ai import Classification, ConversationSummary, SentimentResult
+from app.schemas.ai import (
+    Classification,
+    ConversationSummary,
+    SentimentResult,
+    SuggestedReply,
+)
 from app.services import ai_analysis_service
 
 pytestmark = pytest.mark.unit
@@ -118,6 +123,31 @@ def test_a_summary_reduction_reports_no_confidence_rather_than_a_number() -> Non
     assert outcome.completion_tokens == 120
 
 
+def test_a_draft_reduction_reports_no_confidence_either() -> None:
+    """§41's edit verb, as a column: a reply is rewritten rather than scored.
+
+    `SuggestedReply` has one field by design — §41 says to show confidence where it is
+    meaningful, and a number beside a send button is the first step toward a threshold that
+    sends. The two tests above are what make this `None` a decision rather than a default: the
+    same function does put a number in the column for the two schemas that have one.
+    """
+    body = "Thanks for reporting this — I've asked the platform team to look at the file store."
+    result = AIResult(
+        SuggestedReply(body=body),
+        prompt_tokens=2_400,
+        completion_tokens=60,
+    )
+
+    outcome = ai_analysis_service._reduced(result)
+
+    assert outcome.confidence is None
+    # The payload is the model's own dump, so the draft is where the row keeps it — the
+    # `messages` row the worker also writes is a copy for the thread, not the record.
+    assert outcome.payload == {"body": body}
+    assert outcome.prompt_tokens == 2_400
+    assert outcome.completion_tokens == 60
+
+
 def test_the_payload_is_the_wire_form_of_the_model_not_the_enum() -> None:
     """`mode="json"`, so the row's JSONB holds `"high"` and not a `TicketPriority` member.
 
@@ -138,7 +168,7 @@ def test_the_payload_is_the_wire_form_of_the_model_not_the_enum() -> None:
 
 
 # ---------------------------------------------------------------------------
-# The two request builders
+# The three request builders
 # ---------------------------------------------------------------------------
 
 
@@ -190,6 +220,47 @@ def test_the_summary_request_fences_nothing_itself() -> None:
 
     assert prompts._OPEN not in request.content
     assert prompts._CLOSE not in request.content
+
+
+def test_the_draft_request_carries_the_ticket_and_the_conversation_under_its_own_label() -> None:
+    """§21's call reads both, so `_request_for` cannot build it — it takes only a `Ticket`.
+
+    The label is the third of the three, and it is the caller's own words naming *both* blocks
+    rather than the ticket's subject — `app/ai/prompts.py`'s rule, restated here because this
+    is the one prompt a person can send onward without retyping it.
+    """
+    request = ai_analysis_service._draft_request(
+        _ticket(subject="Cannot log in"),
+        [
+            _message(SenderType.CUSTOMER, "It will not download."),
+            _message(SenderType.AGENT, "Checking with the vendor.", is_internal=True),
+        ],
+    )
+
+    assert isinstance(request, AIRequest)
+    assert request.instruction == prompts.SUGGESTED_REPLY_INSTRUCTION
+    assert request.content_label == ai_analysis_service._DRAFT_LABEL
+    assert "Cannot log in" in request.content
+    assert "It will not download." in request.content
+    assert "Checking with the vendor." in request.content
+    assert request.content_label not in (
+        ai_analysis_service._CONTENT_LABEL,
+        ai_analysis_service._CONVERSATION_LABEL,
+    )
+    assert request.max_tokens == get_settings().AI_MAX_TOKENS
+
+
+def test_the_draft_request_fences_nothing_itself() -> None:
+    """Same rule as the other two builders: the provider is the one place that fences.
+
+    Built with **no** conversation as well as with one, because the ticket-only path is the
+    ordinary case (`create_ticket` writes no message) and it is the path a second fence
+    implementation would be easiest to leave behind.
+    """
+    for conversation in ([], [_message(SenderType.CUSTOMER, "hello")]):
+        request = ai_analysis_service._draft_request(_ticket(), conversation)
+        assert prompts._OPEN not in request.content
+        assert prompts._CLOSE not in request.content
 
 
 # ---------------------------------------------------------------------------

@@ -66,6 +66,12 @@ class ErrorCode(StrEnum):
     # Carries a second meaning beyond "absent": a notification addressed to a colleague
     # is as unreachable as one that was never written, and this is the code both return.
     NOTIFICATION_NOT_FOUND = "NOTIFICATION_NOT_FOUND"
+    # A draft's own code rather than `NOT_FOUND`, which this module reserves for "no such
+    # route". Accepting a draft reports this, and it covers three cases deliberately
+    # indistinguishably: no such message, a message on another ticket, and a message that is
+    # not an `ai_draft`. Telling a caller which of the three it hit would confirm that a
+    # message id it guessed exists and is not a draft (ADR-009).
+    AI_DRAFT_NOT_FOUND = "AI_DRAFT_NOT_FOUND"
 
     # --- Transport-level ---------------------------------------------------
     # Raised by the framework, not by domain code: the *route* does not exist, or the
@@ -199,6 +205,7 @@ _NOT_FOUND_MESSAGES: dict[ErrorCode, str] = {
     ErrorCode.ATTACHMENT_NOT_FOUND: "Attachment not found.",
     ErrorCode.SLA_POLICY_NOT_FOUND: "No SLA policy is configured for that priority.",
     ErrorCode.NOTIFICATION_NOT_FOUND: "Notification not found.",
+    ErrorCode.AI_DRAFT_NOT_FOUND: "Draft not found.",
 }
 
 
