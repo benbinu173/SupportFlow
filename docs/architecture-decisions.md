@@ -2496,3 +2496,304 @@ timeline entry (written with a `NULL` actor by a code path that has no route, so
 §6's separation *deterministically* — section 3 asserts `priority` was untouched, but a run where the model
 happened to recommend the band the ticket already had cannot tell the two columns apart, which is why the
 deliberate break above is what pins it.
+
+---
+
+## ADR-030 — A summary is stale when a person speaks, and a cache hit is still a ledger row
+
+**Status:** accepted · Phase V
+
+**Context.** §20 is four sentences — *"For long ticket conversations, generate a concise summary…
+Store the latest summary. Allow regeneration when the conversation changes significantly. Avoid
+regenerating the summary after every tiny message if unnecessary."* — and §36 names the route that
+serves them, `POST /api/v1/tickets/{id}/ai/summarize`, between the analysis route Phase U built and
+the suggestion route Phase W will.
+
+Everything below the flow already existed, which is the reason this phase is small and the reason its
+central claim is mechanical rather than argued: `AIOperation.SUMMARIZE` (`app/models/enums.py:170`),
+`ConversationSummary` (`app/schemas/ai.py:102`), `AIProvider.summarize_conversation` in the protocol
+and all three implementations, and `ai_service.summarize_conversation` with its ledger row. The
+`ai_analyses` table is operation-agnostic and `latest_by_operation` already serves whatever
+operations a ticket has. **So this phase adds no migration** — `alembic check` staying green is the
+proof, and it is the second phase in a row to make that claim.
+
+Three pieces of scaffolding named this phase and are discharged rather than left standing.
+`app/services/ai_service.py` said *"`was_cached` is always `False`. Phase T has no AI result cache,
+and §20's 'avoid regenerating' belongs to Phase V, which is where a cached call will be able to say
+so"* — that paragraph is now written in the past tense, because the claim is true rather than
+promised. `app/services/ai_analysis_service.py`'s `ANALYSIS_OPERATIONS` comment listed summarization
+as a later phase's; it stays a **two-member tuple**, and the comment now says why. And
+`app/repositories/ai_repository.py` predicted that `load_analyses` *"will be more when Phase V adds
+summarization"*. **It does not**, and the prediction is corrected rather than left standing: a wrong
+prediction in a docstring is a wrong claim.
+
+Three decisions were taken with the user before anything was written, and all three are decisions
+rather than defaults: the cache is a **freshness check** and not a result cache; **any new message**
+makes a summary stale, with no threshold and no `?force=`; and the model reads **people, notes
+included**, excluding system entries and unsent drafts.
+
+**Decision 1 — the cache is a comparison between two stored timestamps, not a cache.** When a
+summary is asked for and no eligible message has arrived since the last one was made, the stored
+summary *is* the answer: `request_summary` returns it, creates no `ai_analyses` row, queues nothing,
+and records the call it did not make. There is no Redis key, no TTL, and **no change to
+`ai_service._run`** — nothing is added inside the retry loop, where a cache would have to reason
+about attempts rather than about answers.
+
+The rejected alternative is the obvious one — a result cache in `app/core/cache.py` keyed on the
+conversation — and it was refused for two reasons. It would be machinery serving exactly one caller:
+a summary is **the only AI operation whose input can be identical twice**, because every ticket's
+classification text is new text by construction, so a generic cache would have one tenant and a
+lifetime of complexity. And §20's first sentence already asks for the thing the cache would need —
+*"Store the latest summary"* — so a second store of one fact is a second thing to keep consistent,
+which is how the freshness check and the model would come to disagree about what changed.
+
+**Decision 2 — any new message makes a summary stale, and nothing runs on a message.** §20 says
+*"changes significantly"* and *"every tiny message"*, both of which invite a threshold. The decision
+is that there is none: one new eligible message is a change. What actually prevents regenerating on
+every tiny message is not a rule about messages but the absence of one — **no message insert queues
+anything**, so a summary is only ever made because a person asked, and a person who asks twice wants
+the current answer rather than a refusal. A `?force=` parameter was considered and rejected as the
+worse version of the same thing: an explicit request is already the strongest statement of intent
+available, and honouring it only when a flag is present makes the ordinary case wrong.
+
+**Decision 3 — the model reads what people said, internal notes included, and the exclusion is one
+predicate with two readers.** Customer and agent messages are eligible; `system` entries and
+`ai_draft` rows are not. A system row is a status change rather than anything anybody said, and a
+draft is unsent — §21's *"AI must NEVER automatically send a customer-facing response"* made a data
+question, because a summary of what people said should not contain a draft nobody sent.
+
+Internal notes **are** included, and that is the decision worth stating. §20's summary is shown to
+staff beside the ticket, the route is gated by `AI_REQUEST_ANALYSIS` and never by `TICKET_VIEW`, and
+the note is often where an agent writes down what was actually promised — so a summary that omitted
+it would be a worse summary for everybody who can read it, and nobody who can read the summary is
+anybody who could not already read the note.
+
+`_CONVERSATION_SENDERS` in `app/repositories/ai_repository.py` is that rule written once, with two
+readers: `conversation_watermark` and `load_conversation` compose the same fragment, so the freshness
+check and the prompt cannot come to describe different conversations. The failure that prevents is
+the bad direction — a summary served as current that never saw the message which made it stale —
+and it is the reason `MESSAGE_FTS_EXPRESSION` is a shared constant rather than a comment asking two
+sites not to diverge.
+
+**Decision 4 — the watermark compares `created_at` to `created_at`, and the direction of its error is
+conservative.** Both `messages.created_at` and `ai_analyses.created_at` are written by the database
+(`server_default=func.now()`), so no application-versus-database clock skew enters the comparison.
+The summary row is written *before* the task that fills it runs, so a message arriving in that window
+makes a summary that did in fact cover it look stale. That costs one regeneration and never serves a
+summary that missed a message. `completed_at` would have been the app clock compared against a
+database one, and this is the column whose error runs in the safe direction.
+
+**Decision 5 — a cache hit is a ledger row, and `was_cached` finally has a writer.** The call that
+did not happen is recorded, with zero tokens, zero cost, zero latency, and `was_cached` set. It would
+have been simpler to write nothing, and that is exactly the wrong choice: `ai_usage`'s own column
+comment says the flag exists so *"the cache's actual saving be measured instead of estimated"*, and a
+saving measured by the absence of a row is an inference, not a count. With the row, the saving sits
+*because* of the calls it saved — `calls` and `cached_calls` in the same aggregate, one a subset of
+the other for the reason `failed_calls` is.
+
+`ai_service.record_cache_hit` is the only writer, and it records **the provider and model of the
+stored summary, not the current configuration** — the row names the model whose answer is being
+reused, which is the fact a ledger row is supposed to carry. `_stage_usage` gains `was_cached` as a
+keyword with a default of `False`, so the three call sites inside `_run` are unchanged: a call that
+reached the provider is a call that was not cached, which is the whole claim the old docstring was
+protecting. And `AIUsageSummary` gains `cached_calls` in the same commit, because a column written
+and never read is the column-with-no-reader this codebase refuses elsewhere.
+
+**Decision 6 — summarization is a second entry point over the same worker, not a third operation.**
+`request_summary` writes one `SUMMARIZE` row where `request_analysis` writes two, and everything
+below the entry point is shared: the same `run_analysis`, the same task, the same terminal-status
+skip, the same failure containment, the same ledger. A second worker path would be a second place
+for §16's duplicate guard to be missing from — and §20's summary is not something "analyze this
+ticket" performs, since what it reads is the conversation rather than the ticket's two text fields.
+
+**Decision 7 — `_reduced` stops assuming every answer has a confidence.** `ConversationSummary` has
+one field, so `_Outcome.confidence` becomes `float | None`, the summary branch returns `None`, and
+`ai_analyses.confidence` stores a `NULL` — which its nullable column and range check already allow.
+The alternatives were both worse: a `0.0` would be a claim the model never made about a judgement it
+was never asked for, and `getattr(value, "confidence", None)` would let §18's and §19's schemas lose
+their confidence silently. The reduction reads the field only from the two schemas that have one, by
+name, so a renamed field is a type error rather than a `None` in a column.
+
+**Decision 8 — a run that changed no ticket column announces without alerting.**
+`notification_service.notify_analysis_completed` still exists and still fires for an analysis run;
+it does not fire for a summary-only run. The alert exists because a classification changes the
+ticket and somebody should look; a summary changes nothing and exists to be read by whoever asked
+for it, so an alert would interrupt the requester about a page they are already on. The timeline
+entry and the socket event **do** still happen — the entry is the only record of *when*, and the
+event is what a client polling between asking and the answer arriving is waiting for — so the run is
+not silent, it is only quiet.
+
+**Decision 9 — an empty conversation is refused, and the refusal is a `ValidationError`.**
+`ticket_service.create_ticket` writes the description onto the ticket and creates **no** `Message`
+row, so a freshly raised ticket has a conversation of length zero. §20 is about *"long ticket
+conversations"*, and summarizing nothing would hand the model an empty block and spend a call
+learning that. `request_summary` therefore checks the watermark's count and raises
+`ValidationError("This ticket has no conversation to summarize.")` — §42's existing `422`, the same
+code and the same class `create_ticket` uses for a rule Pydantic cannot express, rather than a new
+error code for a case that is not a new kind of failure.
+
+**Decision 10 — a conversation longer than the model's context fails rather than being truncated.**
+`load_conversation` has no `LIMIT` and no character budget. An over-long conversation is refused by
+the provider, the row is marked `failed`, and `error_message` says so on the ticket — a visible
+failure. Truncating to fit would produce a summary that silently omitted the beginning and was
+indistinguishable from one that had read it all, which is a wrong answer wearing the same shape as a
+right one, and §60's ban on fake AI results is about exactly that. A budget that keeps the newest
+turns *and says what it dropped* is the honest version of the limit, and it is not in this phase.
+This is recorded as a limitation rather than a plan.
+
+**What this deliberately does not do.** No suggested replies (§21, Phase W) and no knowledge base,
+embeddings, or retrieval (§22, Phase X) — `SuggestedReply`, `AIOperation.SUGGEST_RESPONSE`,
+`EMBED`, and `KNOWLEDGE_ANSWER` stay declared-and-unused exactly as they were. **No automatic
+summarization**: nothing is summarized because a message arrived, per Decision 2. **No
+message-count threshold and no `?force=`**, per Decision 2. **No summary column on `tickets`**: the
+summary is the newest `SUMMARIZE` row, which `GET /tickets/{id}/ai/analyses` already serves and
+`latest_by_operation` already reduces to one per operation — §20's *"store the latest summary"* is a
+reading, not a second copy. **No retry sweep for stuck analyses**, which remains ADR-029's recorded
+gap and is still covered by `ix_ai_analyses_pending`.
+
+**Cost.** No new dependency, no migration, and no new setting. One new public function
+(`ai_service.record_cache_hit`), one new repository function group, one route, one field on
+`AIUsageSummary`, and one more column on a query that already ran. The standing cost is the
+asymmetry `ANALYSIS_OPERATIONS` now documents: "what one analyze request does" and "what the AI
+worker can be asked to do" are no longer the same set, so a reader has to hold both — which is the
+price of §20 reading the conversation while §18 and §19 read the ticket.
+
+**Verification.** The suite is **1357 tests**, all passing — 1322 at ADR-029's close, so 35 for this
+phase's own surface. `alembic check` reports *"No new upgrade operations detected"*, the mechanical
+proof of the claim above: this phase writes an `ai_analyses` lifecycle and a ledger row and every
+column already existed. `ruff check`, `ruff format --check` (191 files), and `mypy app alembic`
+(118 files) are clean.
+
+**Four breaks were made deliberately, and each failed the tests that cover it.** They come in two
+pairs, and the pairing is the interesting part.
+
+*The freshness rule.* Deleting the comparison in `request_summary` — `if stored is not None` — so
+that any stored summary is always the answer, failed **`test_one_new_message_makes_the_summary_stale_again`
+and nothing else**. That is worth recording: the two cache-hit tests *pass* under this break, because
+a route that never regenerates satisfies "a second ask returns the stored row" perfectly. Making
+`conversation_watermark` report `now` instead of the newest message's timestamp — so that every
+summary always looks stale — failed **`test_a_second_summary_with_nothing_new_returns_the_stored_one_for_free`
+and `test_a_current_summary_comes_back_completed_and_queues_nothing`**, and leaves the staleness test
+green. Neither break alone covers the rule; the comparison has two directions and each test file
+pins one of them. A single break that "made the cache tests fail" would have proved nothing about the
+other direction, which is why both were made.
+
+*The ledger.* Defaulting `was_cached` to `True` on every staged row — marking real provider calls as
+free — failed **`test_a_cache_hit_is_a_row_and_the_overview_counts_it`**,
+**`test_a_committed_call_leaves_a_row_in_the_table`**,
+**`test_the_overview_route_reports_the_ledger_it_used_to_read_empty`**, and the ledger assertion
+inside `test_a_second_summary_with_nothing_new_returns_the_stored_one_for_free`. Four tests across
+two files, which is the claim that `was_cached` is checked where a call is real and not only where it
+is skipped.
+
+*The eligibility rule.* Widening `_CONVERSATION_SENDERS` to include `SenderType.SYSTEM` failed
+**`test_the_conversation_is_customer_and_agent_messages`** (the constant itself),
+**`test_every_sender_type_is_eligible_or_deliberately_excluded`** (the mechanical sweep over the
+enum), and **`test_the_model_reads_the_people_and_not_the_books`** (the prompt a scripted provider
+actually received). The third is the one that matters: the first two are assertions about a constant,
+and only the third is about what the model was handed.
+
+Each break was reverted, and the reverts confirmed by re-running the affected files green.
+
+**The live end-to-end ran against a real key.** `uvicorn` under
+`app.core.event_loop:loop_factory`, a Celery worker on `--pool=solo -Q notifications,sla,ai`, and
+`scripts/phase_v_walkthrough.py` raising a real ticket, posting a customer message and an agent's
+internal note over HTTP, and summarizing against the real configured model:
+
+    provider=groq model=openai/gpt-oss-120b
+
+    1. §20 sentences 1-2: a conversation exists and nothing is summarized yet
+      ok    the ticket was created
+      customer: Ada Lovelace  ticket: 1
+      the ticket's own §18 analysis settled: completed
+      ok    a customer message and an internal note were posted
+      ok    no summary exists yet
+      queued: summarize  status=pending
+      ok    the route accepted the request
+      ok    it answered with one row, queued or already done
+      ok    the row names the model that will be asked
+    2. §20 sentence 1: the worker summarizes it, in another process
+      settled after 2.1s: status=completed
+      summary: 'The customer reports that attempting to download a file in Safari still
+      results in an error and the download never starts. The agent has internally
+      identified that the file store is degraded, returning 503 errors to all users, and
+      has opened platform ticket PLAT-4417. No timeline has been promised pending
+      resolution of that ticket.'
+      ok    it is a real sentence somebody could read
+      ok    the row carries no confidence
+      ok    the call was billed for its tokens
+      ok    the summary changed nothing on the ticket
+      priority='medium'  recommended='medium'
+    3. §20 sentence 4: asking again with nothing new costs nothing
+      before: calls=3 cached=0 cost=0.000512
+      ok    the same row came back
+      ok    and it came back completed, not queued again
+      after:  calls=4 cached=1 cost=0.000512
+      ok    the cached call is counted
+      ok    the call count moved with it -- cached_calls is a subset, not a deduction
+      ok    and the bill did not move at all
+    4. §20 sentence 3: one new message makes the summary stale
+      ok    a new customer message was posted
+      queued: summarize  status=pending
+      ok    a new row was queued rather than the old one served
+      ok    the regenerated summary completed
+      summary: 'The customer reports that downloads fail with a 503 Service Unavailable
+      error, even after trying Safari again. An internal note indicates the file store is
+      degraded and returning 503s to all users, with platform ticket PLAT-4417 opened, and
+      no timeline promised. The issue remains unresolved.'
+      ok    it is a different summary
+    5. §53: the same ticket id, asked by another tenant
+      ok    the stranger's request is a 404
+      ok    and it names no ticket
+      ok    the owner still reads their own summary
+
+    24 passed, 0 failed
+
+Section 3 is the phase's whole claim in three lines. A real model summarized a real conversation,
+the second ask was answered from storage, and the numbers say so without any interpretation: the
+call count went up by one because a ledger row was written, `cached_calls` went up by one because
+that row is marked, and **`cost_usd` is identical to the cent** because no provider was asked. §20's
+fourth sentence is not a policy here, it is `0.000512 == 0.000512`. Section 2's summary names
+PLAT-4417 — the platform ticket that exists only in the agent's internal note — which is Decision 5's
+reading decision visible in the model's own output.
+
+**The notification absence was then checked in the database rather than left as an argument:**
+
+    notifications_for_that_ticket
+    ------------------------------
+                                0
+          event_type       | count
+    -----------------------+-------
+     created               |     1
+     message_added         |     2
+     internal_note_added   |     1
+     ai_analysis_completed |     3
+
+Three `ai_analysis_completed` timeline entries — the ticket's own §18 run and the two summaries — and
+zero notifications. **That zero is weaker than it looks, and the reason is worth stating.** This
+ticket was never assigned, and `notify_analysis_completed` sends to the assignee and to managers, so
+the classification run would have produced nothing either. The count alone cannot separate "summaries
+do not alert" from "nobody was listening" — which is exactly why the assertion that carries Decision 8
+is `test_a_summary_only_run_announces_without_alerting`, a test that assigns an agent, runs the
+summary, and asserts the notification list is empty anyway. The query above is a sanity check on the
+story, not the proof of it.
+
+One thing was found by running this rather than by writing it: the first run's output arrived as
+mojibake. Windows redirects stdout to the locale encoding, cp1252, which has no `§`, so the section
+headings came back as replacement characters — and a decision record whose transcript is unreadable
+is not evidence. The script now asks for UTF-8 explicitly, and the block above is a capture of the
+second run.
+
+
+The script's own closing note records three things it cannot show for itself, and the honest one is
+the first. **The notification that is *not* sent** has no HTTP surface at all — a run that changed no
+ticket column announces on the socket and writes its timeline entry, and then nothing arrives, which
+on every other surface looks exactly like a message with nobody to send to; the script prints the
+`psql` query rather than pretending to assert on an absence. **§20's over-context behaviour**
+(Decision 10) is likewise unexercised, because producing a conversation longer than the model's
+window would mean pasting kilobytes of filler, and a limitation stated is worth more than a
+walkthrough that manufactures its own hazard. And section 3's claim is that a **database clock
+comparison** found the conversation unmoved, so the script cannot itself manufacture a message and a
+summary in the same instant to probe the boundary — the deterministic proof is the integration file,
+which scripts the provider and controls both timestamps.
+

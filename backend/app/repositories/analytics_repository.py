@@ -383,6 +383,13 @@ class AnalyticsRepository(TenantScopedRepository[Ticket]):
         `cost_usd` is `Numeric`, so a `SUM` comes back as a `Decimal` and is kept as one.
         Six decimal places of a fraction of a cent is exactly the quantity floating point
         would start losing once the sums got large.
+
+        **`cached_calls` is counted here, and it is the one number that is not a call.**
+        Phase V's summary cache stages a row with `was_cached` set and no tokens, so a
+        `COALESCE(SUM(...), 0)` a `COUNT` away from an identical figure for a real call that
+        returned nothing — the count is what makes the difference visible. It is a subset of
+        `calls` for `failed_calls`' reason: both are views of the same rows, and neither
+        subtracts.
         """
         ticket_ids = self._scoped().with_only_columns(Ticket.id)
         window = [AIUsage.created_at >= start, AIUsage.created_at < end]
@@ -391,6 +398,7 @@ class AnalyticsRepository(TenantScopedRepository[Ticket]):
         totals = select(
             func.count(),
             func.count().filter(AIUsage.was_successful.is_(False)),
+            func.count().filter(AIUsage.was_cached.is_(True)),
             func.coalesce(func.sum(AIUsage.prompt_tokens), 0),
             func.coalesce(func.sum(AIUsage.completion_tokens), 0),
             func.coalesce(func.sum(AIUsage.cost_usd), 0),
@@ -412,9 +420,10 @@ class AnalyticsRepository(TenantScopedRepository[Ticket]):
         return {
             "calls": int(row[0]),
             "failed_calls": int(row[1]),
-            "prompt_tokens": int(row[2]),
-            "completion_tokens": int(row[3]),
-            "cost_usd": Decimal(row[4]),
+            "cached_calls": int(row[2]),
+            "prompt_tokens": int(row[3]),
+            "completion_tokens": int(row[4]),
+            "cost_usd": Decimal(row[5]),
             "by_operation": [
                 {"operation": operation, "calls": int(calls), "cost_usd": Decimal(cost)}
                 for operation, calls, cost in rows

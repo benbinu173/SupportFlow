@@ -26,10 +26,13 @@ rollback discard these rows loses exactly the record that matters most.** The wa
 demonstrates it by reading `failed_calls: 1` back over HTTP after a deliberate permanent
 failure, rather than asserting that it happened.
 
-**`was_cached` is always `False`.** Phase T has no AI result cache, and §20's "avoid
-regenerating" belongs to Phase V, which is where a cached call will be able to say so. The
-column exists so that saving can be measured rather than estimated, and writing `True` for
-a call that reached the provider would corrupt exactly that measurement.
+**`was_cached` is `True` on exactly one kind of row, and it is the only row here that
+records a call nobody made.** Every attempt that reached a provider is `False` — writing
+`True` for one of those would corrupt the measurement the column exists for — and
+`record_cache_hit` writes the other: §20's summary, served from the stored one because the
+conversation had not moved, with zero tokens, zero cost and no call. It is a row rather than
+a silence so that the saving is a count *beside* the calls it saved, and
+`/analytics/overview` reports it as `cached_calls`.
 
 **Provider errors become `AIServiceError` at this boundary.** §54 wants a stable error
 surface, and the three internal types are not it. The distinction between transient,
@@ -146,6 +149,7 @@ def _stage_usage(
     latency_ms: int,
     was_successful: bool,
     ticket_id: uuid.UUID | None,
+    was_cached: bool = False,
 ) -> None:
     """Append one ledger row for one attempt. **Never commits.**
 
@@ -188,8 +192,53 @@ def _stage_usage(
             user_id=context.user_id if isinstance(context, TenantContext) else None,
             latency_ms=latency_ms,
             was_successful=was_successful,
-            was_cached=False,
+            was_cached=was_cached,
         )
+    )
+
+
+def record_cache_hit(
+    session: AsyncSession,
+    context: TenantContext | WorkerContext,
+    *,
+    operation: AIOperation,
+    provider: str,
+    model: str,
+    ticket_id: uuid.UUID | None = None,
+) -> None:
+    """Append the ledger row for a call the cache answered. **Never commits.**
+
+    §20's *"avoid regenerating the summary after every tiny message if unnecessary"* is
+    answered by not making the call, and this is the row that records not making it: zero
+    tokens, zero cost, zero latency, `was_cached=True`. **A row rather than a silence**,
+    because `ai_usage.was_cached`'s own comment is that it exists *"so that the cache's
+    actual saving can be measured instead of estimated"* — and an absence cannot be counted
+    beside the calls it saved.
+
+    **The saving is a count and not an amount, and that is the honest limit of what can be
+    measured.** The tokens the call would have used are unknowable: it was never made. An
+    estimate derived from the average call would be exactly the estimated number the column
+    was added to replace, so `/analytics/overview` reports how many calls were free rather
+    than a dollar figure invented for them.
+
+    `provider` and `model` are the ones whose answer was reused, passed in by the caller
+    rather than read from settings here — the same rule `AIAnalysis` states for the rows it
+    stamps, because config changes and a ledger row has to keep naming the model it is a
+    fact about. `ticket_id` is nullable for the reason every other staging path here has it
+    nullable.
+    """
+    _stage_usage(
+        session,
+        context,
+        operation=operation,
+        provider=provider,
+        model=model,
+        prompt_tokens=0,
+        completion_tokens=0,
+        latency_ms=0,
+        was_successful=True,
+        ticket_id=ticket_id,
+        was_cached=True,
     )
 
 

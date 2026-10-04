@@ -1161,14 +1161,15 @@ error's message embeds `REDIS_URL`, which carries a password in production.
 [backend/app/services/ai_service.py](backend/app/services/ai_service.py) is the one call path that
 enforces the timeout, retries what is worth retrying, validates the answer, and records what it cost;
 and [backend/app/services/ai_analysis_service.py](backend/app/services/ai_analysis_service.py) is the
-pipeline that runs it for a ticket — two routes, one queue, and a worker.
+pipeline that runs it for a ticket — three routes, one queue, and a worker.
 
 **A new ticket is analyzed without anyone asking.** `POST /tickets` writes two `pending` rows, hands a
 task to the `ai` queue, and returns 201 — the model is called in another process, and §16's *"the API
 should not wait unnecessarily for the LLM"* holds structurally rather than by being careful: nothing in
-[backend/app/api/ai.py](backend/app/api/ai.py) imports a provider. §36's remaining two routes are
-Phases V and W. The ledger is still readable on its own: `GET /analytics/overview` reports calls,
-tokens, and dollars for the tenant.
+[backend/app/api/ai.py](backend/app/api/ai.py) imports a provider. §36's remaining route is §21's
+suggested reply, which is Phase W. The ledger is still readable on its own: `GET /analytics/overview`
+reports calls, tokens, and dollars for the tenant — and, since Phase V, how many of those calls were
+answered from a stored result and cost nothing at all.
 
 ### The provider boundary
 
@@ -1275,9 +1276,10 @@ model is called.
 | | |
 |---|---|
 | `POST /api/v1/tickets/{ticket_id}/ai/analyze` | `202` with one `pending` row per operation. Body is what was **queued**, not what was concluded. Rate limited per user (§45). |
+| `POST /api/v1/tickets/{ticket_id}/ai/summarize` | `202` with **one** row — `pending` when a summary was queued, `completed` when the stored one was already current. Same limit. |
 | `GET /api/v1/tickets/{ticket_id}/ai/analyses` | The latest row per operation, so a queued or failed analysis is visible rather than silently absent. |
 
-**Both need `ai:request_analysis`, and neither needs `TICKET_VIEW`.** §3 gives customers no AI access
+**All three need `ai:request_analysis`, and none needs `TICKET_VIEW`.** §3 gives customers no AI access
 at all, so guarding these with the ticket read capability — the obvious choice, since that is what
 they hang off — would hand a portal caller the analysis of their own ticket, including
 `error_message`, which the column's own comment keeps from customers because upstream errors can echo
@@ -1306,6 +1308,37 @@ in the worker instead, with a `NULL` actor, exactly as the SLA sweep's entries a
 **A redelivered task does nothing.** The task runs under at-least-once delivery, so a worker killed
 after committing its results is handed the same message again — and the guard is the row's status, not
 a lock. A row only ever leaves `pending` once.
+
+### Summaries, and the call that never happens
+
+§20 on top of the same worker: one more operation, one more route, and a rule that decides when the
+work does not need doing.
+
+    curl -s -X POST localhost:8000/api/v1/tickets/$TICKET/ai/summarize -H "Authorization: Bearer $TOKEN"
+
+**A summary is stale when a person speaks.** The newest `completed` summary carries a timestamp; the
+conversation carries a count and its own newest message's timestamp. One is newer than the other and
+the request queues a regeneration; otherwise the stored summary *is* the answer and no model is
+consulted. One rule, no message-count threshold, and no `?force=` — an explicit request always gets
+the current answer, and nothing runs when a message arrives, which is what §20's *"avoid regenerating
+after every tiny message"* actually asks for. Both timestamps come from the database's clock
+(`server_default=func.now()`), so there is no app-versus-database skew to reason about; the row is
+written before the task runs, so the error direction is a summary that looks stale one message too
+early, which costs a regeneration and never serves a summary that missed something.
+
+**The saving is recorded, not inferred.** A served-from-storage request still writes a row to
+`ai_usage`, with `was_cached` set and zero tokens, zero latency, and zero dollars. That is the whole
+reason the column exists: `cached_calls` on `/analytics/overview` is then a count of real rows rather
+than an estimate of a call that was skipped, and it is a subset of `calls` exactly as `failed_calls`
+is. A second summarize with nothing new is one more call on the dashboard, one more cached call, and
+**the same `cost_usd` to the cent**.
+
+**The model reads the people, notes included.** Customer messages and agent messages, internal notes
+among them; system entries and unsent drafts are excluded. The route is staff-gated and never
+`TICKET_VIEW`, so a summary that omitted the note where an agent promised a refund would be the
+worse summary — and §21's draft is not something anybody said. A summary-only run writes no ticket
+column, so it announces on the socket and writes its timeline entry but sends **no notification**;
+the person who asked for the summary is the person reading it.
 
 ### Verifying the analysis by hand
 

@@ -5,14 +5,16 @@ Mounted under `/tickets/{ticket_id}` rather than at an `/ai` root, and for the r
 exactly when its ticket is, the path says so, and there is no `/ai/analyses/{id}` route
 that would need its own access rule derived from the ticket's (ADR-015).
 
-**Two routes, one capability, and neither is `TICKET_VIEW`.** §3's matrix gives customers
-no AI access at all, so a ticket read capability here would hand a portal caller the
-analysis of their own ticket — including `error_message`, which the column's own comment
+**Three routes, one capability, and none of them is `TICKET_VIEW`.** §3's matrix gives
+customers no AI access at all, so a ticket read capability here would hand a portal caller
+the analysis of their own ticket — including `error_message`, which the column's own comment
 says is *"surfaced to staff, never to customers: upstream errors can echo prompt content."*
 `AI_REQUEST_ANALYSIS` is the capability that gates asking and reading, which is the same
 reading `GET /customers/{id}` → `CUSTOMER_LIST` takes: one capability for the operation,
-rather than one per verb. `AI_REQUEST_SUGGESTION`, `AI_QUERY_KNOWLEDGE`, and
-`AI_VIEW_USAGE` belong to Phases W, X, and the analytics routes that already exist.
+rather than one per verb. Summarizing is a form of asking for an analysis of the ticket, so
+§20's route takes the same capability as §18's — `AI_REQUEST_SUGGESTION`,
+`AI_QUERY_KNOWLEDGE`, and `AI_VIEW_USAGE` belong to Phases W, X, and the analytics routes
+that already exist.
 
 **The route is not where the work happens.** §16's *"The API should not wait unnecessarily
 for the LLM"* is satisfied structurally — nothing in this module imports a provider.
@@ -73,6 +75,46 @@ async def analyze_ticket(
     ticket = await ticket_service.require_visible_ticket(db, context, ticket_id)
     analyses = await ai_analysis_service.request_analysis(db, context, ticket, origin=origin)
     return [AIAnalysisRead.model_validate(analysis) for analysis in analyses]
+
+
+@router.post(
+    "/{ticket_id}/ai/summarize",
+    response_model=AIAnalysisRead,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Summarize a ticket's conversation",
+    dependencies=[
+        Depends(require_permission(Permission.AI_REQUEST_ANALYSIS)),
+        Depends(limit_ai),
+    ],
+)
+async def summarize_ticket(
+    ticket_id: uuid.UUID, context: Context, db: DbSession, origin: Origin
+) -> AIAnalysisRead:
+    """Summarize this ticket's conversation — §20, and §36's second AI route.
+
+    **One row, not a list.** `analyze_ticket` answers with a list because one request queues
+    two operations; this one queues the single operation §20 describes, so the response is
+    the one row it is about.
+
+    **`202` covers both outcomes, and the row says which happened.** Work was queued and the
+    row is `pending`; or the conversation had not moved since the last summary, in which case
+    §20's *"avoid regenerating after every tiny message if unnecessary"* means the stored
+    summary *is* the answer, the row comes back `completed`, and no second call is made. This
+    is the same reading `analyze_ticket` takes of a double-click: from the caller's point of
+    view the question "what is the summary of this conversation" has an answer either way, and
+    the status code does not need to distinguish how it was reached.
+
+    **The caller polls, or waits for the socket.** A queued summary is filled by the worker
+    like any other analysis, and `GET /tickets/{ticket_id}/ai/analyses` returns it as the
+    latest `SUMMARIZE` row alongside the classification and the sentiment — which is where a
+    summary is read from, and why §36 needs no `GET` route for one.
+
+    Rate limited per user (§45, `limit_ai`) for `analyze_ticket`'s reason: this is the abuse
+    that is billed rather than suffered.
+    """
+    ticket = await ticket_service.require_visible_ticket(db, context, ticket_id)
+    analysis = await ai_analysis_service.request_summary(db, context, ticket, origin=origin)
+    return AIAnalysisRead.model_validate(analysis)
 
 
 @router.get(

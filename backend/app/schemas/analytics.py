@@ -271,12 +271,21 @@ class AIUsageSummary(BaseModel):
     report spend with no way to see how much of it bought nothing. It is a subset of
     `calls`, and `cost_usd` includes it: a truncated answer is still an invoice.
 
+    `cached_calls` is the other subset, and **it is the first field here that counts rows
+    for calls no provider made.** Since Phase V §20's summary is served from the stored one
+    when the conversation has not moved, and that saving is a ledger row with
+    `was_cached` set rather than a silence — so "how much did the cache save" is this number
+    and not an estimate. It contributes zero to `prompt_tokens`, `completion_tokens` and
+    `cost_usd`, which is what zero was going to look like anyway; the count is the only
+    evidence the row exists.
+
     `calls` counts only calls attributed to a ticket in the caller's row scope, because
     `ai_usage` has no `customer_id` to scope by — see `AnalyticsRepository.ai_usage`.
     """
 
     calls: int
     failed_calls: int
+    cached_calls: int
     prompt_tokens: int
     completion_tokens: int
     cost_usd: Decimal

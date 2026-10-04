@@ -535,9 +535,66 @@ async def test_the_overview_route_reports_the_ledger_it_used_to_read_empty(
 
     assert overview.ai_usage.calls == 1
     assert overview.ai_usage.failed_calls == 0
+    # A call that reached the provider is a call that was not cached, which is the whole
+    # claim `was_cached` protects — see the test below for the other kind of row.
+    assert overview.ai_usage.cached_calls == 0
     assert overview.ai_usage.prompt_tokens == PROMPT_TOKENS
     assert overview.ai_usage.cost_usd == EXPECTED_COST
     assert [row.operation for row in overview.ai_usage.by_operation] == [AIOperation.CLASSIFY]
+
+
+async def test_a_cache_hit_is_a_row_and_the_overview_counts_it(
+    db: AsyncSession, spender: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§20's saving, made countable: **the call nobody made is still a ledger row.**
+
+    `ai_service.record_cache_hit` is the only writer of `was_cached=True`, and this is the
+    assertion that the column Phase T declared for it finally has a meaning. A real call and a
+    served-from-storage call sit beside each other in the same table, and the difference between
+    them is one boolean and two zeros.
+
+    **`cached_calls` is a subset of `calls` and not a deduction from it**, for the reason
+    `failed_calls` is: both are views of the same rows. A dashboard that subtracted would be
+    reporting a number that no longer answered "how many calls were made", and the arithmetic
+    would stop being a measurement — which is the whole reason the saving is a row rather than
+    an absence.
+
+    The cost assertion is the point of the exercise: the cached row contributes nothing to
+    `cost_usd`, so the tenant's bill is what the one real call cost.
+    """
+    use_provider(monkeypatch, FakeProvider(classify_payload()))
+
+    await ai_service.classify_ticket(
+        db, spender["context"], request(), ticket_id=spender["ticket"].id
+    )
+    ai_service.record_cache_hit(
+        db,
+        spender["context"],
+        operation=AIOperation.SUMMARIZE,
+        provider="fake",
+        model=get_settings().AI_MODEL,
+        ticket_id=spender["ticket"].id,
+    )
+    await db.commit()
+
+    rows = await ledger_rows(db, spender["organization"].id)
+    cached = [row for row in rows if row.was_cached]
+
+    assert len(rows) == 2
+    assert len(cached) == 1
+    assert cached[0].operation is AIOperation.SUMMARIZE
+    assert cached[0].prompt_tokens == 0
+    assert cached[0].completion_tokens == 0
+    assert cached[0].cost_usd == Decimal("0")
+    assert cached[0].was_successful is True
+
+    totals = await aggregate(db, spender)
+
+    assert totals["calls"] == 2
+    assert totals["cached_calls"] == 1
+    assert totals["cached_calls"] <= totals["calls"]
+    assert totals["failed_calls"] == 0
+    assert totals["cost_usd"] == EXPECTED_COST
 
 
 # ---------------------------------------------------------------------------
@@ -569,6 +626,7 @@ async def test_a_tenant_that_has_spent_nothing_reads_zeros(
 
     assert theirs["calls"] == 0
     assert theirs["failed_calls"] == 0
+    assert theirs["cached_calls"] == 0
     assert theirs["prompt_tokens"] == 0
     assert theirs["completion_tokens"] == 0
     assert theirs["cost_usd"] == Decimal("0")

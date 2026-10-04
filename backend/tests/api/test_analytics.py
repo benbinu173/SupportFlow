@@ -377,15 +377,20 @@ def test_the_ai_usage_block_is_a_real_zero(manager: OrgSession) -> None:
     """§8's eleventh criterion: real aggregation queries, never hardcoded values.
 
     Nothing writes `ai_usage` until Phase T, so these are `COUNT` and `SUM` results over
-    zero rows — which is why `failed_calls` is a number of its own and why `by_operation`
-    is empty rather than carrying enum rows at zero: an operation with no calls has no row
-    to group, and inventing one would be the one hardcoded value in this module.
+    zero rows — which is why `failed_calls` and `cached_calls` are numbers of their own and
+    why `by_operation` is empty rather than carrying enum rows at zero: an operation with no
+    calls has no row to group, and inventing one would be the one hardcoded value in this
+    module.
 
     `cost_usd` is compared as a `Decimal` rather than as its rendered string. A sum over
     no rows is `NULL`, coalesced to zero — and PostgreSQL renders that zero as `"0"`, not
     as the six-place `"0.000000"` a real sum carries, because the scale comes from the
     value. Asserting the parsed number is what keeps this test about the money being
     nothing rather than about its formatting.
+
+    A tenant that has made no calls has also saved none, which is what `cached_calls` being
+    zero here says — §20's summary cache is a fact about a row that was *not* written, and a
+    tenant with no rows at all has neither claim to make.
     """
     usage = read(manager, "/overview")["ai_usage"]
 
@@ -393,6 +398,7 @@ def test_the_ai_usage_block_is_a_real_zero(manager: OrgSession) -> None:
     assert usage == {
         "calls": 0,
         "failed_calls": 0,
+        "cached_calls": 0,
         "prompt_tokens": 0,
         "completion_tokens": 0,
         "by_operation": [],

@@ -135,22 +135,23 @@ AI-review rules structural rather than conventional.
 
 ## 6. AI flow
 
-The lower half of this section is implemented; the upper half is partly so. **Phase T (ADR-027)**
-built the provider abstraction, the call path, and the ledger. **Phase U (ADR-029)** built §18's flow
-around them for the first two operations — classification and sentiment — with the route, the queue,
-and the worker. Summarization (§20) and suggested replies (§21) are Phases V and W, and the flow below
-gains a line each when they land.
+The lower half of this section is implementation, and the flow has one operation left to gain. **Phase
+T (ADR-027)** built the provider abstraction, the call path, and the ledger. **Phase U (ADR-029)** built
+§18's flow around them for the first two operations — classification and sentiment — with the route, the
+queue, and the worker. **Phase V (ADR-030)** added §20's summary on the same worker and a rule that
+decides when it does not need to run at all. Suggested replies (§21) are Phase W, and the flow gains its
+last line when they land.
 
 ```
-trigger (ticket created, or agent request)          ── ✅ U
+trigger (ticket created, or agent request)          ── ✅ U; ✅ V by request, when the conversation moved
    → enqueue task, return immediately                    ── ✅ U, on the `ai` queue
    → worker loads ticket within tenant scope             ── ✅ U (`ai_repository.py`, tenant in the WHERE)
-   → build prompt from a versioned template              ── mechanism in T (`app/ai/prompts.py`); classification and sentiment text in U; summarization and replies in V-W
+   → build prompt from a versioned template              ── mechanism in T (`app/ai/prompts.py`); classification and sentiment text in U; summarization text in V; replies in W
    → provider call with timeout and bounded retry        ── ✅ T
    → parse into a Pydantic model  ── invalid ──▶ handled failure, no result  ✅ T
-   → persist AI_USAGE (one row per attempt)              ── ✅ T
+   → persist AI_USAGE (one row per attempt)              ── ✅ T; ✅ V records a served-from-storage answer as a row with `was_cached`
    → persist AI_ANALYSIS                                 ── ✅ U
-   → update ticket AI fields                             ── ✅ U (never `tickets.priority`)
+   → update ticket AI fields                             ── ✅ U (never `tickets.priority`); a summary writes no field at all
    → publish event → clients update live                 ── ✅ U
 ```
 
@@ -161,6 +162,17 @@ trigger (ticket created, or agent request)          ── ✅ U
 anything, and a redelivered task finds them terminal and does nothing. Both operations run in **one**
 task, so the ticket gets one timeline entry, one notification, and one announcement, because §18's
 last three steps are singular; a failure inside the run is still contained to its own operation.
+
+**What Phase V added on top of U.** §20's summary as a **second entry point over the same worker**
+rather than a third member of `ANALYSIS_OPERATIONS` (ADR-030 Decision 5) — the operation differs, the
+machinery does not. The entry point is where the freshness rule lives, because it is the only place
+that can know a call is unnecessary: the newest `completed` summary's timestamp against the
+conversation's newest message, both read from the database's clock, and one rule — a person spoke or
+nobody did. `ai_service.record_cache_hit` writes the ledger row for the call that did not happen, so
+the saving is a count of rows rather than an estimate, and `/analytics/overview` gained `cached_calls`
+to read it. The flow above changes in exactly two places: the trigger can now be a request against a
+ticket that is already analyzed, and one of §18's steps writes nothing — a summary stores a result and
+touches no ticket field, which is why a summary-only run announces without notifying.
 
 **What runs today.** `app/services/ai_service.py` is the single call path — `classify_ticket`,
 `analyze_sentiment`, `summarize_conversation`, `generate_response` — and every one of them reduces
@@ -197,8 +209,12 @@ invariants above are the containment that matters.
 **Cost is recorded, not estimated.** Every attempt writes an `ai_usage` row with the provider's own
 token counts, a `cost_usd` computed at write time from the published rate in `app/ai/pricing.py`,
 the latency, and whether the attempt succeeded. A failed call is recorded rather than dropped,
-because it consumed quota and may have been billed. `GET /analytics/overview` reads that table
-through the Phase S aggregate and needed no change to start reporting real numbers.
+because it consumed quota and may have been billed. **So is the call that was never made:** since
+Phase V a served-from-storage answer writes a row with `was_cached` set and zeroes throughout, because
+an absent row and a call that cost nothing look identical on a dashboard and only one of them is
+evidence. `GET /analytics/overview` reads that table through the Phase S aggregate and reports `calls`,
+`failed_calls`, and `cached_calls` as three overlapping counts over the rows that exist — the last two
+each a subset of the first, so the number still answers "how many calls were made".
 
 **Two obligations travel with the ledger, and both belong to the caller.** `ai_service` stages rows
 and never commits, so whoever calls it commits — including after a failure, since a ledger that

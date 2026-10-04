@@ -33,6 +33,24 @@ notification, and one announcement. Two tasks would each independently decide to
 which is how a client ends up re-reading the same ticket twice and an agent gets two
 alerts for one arrival.
 
+**Summarization is a second entry point over this same worker, not a third operation.**
+§20's summary is not something "analyze this ticket" performs — §36 gives it its own route,
+and the thing it reads is the conversation rather than the ticket's two text fields. So
+`ANALYSIS_OPERATIONS` stays two members, and `request_summary` writes one `SUMMARIZE` row
+where `request_analysis` writes two. Everything below the entry point is shared: the same
+`run_analysis`, the same task, the same terminal-status skip, the same failure containment,
+the same ledger. A second worker path would be a second place for §16's duplicate guard to
+be missing from.
+
+**§20's "avoid regenerating after every tiny message if unnecessary" is a comparison between
+two stored timestamps, not a cache.** When a summary is asked for and no message has arrived
+since the last one was made, the stored summary *is* the answer: `request_summary` returns
+it, writes no `ai_analyses` row, queues nothing, and records the call it did not make with
+`ai_service.record_cache_hit`. There is no Redis entry and no TTL, because the thing being
+reused is the row §20's own first sentence asks for — *"store the latest summary"* — and a
+second store of one fact is a second thing to keep consistent. `was_cached` on the ledger row
+is what makes the saving countable rather than estimated.
+
 **A failure is contained to its own operation.** §7's *"AI provider failure degrades
 gracefully"* means a sentiment call that fails must not lose a classification that
 succeeded: each operation is caught separately, its row is marked `failed` with the reason,
@@ -53,7 +71,7 @@ from app.ai import prompts
 from app.ai.provider import AIRequest, AIResult
 from app.core import cache, redis
 from app.core.config import get_settings
-from app.core.exceptions import AIServiceError
+from app.core.exceptions import AIServiceError, ValidationError
 from app.core.tenancy import RequestOrigin, TenantContext, WorkerContext
 from app.models.ai_analysis import AIAnalysis
 from app.models.enums import (
@@ -62,28 +80,35 @@ from app.models.enums import (
     ProcessingStatus,
     TicketEventType,
 )
+from app.models.message import Message
 from app.models.notification import Notification
 from app.models.ticket import Ticket
 from app.models.ticket_event import TicketEvent
 from app.repositories import ai_repository
-from app.schemas.ai import Classification, SentimentResult
+from app.schemas.ai import Classification, ConversationSummary, SentimentResult
 from app.services import ai_service, audit_service, notification_service
 from app.websocket import manager as realtime
 
 logger = structlog.get_logger(__name__)
 
 #: The operations one "analyze this ticket" request performs. §51's list, minus the parts
-#: later phases own: summarization is §20 and Phase V, suggested replies are §21 and Phase W,
-#: and the knowledge base is §22 and Phase X. The tuple is ordered because the rows are
-#: written in this order and a client reading them back sees it.
+#: that are other requests: **summarization is §20 and it deliberately did not join this
+#: tuple** — Phase V gave it `request_summary` and `/ai/summarize`, and the conversation that
+#: reads is not the ticket text these two read. Suggested replies are §21 and Phase W, the
+#: knowledge base is §22 and Phase X, and neither belongs here either. The tuple is ordered
+#: because the rows are written in this order and a client reading them back sees it.
 ANALYSIS_OPERATIONS: tuple[AIOperation, ...] = (
     AIOperation.CLASSIFY,
     AIOperation.SENTIMENT,
 )
 
 #: The instruction each operation is called with. A dict rather than a branch, so
-#: `_request_for` cannot be reached with an operation that has no instruction — it raises a
-#: `KeyError` naming the operation, which is the failure a reader would want.
+#: `_request_for` cannot be reached with an operation that has no ticket-shaped instruction —
+#: it raises a `KeyError` naming the operation, which is the failure a reader would want.
+#: **`SUMMARIZE` is absent on purpose**: its instruction is
+#: `prompts.CONVERSATION_SUMMARY_INSTRUCTION` and its content is a conversation rather than
+#: `prompts.ticket_content`, so `_summary_request` builds that call and this dict must not
+#: pretend to.
 _INSTRUCTIONS: dict[AIOperation, str] = {
     AIOperation.CLASSIFY: prompts.CLASSIFICATION_INSTRUCTION,
     AIOperation.SENTIMENT: prompts.SENTIMENT_INSTRUCTION,
@@ -94,6 +119,11 @@ _INSTRUCTIONS: dict[AIOperation, str] = {
 #: not be anything a customer wrote. "The customer's ticket" describes the block; the ticket's
 #: subject would be part of it.
 _CONTENT_LABEL = "the customer's support ticket"
+
+#: The same, for §20's conversation block. A label rather than the ticket's subject for the
+#: reason above, and separate from `_CONTENT_LABEL` because the two describe different things:
+#: a summary is asked about a thread of replies, not about the description that opened it.
+_CONVERSATION_LABEL = "the support conversation so far"
 
 #: Stored on a row whose operation this build has no implementation for. See `_execute`.
 _NO_IMPLEMENTATION = "This analysis operation is not implemented in this version."
@@ -111,12 +141,16 @@ _TERMINAL: frozenset[ProcessingStatus] = frozenset(
 class _Outcome:
     """One operation's result, reduced to what the analysis row stores.
 
-    Built by `_reduced` from the provider's `AIResult`, and it exists because the two
+    Built by `_reduced` from the provider's `AIResult`, and it exists because the three
     schemas have no common supertype beyond `BaseModel` — the row is written from this
     rather than from a union the type checker cannot narrow.
+
+    `confidence` is optional because §20's summary has none. The other two schemas carry one;
+    `ai_analyses.confidence` is nullable with a range check, so `None` is a value the column
+    already accepts rather than a gap this dataclass is working around.
     """
 
-    confidence: float
+    confidence: float | None
     payload: dict[str, object]
     prompt_tokens: int
     completion_tokens: int
@@ -222,6 +256,143 @@ async def request_analysis(
     return [*in_flight, *created]
 
 
+async def request_summary(
+    session: AsyncSession,
+    context: TenantContext,
+    ticket: Ticket,
+    *,
+    origin: RequestOrigin | None = None,
+) -> AIAnalysis:
+    """Summarize this ticket's conversation, or return the summary it already has.
+    **Commits when it does work.**
+
+    §20 in four sentences, and this function answers three of them. *"Store the latest
+    summary"* is an `ai_analyses` row with `operation = SUMMARIZE` — which
+    `latest_by_operation` already reduces to one per operation and
+    `GET /tickets/{id}/ai/analyses` already serves, so there is no summary column and no
+    second table. *"Allow regeneration when the conversation changes significantly"* is a
+    second call to this function, which writes a new row and leaves the old one for §6's
+    comparison. *"Avoid regenerating after every tiny message if unnecessary"* is the check
+    below.
+
+    **Three outcomes, in the order a caller cares about them.**
+
+    1. **Work is already on its way.** An in-flight `SUMMARIZE` row is returned rather than a
+       second one queued — §16's *"avoid duplicate processing"*, the guard `request_analysis`
+       applies, and for the same reason: two clicks would be two provider calls for a
+       question that is already in flight.
+    2. **The stored summary is current.** No message has arrived since it was made, so it
+       *is* the answer. The audit row and a `was_cached=True` ledger row are written, the
+       tenant's analytics are invalidated because a ledger row moved them, and the existing
+       row comes back. **No `ai_analyses` row is created and nothing is queued.**
+    3. **The conversation moved, or has never been summarized.** A `PENDING` row is created,
+       stamped with the configured provider and model, and queued.
+
+    **The freshness comparison is between two database timestamps** — the newest eligible
+    message's `created_at` and the stored summary row's own `created_at`. See
+    `ai_repository.conversation_watermark` for why that column rather than `completed_at`,
+    and for the direction its error is allowed to run in.
+
+    **An empty conversation is refused.** §20 is about *"long ticket conversations"*, and a
+    ticket whose description has not yet been followed by a reply has nothing to summarize:
+    the model would be handed an empty block and asked to summarize it. `ValidationError`
+    says so rather than spending a call to find out — the same explicit refusal
+    `create_ticket` makes when a portal caller names somebody else's `customer_id`.
+
+    Takes the `Ticket` and not an id, like `request_analysis` and for its reason: both
+    callers have one, resolving it again would be a second query for the route and a wasted
+    one for `create_ticket`, and this function would gain an authorization decision its
+    callers have already made.
+    """
+    in_flight = [
+        queued
+        for queued in await ai_repository.in_flight_analyses(session, ticket=ticket)
+        if queued.operation is AIOperation.SUMMARIZE
+    ]
+    if in_flight:
+        logger.info(
+            "ai_summary_already_queued",
+            ticket_id=str(ticket.id),
+            organization_id=str(context.organization_id),
+        )
+        return in_flight[0]
+
+    watermark = await ai_repository.conversation_watermark(session, ticket=ticket)
+    if watermark.count == 0:
+        raise ValidationError("This ticket has no conversation to summarize.")
+
+    stored = await ai_repository.latest_completed_summary(session, ticket=ticket)
+    # `watermark.newest` cannot be `None` past the check above — a count of nought is the
+    # only way an aggregate over no rows reads — but the comparison is written to tolerate it
+    # rather than asserting what the aggregate already guarantees.
+    if stored is not None and (watermark.newest is None or watermark.newest <= stored.created_at):
+        audit_service.record_for(
+            session,
+            context,
+            AuditAction.AI_ANALYSIS_REQUESTED,
+            target_type="ticket",
+            target_id=ticket.id,
+            metadata={"operations": [str(AIOperation.SUMMARIZE)], "cached": True},
+            origin=origin,
+        )
+        # The row recording the call nobody made — see `ai_service.record_cache_hit`. The
+        # provider and model are the stored summary's and not the current configuration's:
+        # they name the model whose answer is being reused, which is the fact a ledger row
+        # is supposed to carry.
+        ai_service.record_cache_hit(
+            session,
+            context,
+            operation=AIOperation.SUMMARIZE,
+            provider=stored.provider,
+            model=stored.model,
+            ticket_id=ticket.id,
+        )
+        await session.commit()
+        # A ledger row moved `/analytics/overview`'s totals, so the tenant's cached entries
+        # move with it — the same post-commit position every other writer invalidates from.
+        await cache.invalidate(context.organization_id)
+        logger.info(
+            "ai_summary_cached",
+            ticket_id=str(ticket.id),
+            organization_id=str(context.organization_id),
+            analysis_id=str(stored.id),
+        )
+        return stored
+
+    settings = get_settings()
+    created = AIAnalysis(
+        organization_id=context.organization_id,
+        ticket_id=ticket.id,
+        operation=AIOperation.SUMMARIZE,
+        status=ProcessingStatus.PENDING,
+        # Stamped at queue time for the reason `request_analysis` gives: config changes, and a
+        # historical row has to keep naming the model it asked.
+        provider=settings.AI_PROVIDER,
+        model=settings.AI_MODEL,
+    )
+    session.add(created)
+    audit_service.record_for(
+        session,
+        context,
+        AuditAction.AI_ANALYSIS_REQUESTED,
+        target_type="ticket",
+        target_id=ticket.id,
+        metadata={"operations": [str(AIOperation.SUMMARIZE)], "cached": False},
+        origin=origin,
+    )
+    await session.commit()
+
+    enqueue_analysis(ticket.id, context.organization_id, analysis_ids=[created.id])
+
+    logger.info(
+        "ai_summary_queued",
+        ticket_id=str(ticket.id),
+        organization_id=str(context.organization_id),
+        actor_id=str(context.user_id),
+    )
+    return created
+
+
 def enqueue_analysis(
     ticket_id: uuid.UUID, organization_id: uuid.UUID, *, analysis_ids: Sequence[uuid.UUID]
 ) -> int:
@@ -312,6 +483,13 @@ async def run_analysis(
     ticket, so writing the entry would be a false claim on the record and sending the alert
     would be an interruption about nothing. The rows say `failed` and `error_message` says
     why, which is where somebody asking "what happened to my analysis" should be looking.
+
+    **A run that changed no ticket column announces without alerting.** A summary is the one
+    operation that finishes without writing a ticket field, and an alert to the assignee about
+    a summary they asked for is an interruption about something they are already reading. The
+    timeline entry and the socket event still happen: the entry is the only record of *when*,
+    and the event is what a client polling between asking and the answer arriving is waiting
+    for.
     """
     counts = {"completed": 0, "failed": 0, "skipped": 0}
 
@@ -377,9 +555,15 @@ async def run_analysis(
         event = _record_completion(
             session, context.organization_id, ticket, completed=completed_this_run
         )
-        notifications = await notification_service.notify_analysis_completed(
-            session, organization_id=context.organization_id, ticket=ticket
-        )
+        # §18's last step, and it rings only for a run that changed the ticket. A summary
+        # changed nothing — §20 stores one and writes no column — and the person who asked for
+        # it is the person reading it, so the alert would announce to somebody what they are
+        # already looking at. The timeline entry and the socket event still happen; see the
+        # docstring.
+        if any(analysis.operation in ANALYSIS_OPERATIONS for analysis in completed_this_run):
+            notifications = await notification_service.notify_analysis_completed(
+                session, organization_id=context.organization_id, ticket=ticket
+            )
 
     await session.commit()
 
@@ -417,20 +601,23 @@ async def _execute(
     analysis: AIAnalysis,
     ticket: Ticket,
 ) -> _Outcome | None:
-    """Make one operation's call and copy its result onto the ticket.
+    """Make one operation's call, and copy what belongs on the ticket.
 
     Returns `None` for an operation this build has no implementation for, which the caller
-    records as a failure. That case is unreachable while `ANALYSIS_OPERATIONS` is what
-    `request_analysis` writes rows for — and reachable the moment it is not, because a task
-    is handed ids over a broker and a deployment mid-rollout can deliver a row from a
-    version that knew an operation this one does not. Failing the row says so on the ticket
-    where a person will see it, rather than dying in a worker log.
+    records as a failure. That case is unreachable while the operations a route can queue are
+    exactly the three implemented below — and reachable the moment they are not, because a
+    task is handed ids over a broker and a deployment mid-rollout can deliver a row from a
+    version that knew an operation this one does not. §21's `SUGGEST_RESPONSE` and §22's
+    `KNOWLEDGE_ANSWER` are already declared and unimplemented, so the case has a name today.
+    Failing the row says so on the ticket where a person will see it, rather than dying in a
+    worker log.
 
     **The ticket is written here, per operation, and not from the row afterwards.** The
     mapping from a validated model to the columns it feeds is the one place this module and
     `app/schemas/ai.py` have to agree, and writing it as two typed branches means a field
     renamed on one side is a mypy error rather than a column that silently stops being
-    written.
+    written. **§20's summary is the branch that writes nothing**: a summary is stored, not
+    applied, and the row's own `result` is where it lives.
     """
     if analysis.operation is AIOperation.CLASSIFY:
         classified = await ai_service.classify_ticket(
@@ -454,6 +641,19 @@ async def _execute(
         ticket.sentiment = sentiment.sentiment
         ticket.sentiment_confidence = sentiment.confidence
         return _reduced(analyzed)
+
+    if analysis.operation is AIOperation.SUMMARIZE:
+        conversation = await ai_repository.load_conversation(
+            session, context.organization_id, ticket_id=ticket.id
+        )
+        summarized = await ai_service.summarize_conversation(
+            session, context, _summary_request(conversation), ticket_id=ticket.id
+        )
+        # **Nothing is written onto the ticket**, and that is the whole of this branch's
+        # difference: §20 stores a summary rather than applying one, and the row's `result`
+        # is where it lives. It is also what makes a summary-only run the one completion that
+        # announces without notifying — see `run_analysis`.
+        return _reduced(summarized)
 
     logger.error(
         "ai_operation_unimplemented",
@@ -482,7 +682,28 @@ def _request_for(operation: AIOperation, ticket: Ticket) -> AIRequest:
     )
 
 
-def _reduced(result: AIResult[Classification] | AIResult[SentimentResult]) -> _Outcome:
+def _summary_request(conversation: Sequence[Message]) -> AIRequest:
+    """The §20 call for one conversation.
+
+    Its own function rather than a branch inside `_request_for`, because the two are handed
+    different things: that one takes a `Ticket` and reads its two text fields, and this one
+    takes the messages the worker loaded. `max_tokens` comes from settings in both, for the
+    reason `AIRequest`'s docstring gives — it has one home.
+
+    The fence is still the provider's. `prompts.conversation_content` renders the turns and
+    stops there, which is what keeps one implementation of the mechanism rather than two.
+    """
+    return AIRequest(
+        instruction=prompts.CONVERSATION_SUMMARY_INSTRUCTION,
+        content=prompts.conversation_content(conversation),
+        content_label=_CONVERSATION_LABEL,
+        max_tokens=get_settings().AI_MAX_TOKENS,
+    )
+
+
+def _reduced(
+    result: AIResult[Classification] | AIResult[SentimentResult] | AIResult[ConversationSummary],
+) -> _Outcome:
     """One provider result reduced to what the analysis row stores.
 
     **The model's own dump, re-serialized, and the token counts untouched.** The payload is
@@ -490,12 +711,16 @@ def _reduced(result: AIResult[Classification] | AIResult[SentimentResult]) -> _O
     `StrEnum` would serialize correctly through `json.dumps` anyway, and the mode makes that
     a property of this function rather than of every future field.
 
-    Both schemas carry a `confidence`, which is why the union above needs no narrowing to
-    read it: the attribute access is checked against both members.
+    **`confidence` is read only from the schemas that have one.** §18's classification and
+    §19's sentiment each carry a confidence and §20's summary deliberately does not — §20
+    asks for a summary rather than a judgement, and the column's own check constraint already
+    allows NULL. Naming the two types is what keeps that a property of the schemas rather
+    than of a `getattr` that would hand back `None` for a field somebody misspelled.
     """
     value = result.value
+    confidence = value.confidence if isinstance(value, (Classification, SentimentResult)) else None
     return _Outcome(
-        confidence=value.confidence,
+        confidence=confidence,
         payload=value.model_dump(mode="json"),
         prompt_tokens=result.prompt_tokens,
         completion_tokens=result.completion_tokens,
