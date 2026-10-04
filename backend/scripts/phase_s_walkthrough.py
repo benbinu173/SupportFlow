@@ -388,7 +388,14 @@ def version_in_redis(organization_id: str) -> int:
 def keys_in_redis(pattern: str) -> list[str]:
     client = _redis()
     try:
-        return sorted(str(key.decode()) for key in client.keys(pattern))
+        # `Redis.from_url` above sets no `decode_responses`, so a key is `bytes` at
+        # runtime — but redis-py's signature offers `bytes | str`, and mypy is right that
+        # a bare `.decode()` is a lie about half of it. Branching is the runtime-correct
+        # reading rather than a cast: the day somebody adds `decode_responses=True`, a
+        # `.decode()` would raise on a `str` and this still works.
+        return sorted(
+            key.decode() if isinstance(key, bytes) else key for key in client.keys(pattern)
+        )
     finally:
         client.close()
 
@@ -648,7 +655,8 @@ def the_sla_reading_is_a_cohort_and_a_queue(tenant: Tenant, targets: dict[str, A
     # target this tenant's own policy carries". No warning band, no `LEAST`, no timer
     # precedence — which is exactly why it is a usable check on the code that has them.
     def stopped(timer: str) -> tuple[list[str], list[str]]:
-        met, breached = [], []
+        met: list[str] = []
+        breached: list[str] = []
         for plan in FIXTURE:
             if not (plan.reply if timer == "response" else plan.resolve):
                 continue

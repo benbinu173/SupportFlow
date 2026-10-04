@@ -80,7 +80,11 @@ jobs:
         run: ruff format --check .
 
       - name: mypy
-        run: mypy app alembic
+        # `scripts/` is named explicitly. Ruff already covers it — `ruff check .` has no
+        # path filter — and mypy did not, which is how three errors sat in
+        # `phase_s_walkthrough.py` while the gate stayed green. A walkthrough is a phase's
+        # recorded evidence and an ADR cites it, so it is source, not scratch.
+        run: mypy app alembic scripts
 
       - name: pytest
         run: pytest --cov=app --cov-report=term-missing

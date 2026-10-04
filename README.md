@@ -118,7 +118,7 @@ rather than falling back to something insecure.
 pytest                      # tests
 pytest -m security          # tenant-isolation and authz tests only
 ruff check . && ruff format --check .
-mypy app alembic
+mypy app alembic scripts
 
 # The worker, needed for any email to actually be sent, for SLA alerts to fire, and for
 # a ticket's AI analysis to run. `-Q` must name *every* queue in `task_routes` — see the
