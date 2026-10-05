@@ -48,6 +48,36 @@ jobs:
           --health-timeout 3s
           --health-retries 10
 
+      # Object storage, and this is the service whose absence made every run of this workflow
+      # fail. `tests/api/test_attachments.py` states it plainly — "Nothing here mocks storage"
+      # — and it is not the only file that uploads: the tenancy, row-scope, and log-hygiene
+      # suites each raise an attachment as part of their setup. Pointed at a closed port the
+      # API answers all of them with a 503, so the job died at pytest. It was invisible
+      # locally because the developer's `minio` container is always up: green on a machine
+      # with the dev stack running, red on a clean runner. ADR-033's Finding 5 records the
+      # same divergence about the seed script, and this one had been failing since run 1.
+      #
+      # `command` is not decoration. MinIO's image starts the server only when told to, so
+      # without it the container prints its help text and exits — and a service container can
+      # carry that argument where `options` cannot, because `options` is spliced into the
+      # `docker create` command ahead of the image name.
+      #
+      # The credentials match the `S3_ACCESS_KEY`/`S3_SECRET_KEY` defaults in
+      # `tests/conftest.py`. Nothing creates the bucket here: `ensure_bucket` does that when
+      # the app's lifespan starts, which is when it happens in development too.
+      minio:
+        image: minio/minio:latest
+        command: server /data
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        ports: ['9000:9000']
+        options: >-
+          --health-cmd "mc ready local"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     env:
       DATABASE_URL: postgresql+psycopg://supportflow:supportflow@localhost:5432/supportflow_test
       REDIS_URL: redis://localhost:6379/1
