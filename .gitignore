@@ -4,6 +4,11 @@
 .env
 .env.*
 !.env.example
+# The production template, by the same argument as the development one: it is a list of
+# variable *names* with no values, which is a document the next person needs. The value of
+# `!.env.*.example` over a second explicit exception is that a future `.env.staging.example`
+# is covered without anyone remembering this file exists.
+!.env.*.example
 *.pem
 *.key
 secrets/

@@ -393,5 +393,19 @@ def error_body(code: ErrorCode, message: str) -> dict[str, Any]:
 
     Shared by every handler in `app/main.py` so the shape is defined once. A separate
     Pydantic response model per error would be ceremony for a two-field object.
+
+    **The envelope is deliberately a pure function of the error, and the request id is not in
+    it.** Phase Y first added `request_id` here so a user could quote it from a rendered error;
+    that was wrong, and the full test suite said so. Eighteen security tests assert that a
+    cross-tenant refusal is *indistinguishable* from a missing record — `assert refused.json() ==
+    missing.json()` — and a per-request random field makes that comparison false while proving
+    nothing: the two responses still differ by exactly one value that carries no information about
+    which case occurred.
+
+    Keeping it would have meant rewriting all eighteen to compare bodies with that field stripped,
+    and every future isolation test would have had to remember the same incantation. The property
+    is better held structurally than by test discipline, so the id lives only in the
+    `X-Request-ID` response header — which is where a correlation id belongs, which every response
+    already carries, and which any client able to read this body can also read.
     """
     return {"error": {"code": str(code), "message": message}}

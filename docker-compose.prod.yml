@@ -1,0 +1,283 @@
+# SupportFlow — the production stack.
+#
+#   docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
+#
+# **A separate file rather than a fourth profile in `docker-compose.yml`, and that is a
+# correctness decision rather than tidiness.** The development file bind-mounts source and runs
+# `--reload` and the `development` image target; a single file answering both "mount my working
+# copy" and "ship an immutable image" has to pick one answer per service, and whichever it picks
+# is wrong for the other use. Two files, two questions, no ambiguity about which one a command
+# is asking.
+#
+# What this file changes relative to development, in one list, because these are the differences
+# that make a deployment a deployment:
+#
+#   * the `production` build target, so no test dependencies and no toolchain reach the image;
+#   * **no bind mounts** — the image is the artifact, and the host's working copy is irrelevant;
+#   * `restart: unless-stopped` everywhere, so a reboot brings the stack back;
+#   * a one-shot `migrate` service the API waits on, so nobody deploys a schema by hand;
+#   * **only Caddy publishes ports.** Postgres, Redis, MinIO, and the API are reachable only
+#     inside the compose network;
+#   * mailpit is gone: production sends real mail.
+#
+# Secrets come from `.env.production`, which is gitignored exactly as `.env` is. Copy
+# `.env.production.example` and fill it in; the file names a value for every variable this stack
+# requires and nothing else.
+
+name: supportflow-prod
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # **The extensions file alone, not the directory.** The development file mounts
+      # `./docker/postgres/init`, which also holds `02-test-database.sql` — a file that creates
+      # `supportflow_test` for the integration suite. Mounting the directory would create a test
+      # database in production: empty, unused, never backed up, and impossible to explain to
+      # whoever finds it. Naming the one file that is wanted keeps the two environments from
+      # sharing a convenience that only one of them needs.
+      - ./docker/postgres/init/01-extensions.sql:/docker-entrypoint-initdb.d/01-extensions.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    # No `ports:`. The database is reachable by the API and the worker over the compose network
+    # and by nothing else; publishing 5432 would put an authentication prompt on the public
+    # internet and make the password the only thing standing between a stranger and every
+    # tenant's data.
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  redis:
+    image: redis:8-alpine
+    # `appendonly yes` here for a different reason than in development. There, it survives a
+    # developer restarting the stack; here, a broker without persistence loses every queued job
+    # on restart, and those jobs are emails and SLA alerts that nothing will ever re-enqueue.
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:?S3_ACCESS_KEY is required}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?S3_SECRET_KEY is required}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    # The console on 9001 is a development affordance. For a deployment on a real S3-compatible
+    # service this whole service disappears and only the `S3_*` variables change.
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  # Runs to completion before the API starts, and exits. A migration applied by hand is a
+  # migration that gets forgotten on the day it matters; making it a dependency means
+  # `docker compose up` cannot produce an API running against the previous schema.
+  #
+  # `alembic upgrade head` is idempotent, so a redeploy with no new revision is a no-op rather
+  # than an error.
+  migrate:
+    build:
+      context: ./backend
+      target: production
+    image: ${BACKEND_IMAGE:-supportflow-backend}:${IMAGE_TAG:-latest}
+    env_file: .env.production
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    command: alembic upgrade head
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  backend:
+    build:
+      context: ./backend
+      target: production
+    image: ${BACKEND_IMAGE:-supportflow-backend}:${IMAGE_TAG:-latest}
+    env_file: .env.production
+    environment:
+      # Service names replace localhost inside the compose network, exactly as the development
+      # file does it — the difference is that nothing here is also reachable from the host.
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/2
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      S3_ENDPOINT: http://minio:9000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    # The image's own HEALTHCHECK curls /health on 8000. Caddy proxies /health* to this service,
+    # so an unhealthy API fails its own probe and the orchestrator stops routing to it.
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+      # The API holds no state that would be lost by replacing it: sessions live in Redis and
+      # Postgres. `docker compose up --scale backend=3` behind Caddy is therefore a supported
+      # scale-out, which is §59's claim made operational.
+
+  worker:
+    build:
+      context: ./backend
+      target: production
+    image: ${BACKEND_IMAGE:-supportflow-backend}:${IMAGE_TAG:-latest}
+    env_file: .env.production
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/2
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      S3_ENDPOINT: http://minio:9000
+    # `-Q` names every queue. A worker started without it consumes the default queue only, so
+    # the other four fill up in Redis with no consumer and no error anywhere — the deployment
+    # trap `tests/integration/test_celery_wiring.py` exists to catch in the development file,
+    # and which is repeated here because the two files are separate.
+    command: celery -A app.workers.celery_app worker --concurrency=${WORKER_CONCURRENCY:-4} --loglevel=info -Q notifications,sla,ai,knowledge
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    # **The image's HTTP healthcheck is wrong for this container and must be replaced.** The
+    # worker runs no web server, so curling localhost:8000 fails forever and the container sits
+    # at `unhealthy` while doing its job perfectly. `celery inspect ping` asks the process that
+    # is actually running whether it is alive.
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.workers.celery_app inspect ping --timeout 10 >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 15s
+      start_period: 30s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  beat:
+    build:
+      context: ./backend
+      target: production
+    image: ${BACKEND_IMAGE:-supportflow-backend}:${IMAGE_TAG:-latest}
+    env_file: .env.production
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/2
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      S3_ENDPOINT: http://minio:9000
+    command: celery -A app.workers.celery_app beat --loglevel=info -s /tmp/celerybeat-schedule
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    # **Never scale this service, and the comment is here because it is the one line somebody
+    # will change.** Beat is a singleton by construction: two instances each fire every schedule
+    # entry on their own clock, so the SLA sweep runs twice per interval and every warning alert
+    # is staged twice. Nothing in the code can prevent it.
+    #
+    # The inherited HTTP healthcheck is disabled rather than replaced — beat publishes and never
+    # consumes, so it has no task to ping and no port to curl.
+    healthcheck:
+      disable: true
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+      # Restated so the singleton is enforced where a reader looks for it, not only in a comment.
+      replicas: 1
+
+  frontend:
+    build:
+      context: ./frontend
+      target: runtime
+      args:
+        # Empty, so the SPA calls its own origin. Caddy has already put the API and the socket
+        # on that origin; a hostname baked in at build time would be a second source of truth,
+        # wrong the moment the domain changes.
+        VITE_API_BASE_URL: ""
+        VITE_WS_URL: ""
+    image: ${FRONTEND_IMAGE:-supportflow-frontend}:${IMAGE_TAG:-latest}
+    depends_on:
+      - backend
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+
+  caddy:
+    image: caddy:2-alpine
+    # The single public surface. 80 exists only to redirect to 443.
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?SITE_ADDRESS is required}
+      # No ACME_EMAIL. Caddy's `email` directive rejects an empty argument, so wiring an
+      # optional address through the environment makes the default configuration fail to
+      # start — see the note in docker/Caddyfile for the one-line change a real domain makes.
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates and ACME account state. **This volume is not optional**: without it every
+      # restart requests a new certificate, and Let's Encrypt's rate limit turns that into a
+      # deployment that cannot obtain one for a week.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - backend
+      - frontend
+    restart: unless-stopped
+    healthcheck:
+      # `/health` is proxied to the API, so this checks the whole path a request takes —
+      # TLS, routing, and the backend — rather than only that Caddy is listening.
+      test: ["CMD", "wget", "--quiet", "--spider", "--no-check-certificate", "https://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  caddy_data:
+  caddy_config:

@@ -38,8 +38,21 @@ wrong for several of those in ways that matter (§4, §54).
 from celery import Celery
 
 from app.core.config import get_settings
+from app.core.logging import configure_logging
 
 settings = get_settings()
+
+# The worker is a second process with a second logger registry, so it configures itself rather
+# than inheriting the API's — which it could not do even if the two shared a machine. Called
+# here, at import, for the same reason `app.main.create_app` calls it before building the app:
+# structlog caches a bound logger on first use, and a logger used before this line keeps the
+# default console renderer for the life of the process. `configure_logging` is idempotent, so
+# the worker and beat each calling it in their own process is the intended shape.
+#
+# The renderer this installs is the same one the API installs, which is what makes a worker's
+# line and an API's line the same shape in the same collector. `worker_hijack_root_logger` below
+# is the other half of that: without it Celery replaces the root handlers this set up.
+configure_logging(settings)
 
 # Four queues now, each named for its purpose. §51's Phase P asks for "task routing", and
 # the route table's entries are what makes each destination explicit instead of relying on

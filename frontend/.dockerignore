@@ -1,0 +1,33 @@
+# What the frontend build context excludes.
+#
+# **This file did not exist, and its absence was visible in the build.** `frontend/Dockerfile`
+# copies the context twice — `package.json`/`package-lock.json` for the cached `npm ci` layer,
+# then `COPY . .` for the source — and with no ignore file the second copy carried the host's
+# `node_modules` with it. A production build reported `transferring context: 81.57MB` and spent
+# 41 seconds moving a dependency tree the image is about to install correctly on its own.
+
+# The dependency tree. `npm ci` in the build stage installs it from the lockfile, which is the
+# only version that may reach the image. A host tree is not merely redundant here: it can hold
+# native binaries for the host's platform and architecture, and a leaked `node_modules` shadows
+# the one `npm ci` just built — a failure that appears as an unrelated native crash at runtime.
+node_modules/
+
+# The previous build's output. `npm run build` regenerates it inside the image, so a stale local
+# `dist/` is a copy of a tree from before the current source existed.
+dist/
+
+# A developer's local overrides. The deployed build takes `VITE_API_BASE_URL` and `VITE_WS_URL`
+# from the compose build args, which are empty so the SPA calls its own origin. A local `.env`
+# setting `VITE_API_BASE_URL=http://localhost:8000` would be inlined into the bundle and every
+# deployed page would point at the developer's machine — §4's "no secrets in the image" is the
+# same rule, for a variable the image should never have been given.
+.env
+.env.*
+!.env.example
+
+.git/
+.gitignore
+coverage/
+Dockerfile
+.dockerignore
+README.md

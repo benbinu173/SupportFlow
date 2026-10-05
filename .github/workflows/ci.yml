@@ -4,6 +4,11 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Callable by `release.yml`, so a tagged release runs these exact jobs rather than a
+  # near-copy that drifts. A release is the one moment the answer to "did this pass?" has to
+  # be about the commit being published, and a second copy of the config is how that answer
+  # quietly becomes about a slightly different set of checks.
+  workflow_call:
 
 # A new push supersedes an in-flight run on the same ref.
 concurrency:

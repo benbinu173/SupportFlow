@@ -42,6 +42,12 @@ dev = [
     "pytest-cov==7.0.0",
     "ruff==0.15.1",
     "mypy==1.19.0",
+    # Declared, though it already arrives inside `uvicorn[standard]`. `scripts/deploy_smoke.py`
+    # opens a real WebSocket through the reverse proxy, and that is the one thing in this project
+    # that needs a client — reading it from a transitive dependency means a future
+    # `uvicorn[standard]` that switches to `wsproto` would remove it silently, and the smoke
+    # script would fail for a reason that has nothing to do with the deployment it is testing.
+    "websockets==17.1",
 ]
 
 [build-system]

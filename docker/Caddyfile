@@ -1,0 +1,83 @@
+# SupportFlow — TLS termination and path routing for the production stack.
+#
+# This is the only service in `docker-compose.prod.yml` that is reachable from outside the
+# compose network. Everything behind it — the API, the worker, Postgres, Redis, MinIO — is on
+# the internal network and has no published port, which is why the backend's own image can
+# safely listen on plain HTTP.
+
+{
+	# **There is deliberately no `email` line here, and it took running the stack to learn why.**
+	# The obvious form is `email {$ACME_EMAIL:}`, and it does not work: an unset variable expands
+	# to an empty token, the `email` directive requires exactly one argument, and Caddy exits at
+	# adapt time with `wrong argument count or unexpected line ending after 'email'`. The
+	# container then restart-loops with that error as its only output — a hard failure to start,
+	# caused by an optional setting left at its default.
+	#
+	# So the setting is not wired to the environment at all. A real deployment that wants ACME
+	# expiry notices — the backstop for a renewal that somehow failed, not the renewal itself,
+	# which Caddy performs automatically — adds one line to this block:
+	#
+	#     email ops@your-domain
+	#
+	# `tls internal` on localhost needs no address, which is why the default is to have none.
+
+	# The admin API is a local control surface. Nothing in this deployment uses it, and an
+	# endpoint that can rewrite the running configuration is one this stack does not need to
+	# expose on a public host.
+	admin off
+}
+
+# `SITE_ADDRESS` is the deployment's one required variable. **Caddy decides the certificate
+# source from the value, and that is why there is no `tls` line here to get wrong:** a public
+# hostname gets Let's Encrypt automatically and renews itself, while `localhost` gets Caddy's
+# own internal CA. Hardcoding `tls internal` would pin a real domain to an untrusted
+# certificate; hardcoding an ACME block would make the local demonstration fail for want of a
+# domain. Both are the same file.
+{$SITE_ADDRESS:localhost} {
+	# Compress everything that is worth compressing. JSON analytics payloads and the SPA's
+	# JavaScript are the bulk of this deployment's bytes and both compress well.
+	encode zstd gzip
+
+	# One JSON line per request, matching the shape `app/core/logging.py` gives the API. Caddy
+	# and the application then land in the same collector with the same structure, and a
+	# request can be followed from the edge to the handler.
+	log {
+		output stdout
+		format json
+	}
+
+	# --- Routing -----------------------------------------------------------
+	# Three paths belong to the API and everything else is the SPA. This is the same split the
+	# Vite dev proxy makes in `frontend/vite.config.ts`, so a request resolves to the same
+	# service in development and in production — the property that stops "works locally, 404 in
+	# production" bugs from being a category.
+	#
+	# `handle` blocks are mutually exclusive and Caddy orders them by specificity, so `/api/*`
+	# wins over the catch-all regardless of the order written here.
+
+	handle /api/* {
+		reverse_proxy backend:8000
+	}
+
+	# The WebSocket. **Caddy upgrades this without any configuration**, unlike nginx, which
+	# needs the `Upgrade` and `Connection` headers written by hand and silently returns a 400
+	# for the handshake when they are missing. That silence is why `scripts/deploy_smoke.py`
+	# opens a real socket through this proxy rather than trusting the absence of a config
+	# error — the failure mode of a broken upgrade is not a log line, it is a client that
+	# never receives an update.
+	handle /ws {
+		reverse_proxy backend:8000
+	}
+
+	# Liveness and readiness, outside the versioned prefix. A load balancer or orchestrator
+	# probes these directly, so they must not be swallowed by the SPA fallback below.
+	handle /health* {
+		reverse_proxy backend:8000
+	}
+
+	# Everything else: the built frontend. nginx serves the files and owns the SPA fallback
+	# and the cache policy; this proxy only decides *which* service sees the request.
+	handle {
+		reverse_proxy frontend:80
+	}
+}

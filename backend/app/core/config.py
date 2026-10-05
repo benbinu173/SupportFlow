@@ -32,6 +32,15 @@ class Settings(BaseSettings):
     API_V1_PREFIX: str = "/api/v1"
     PROJECT_NAME: str = "SupportFlow"
 
+    # The floor for what reaches the log stream. A `Literal` rather than a free string so a
+    # typo is a startup error naming the variable, instead of a `logging` call that silently
+    # falls back to WARNING and hides every info line in the deployment.
+    #
+    # Read by `app/core/logging.py`, which is the single place the level is applied — to
+    # structlog's bound logger and to the root stdlib logger both, so a third-party library's
+    # line and this project's line are filtered by the same number.
+    LOG_LEVEL: Literal["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"] = "INFO"
+
     # --- Datastores -------------------------------------------------------
     DATABASE_URL: PostgresDsn
     REDIS_URL: RedisDsn
@@ -347,6 +356,25 @@ class Settings(BaseSettings):
             return dsn
         return dsn.replace("postgresql://", "postgresql+psycopg://", 1)
 
+    @field_validator("LOG_LEVEL", mode="before")
+    @classmethod
+    def _the_log_level_is_case_insensitive(cls, v: object) -> object:
+        """Accept `info` as `INFO`, because this file's convention is lowercase.
+
+        Every other enum-like value in the repository's `.env` is written lowercase —
+        `ENVIRONMENT=development`, `AI_PROVIDER=anthropic`, `EMBEDDING_PROVIDER=openai` — so
+        `LOG_LEVEL=info` is the spelling this project teaches, and refusing it in favour of an
+        uppercase form stdlib happens to use would be a trap laid by a library's convention
+        rather than this project's.
+
+        The value is normalised to uppercase rather than the `Literal` being widened, because
+        stdlib's `logging` is the consumer and its table is uppercase: `setLevel("info")` raises.
+        Normalising here means the field holds the one spelling every downstream use expects.
+        """
+        if isinstance(v, str):
+            return v.upper()
+        return v
+
     @field_validator("JWT_SECRET")
     @classmethod
     def _secret_is_strong_enough(cls, v: str) -> str:
@@ -496,6 +524,56 @@ class Settings(BaseSettings):
                     f"{self.EMBEDDING_PROVIDER!r}: "
                     f"{', '.join(models_for(self.EMBEDDING_PROVIDER)) or '<none>'}"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _production_is_not_a_development_checkout(self) -> "Settings":
+        """Refuse a production deployment still wearing development settings.
+
+        **Added in Phase Y, and the two rules are the two ways this actually happens.** Both
+        describe a deployment that starts cleanly and is wrong in a way nothing else reports:
+        no test fails, no route changes shape, and the problem is discovered by a stranger.
+
+        1. **`DEBUG=true` beside `ENVIRONMENT=production`.** `DEBUG` is not a log level here —
+         it is the flag a developer sets to get a verbose local run, and it is exactly the flag
+         that gets left on when a `.env` is copied to a server. Production posture and debug
+         posture are contradictory claims about the same process, so the process refuses to
+         make both.
+
+        2. **A `JWT_SECRET` that this repository publishes.** Every value below is committed in
+         plaintext — `.env.example`'s template or `ci.yml`'s CI-only secret. A signing key
+         anyone can read is not a signing key; it is a key that lets anyone mint a token for any
+         tenant, which is the one credential in this system whose compromise is total. The check
+         is a blocklist rather than an entropy heuristic because a blocklist of *the values this
+         repo itself ships* is finite, knowable, and exactly the failure being prevented —
+         guessing at what a weak secret looks like is not.
+
+        Deliberately a `model_validator` rather than two `field_validator`s: `DEBUG` alone is
+        legal, `ENVIRONMENT=production` alone is legal, and only the pair is a contradiction.
+        Compare `_the_model_is_served_by_the_provider`, which is a pairing for the same reason.
+        """
+        if not self.is_production:
+            return self
+
+        if self.DEBUG:
+            raise ValueError(
+                "DEBUG=true is refused when ENVIRONMENT=production. Set DEBUG=false, or "
+                "set ENVIRONMENT=development if this really is a development machine."
+            )
+
+        published = {
+            # .env.example's template value, and the shape a person types by hand.
+            "change-me-in-production-at-least-32-chars",
+            "change-me",
+            # ci.yml's value. Public in this repository by construction.
+            "ci-only-secret-value-at-least-32-chars",
+        }
+        if self.JWT_SECRET in published:
+            raise ValueError(
+                "JWT_SECRET is a value published in this repository (.env.example or "
+                "ci.yml), so it is not a secret. Generate one: "
+                'python -c "import secrets; print(secrets.token_urlsafe(48))"'
+            )
         return self
 
     @property

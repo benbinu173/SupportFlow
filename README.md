@@ -8,11 +8,13 @@ summarization, and draft replies — with a human always in the loop before anyt
 reaches a customer. Each organization keeps a private knowledge base that grounds AI
 answers in its own documented policy rather than model invention.
 
-**Status: Phases A–X complete.** Auth, RBAC, multi-tenancy, the ticket lifecycle, attachments,
-audit logging, search, notifications, SLAs, real-time fan-out, analytics, the AI layer, and the
-knowledge base are all built and covered by the test suite, and every phase's end-to-end is a
-script under [backend/scripts/](backend/scripts/). Phases Y–Z — hardening and deployment — are
-next; see [Roadmap](#roadmap).
+**Status: Phases A–Z complete.** Auth, RBAC, multi-tenancy, the ticket lifecycle, attachments,
+audit logging, search, notifications, SLAs, real-time fan-out, analytics, the AI layer, the
+knowledge base, and the production deployment are all built and covered by the test suite. Every
+phase's end-to-end is a script under [backend/scripts/](backend/scripts/); the deployment is a
+compose stack behind Caddy, and [scripts/deploy_smoke.py](backend/scripts/deploy_smoke.py) tests a
+*running* one through the proxy rather than trusting the suite's in-process client. See
+[Deployment](#deployment) and the [Roadmap](#roadmap).
 
 ## Why this project exists
 
@@ -1819,6 +1821,154 @@ legitimate login from the same address is throttled alongside an attacker's. The
 limiter, arriving later, declines to inherit the second of those and keys on the user
 instead; see [Rate limiting](#rate-limiting).
 
+## Deployment
+
+§55.19, and §Z's twelve items. The deployment is a **second compose file**, not a profile of the
+development one — `docker-compose.yml` bind-mounts source and runs `--reload`, and a file that
+answers both "mount my working copy" and "ship an immutable image" has to be wrong about one of
+them. `docker-compose.prod.yml` has no mounts, uses the `production` build target, sets
+`restart: unless-stopped`, and is the only file with Caddy.
+
+The full topology — what routes where, what terminates TLS, what is stateful — is in
+[architecture.md §11](docs/architecture.md#11-deployment-shape), and the decisions behind it in
+[ADR-033](docs/architecture-decisions.md).
+
+### The stack
+
+| Service | Image | Role |
+|---|---|---|
+| `caddy` | `caddy:2-alpine` | **The only published port** (80/443). TLS, and the path split: `/api/*`, `/ws`, `/health*` → backend; everything else → frontend. |
+| `postgres` | `pgvector/pgvector:pg17` | Data. `pgvector` for the knowledge base (ADR-032). Not published. |
+| `redis` | `redis:8-alpine` | Cache, rate limits, broker, pub/sub. `appendonly yes`, so a restart does not discard queued email. |
+| `minio` | `minio/minio` | S3-compatible object storage for attachments. Swap for any S3 service by changing `S3_*`. |
+| `migrate` | backend image | One-shot `alembic upgrade head`. Every other service waits on `service_completed_successfully`. |
+| `backend` | backend image | The API. Stateless — `--scale backend=3` behind Caddy is supported. |
+| `worker` | backend image | Celery, `-Q notifications,sla,ai,knowledge`. Healthchecked with `celery inspect ping`. |
+| `beat` | backend image | The SLA clock. **Singleton** — two would double every sweep. `replicas: 1`. |
+| `frontend` | frontend image | nginx serving the built SPA. Same-origin, so no API hostname is baked in. |
+
+### Running it locally
+
+```bash
+# 1. Generate a production env file. It is gitignored exactly as `.env` is.
+cp .env.production.example .env.production
+#    Fill in POSTGRES_PASSWORD, JWT_SECRET (>= 32 chars), S3_ACCESS_KEY, S3_SECRET_KEY.
+#    Settings refuses to start with ENVIRONMENT=production beside DEBUG=true, or with a
+#    JWT_SECRET that this repository publishes — so a template copied unchanged fails loudly.
+
+# 2. Build and start everything.
+make prod-up          # docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
+
+# 3. Create the §56 demo tenant, once migrations have finished.
+#    `make seed` runs from the host against the database in your .env — the *development* one.
+#    The production database publishes no port on purpose, so the deployment's seed runs inside
+#    the network. Use this one against a stack started by `make prod-up`:
+make prod-seed        # ARGS='--reset' make prod-seed to start over
+
+# 4. Prove the running deployment serves traffic.
+make smoke            # backend/scripts/deploy_smoke.py, against https://localhost
+```
+
+`SITE_ADDRESS=localhost` uses Caddy's internal CA, so the browser warning is expected — run
+`caddy trust` inside the container, or point `SITE_ADDRESS` at a real domain and let ACME issue a
+certificate. **TLS verification is off by default** in the smoke script for that reason;
+`--verify-tls` is the mode that actually protects anything, and it is what you would run against a
+real hostname.
+
+### The seed (§56)
+
+[backend/scripts/seed_demo.py](backend/scripts/seed_demo.py) builds the Acme Support tenant: four
+staff accounts (`admin@`, `manager@`, `agent1@`, `agent2@`), eight customers, thirty tickets across
+six categories with realistic statuses, priorities, and outcomes, and five knowledge documents. It
+prints the sign-in details when it finishes.
+
+Two things about it are decisions rather than details:
+
+- **It writes through the service layer.** Tickets are created by `ticket_service.create_ticket` and
+  their statuses are walked with `change_status`/`close_ticket`, so the demo tenant has a real audit
+  trail and real ticket events — it is indistinguishable from a hand-built one.
+- **It fabricates no AI result (§60).** `create_ticket` queues classification and sentiment, so the
+  thirty tickets leave sixty `ai_analyses` rows `pending` with no result. That is the true state of
+  every ticket before its worker picks it up, and the script says so rather than inventing
+  classifications to make a dashboard look populated. Run a worker and they fill in for real.
+
+It is idempotent by refusing to run over an existing Acme Support unless `--reset` is passed.
+
+### The smoke test
+
+[backend/scripts/deploy_smoke.py](backend/scripts/deploy_smoke.py) is the only thing in this repository that
+can tell a working deployment from a compiling one, because everything else talks to the app
+in-process. Every check goes over the network, through Caddy, over TLS:
+
+1. `/health` answers — a process is listening behind the proxy.
+2. `/health/ready` reports `ready` and every dependency it covers is reachable.
+3. The seeded administrator can log in — so migrations ran and the seed is present.
+4. Security headers and `X-Request-ID` are on the responses, **as deployed**. HSTS being present is
+   what proves the container is running `ENVIRONMENT=production`.
+5. Tenant isolation, **two-sided**: tenant B's ticket returns `200` to B and `404` to A. A
+   one-sided check would pass just as well for a ticket that does not exist.
+6. A real WebSocket, through Caddy, receives the `ticket.created` event for a ticket created over
+   HTTP a moment earlier — the check a proxy that drops upgrade headers fails.
+
+`RAG retrieval verified` (§52) is reported as `SKIP`, not as a pass or a failure, when no
+`EMBEDDING_API_KEY` is configured — the same honest distinction Phase X made (ADR-032).
+
+### Deploying to a real host
+
+CI does not deploy, because there is no cloud account and a workflow that "deployed" would either
+do nothing or lie. What CI does is real: [.github/workflows/release.yml](.github/workflows/release.yml)
+runs on a version tag, builds both production images, and pushes them to GHCR **with provenance and
+an SBOM**, attaching the digest. The deploy is then:
+
+```bash
+export BACKEND_IMAGE=ghcr.io/<owner>/supportflow-backend FRONTEND_IMAGE=ghcr.io/<owner>/supportflow-frontend
+export IMAGE_TAG=<version>
+
+docker compose --env-file .env.production -f docker-compose.prod.yml pull
+docker compose --env-file .env.production -f docker-compose.prod.yml up -d   # migrate runs first, by dependency
+make smoke ARGS='--base-url https://your.domain --verify-tls'
+```
+
+Rolling back is running the previous `IMAGE_TAG`. Migrations are forward-only, so a rollback across
+a migration needs the database restored too — which is why the backup row below matters before the
+first real deploy, not after.
+
+### §52's checklist, answered
+
+Every row is either discharged by something in this repository or marked as not true. The markings
+are the point: a checklist where everything is ticked says nothing.
+
+| §52 row | Where it stands |
+|---|---|
+| production environment created | **Not on a host.** `docker-compose.prod.yml` starts the whole stack and was brought up and smoke-tested here; no cloud account was provisioned, so there is no live URL to point at. |
+| database configured | `postgres` service, `pgvector/pgvector:pg17`, healthchecked, not published. ADR-033. |
+| Redis configured | `redis:8-alpine`, `appendonly yes`. Celery uses db 2 so a `FLUSHDB` on the cache db cannot discard queued work (ADR-022). |
+| object storage configured | `minio` service; any S3-compatible service is a `S3_*` change and nothing else (ADR-018). |
+| secrets configured | `.env.production` is gitignored; `.env.production.example` names every variable. `Settings._production_is_not_a_development_checkout` refuses a published `JWT_SECRET` or `DEBUG=true` beside `ENVIRONMENT=production` **at startup**. |
+| migrations applied | The one-shot `migrate` service; backend, worker, and beat gate on `service_completed_successfully`. |
+| backend deployed | `production` target image, `restart: unless-stopped`, scale-out supported (stateless; state is in Postgres and Redis). |
+| worker deployed | Same image, `-Q notifications,sla,ai,knowledge`, healthchecked with `celery inspect ping`. |
+| frontend deployed | Multi-stage Node 22 → nginx, SPA fallback, `index.html` never cached (ADR-033). |
+| HTTPS configured | Caddy with automatic issuance and renewal. HSTS is production-only (ADR-033 D3), and the smoke test asserts it is present. |
+| CORS configured | Explicit origin allowlist from settings; `allow_credentials` for the refresh cookie. |
+| health checks working | `/health` and `/health/ready` with real dependency checks; the backend image's HEALTHCHECK; Caddy healthchecks `/health` through the proxy; the smoke test reads all of it. |
+| logs accessible | JSON via `configure_logging`, `LOG_LEVEL`, and an `X-Request-ID` on every line (ADR-033 D1–D2). **No collector is shipped** — choosing one is a later decision with a cost. uvicorn's own loggers are not unified; see the note below. |
+| CI/CD working | `ci.yml` is the gate; `release.yml` publishes both images to GHCR on a tag with SBOM and provenance. **The deploy step is a runbook**, above. |
+| database backups configured where supported | **Not configured.** The Postgres volume is not a backup — it shares a disk with the database. This needs `pg_dump` on a schedule to storage that survives the host, or a managed service that does it. It is the first row to fix before a real deploy. |
+| rate limiting enabled | Redis-backed limiters (ADR-014): login and registration keyed on the client address, uploads on the user. Deliberately fails **open** when Redis is down. |
+| tenant security tested | [tests/security/](backend/tests/security/) — route protection (every route, both claims), tenant isolation, row scopes — plus the two-sided `404` in the smoke test. |
+| AI API limits configured | Every attempt writes an `ai_usage` row; §17's retry policy has one owner (`ai_service._run`); `AI_MAX_TOKENS`, the per-task time limits, and the provider timeout bound a call. **No spend cap** — nothing refuses a call on cost, which would need a budget check and a policy for what to do when it trips. |
+| error handling verified | §42's envelope, and every deliberate failure is an `AppError` subclass with a code; anything else is an opaque 500 whose contents never reach the client (ADR-033 D2: the correlation id is on `X-Request-ID`, deliberately not in that envelope). |
+| WebSocket connection verified | The smoke test's socket through Caddy. Nothing in the suite can make this assertion — the suite is in-process. |
+| RAG retrieval verified | The suite asserts retrieval with chosen vectors and a real pipeline (`tests/integration/test_knowledge_*`). **No live run happened here**: no `EMBEDDING_API_KEY` is configured, so the smoke test reports `SKIP` rather than claiming it (ADR-032's precedent). |
+| file upload verified | Attachments validated on extension, declared type, and leading bytes, proxied through the API (ADR-018). Covered by the suite and by `scripts/phase_l_walkthrough.py`. |
+| email notifications verified | At-least-once delivery with `notifications.emailed_at` narrowing redelivery to a no-op, and `TransientEmailError`-only retries with backoff. Verified against Mailpit in `scripts/phase_p_walkthrough.py`; production sends real mail. |
+
+**uvicorn's own log lines are not in the JSON stream.** `uvicorn.error` and `uvicorn.access` install
+their handlers with `propagate=False`, so the root handler `configure_logging` replaces cannot reach
+them. Unifying them means passing uvicorn a `--log-config`, which is a deployment concern rather
+than an application one — and it is the one grep-shaped gap in the row above.
+
 ## Roadmap
 
 | Phase | Scope | Status |
@@ -1839,10 +1989,32 @@ instead; see [Rate limiting](#rate-limiting).
 | T | AI foundation: provider, structured output, retry, usage ledger | ✅ |
 | U–W | AI analysis, summaries, drafts | ✅ |
 | X | Knowledge base and RAG | ✅ |
-| Y–Z | Hardening, deployment | |
+| Y | Hardening: audit, logging, correlation, secure headers | ✅ |
+| Z | Deployment: images, Caddy, CD, seed data, smoke tests | ✅ |
 
 ## Known limitations
 
+- **An analysis can be left permanently claimed, and Phase Y found it rather than fixed it.**
+  `run_analysis` marks its rows `PROCESSING` and catches only `AIServiceError`; any other exception —
+  a database error, a bug — escapes the task, which `task_acks_late` plus Celery's default
+  `task_acks_on_failure_or_timeout=True` then acknowledges without redelivery. The row stays
+  `PROCESSING`, and because `in_flight_analyses` counts `PROCESSING` as in flight, that operation can
+  never be requested for that ticket again — and no beat entry reaps a stale claim. The trigger
+  surface is narrow (`ai_service` converts every provider failure into `AIServiceError`, so model
+  misbehaviour cannot cause it), and the reason it is reported rather than patched is in
+  [ADR-033](docs/architecture-decisions.md): widening the `except` would leave a poisoned session to
+  fail the whole batch's commit, so the fix is a transaction-shape change that has to be tested. The
+  same shape exists in `knowledge_service.run_ingestion`.
+- **The analysis claim is a read-then-write, not a compare-and-set**, and a redelivered task will
+  re-claim a row that is already `PROCESSING` — which is the only crash-recovery mechanism there is,
+  since nothing reaps a stale claim. Genuine concurrency is bounded by configuration: a task's
+  message cannot outlive `visibility_timeout` (3600 s) while the time limit is 120 s, so the exposure
+  is duplicate provider spend after a hard-time-limit kill rather than corrupt state. The inline
+  comment in `run_analysis` that claims otherwise is wrong, and ADR-033 records the correction
+  rather than a lock, which would hold a row for the length of a provider call.
+- **`sort=updated_at` and `sort=priority` on `GET /tickets` have no supporting index**, so they sort
+  over the tenant's whole ticket set. Deliberately not migrated: §53 says not to optimize a query
+  nobody has run slowly, and adding one is a write cost on every insert (ADR-033).
 - Four migrations exist: the baseline, Phase N's message full-text index, Phase P's
   `notifications.emailed_at`, and Phase Q's `notification_type` enum value. The baseline is
   still the first revision, so there is no upgrade path from an older schema.

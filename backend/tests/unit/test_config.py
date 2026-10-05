@@ -391,3 +391,65 @@ def test_the_retrieval_threshold_is_a_probability() -> None:
         _settings(RETRIEVAL_MIN_SIMILARITY="1.5")
     with pytest.raises(ValidationError):
         _settings(RETRIEVAL_MIN_SIMILARITY="-0.1")
+
+
+# ---------------------------------------------------------------------------
+# Production posture (Phase Y)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_debug_is_refused_in_production() -> None:
+    """`DEBUG=true` beside `ENVIRONMENT=production` is a contradiction, so startup refuses.
+
+    The failure this prevents has no other reporter: the process starts, serves every route,
+    passes every test, and is wrong in a way only a stranger notices.
+    """
+    with pytest.raises(ValidationError, match="DEBUG=true is refused"):
+        _settings(ENVIRONMENT="production", DEBUG="true")
+
+    # The same flag in development is ordinary and must stay legal — a rule that also forbade
+    # this would be a rule people turn off.
+    assert _settings(ENVIRONMENT="development", DEBUG="true").DEBUG is True
+
+
+@pytest.mark.unit
+def test_a_secret_published_in_the_repository_is_refused_in_production() -> None:
+    """A signing key anyone can read from the repo is not a signing key.
+
+    Both values below are committed in plaintext — one in `.env.example`, one in `ci.yml` — so
+    a deployment using either has published the credential that mints tokens for every tenant.
+    """
+    published = (
+        "change-me-in-production-at-least-32-chars",
+        "ci-only-secret-value-at-least-32-chars",
+    )
+    for secret in published:
+        with pytest.raises(ValidationError, match="published in this repository"):
+            _settings(ENVIRONMENT="production", JWT_SECRET=secret)
+
+
+@pytest.mark.unit
+def test_a_generated_secret_is_accepted_in_production() -> None:
+    """The rule is a blocklist, not a ban on production — a real secret still starts.
+
+    Without this the test above would pass against a validator that refused *every* production
+    configuration, which is a different and much worse bug.
+    """
+    settings = _settings(ENVIRONMENT="production", JWT_SECRET="Zx9" * 11)
+
+    assert settings.is_production is True
+
+
+@pytest.mark.unit
+def test_the_log_level_is_case_insensitive_and_constrained() -> None:
+    """A typo in `LOG_LEVEL` is a startup error rather than a silent fallback to WARNING.
+
+    `logging.setLevel` raises on an unknown *name* but accepts any integer, so an unvalidated
+    string setting is one misspelling away from a deployment that logs nothing and reports no
+    problem.
+    """
+    assert _settings(LOG_LEVEL="debug").LOG_LEVEL == "DEBUG"
+
+    with pytest.raises(ValidationError):
+        _settings(LOG_LEVEL="verbose")

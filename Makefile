@@ -30,6 +30,13 @@ help:
 	@echo "  make check          Lint, format, and type checks"
 	@echo "  make security       Security and tenant-isolation tests only"
 	@echo "  make ci             Everything CI runs"
+	@echo ""
+	@echo "Deploy"
+	@echo "  make seed           Create the §56 demo tenant in the LOCAL database"
+	@echo "  make prod-up        Build and start the production stack, behind Caddy"
+	@echo "  make prod-seed      The same tenant, in the RUNNING production stack"
+	@echo "  make prod-down      Stop it, keeping its volumes"
+	@echo "  make smoke          Smoke-test a running deployment through its proxy"
 
 # --- setup -----------------------------------------------------------------
 .PHONY: install
@@ -126,7 +133,11 @@ test:
 check:
 	cd backend && .venv/Scripts/python.exe -m ruff check .
 	cd backend && .venv/Scripts/python.exe -m ruff format --check .
-	cd backend && .venv/Scripts/python.exe -m mypy app alembic
+	# `scripts` is named here because CI names it. It was missing, which made `make check`
+	# weaker than the gate that actually decides whether a change lands — three mypy errors
+	# sat in a walkthrough script while this target passed. A local check that cannot fail
+	# where CI fails is worse than no local check, because it is trusted.
+	cd backend && .venv/Scripts/python.exe -m mypy app alembic scripts
 	cd frontend && npx tsc -b && npm run lint
 
 .PHONY: security
@@ -142,3 +153,75 @@ ci: check test
 # asserts the same thing, via tests/integration/test_migrations.py, against a scratch
 # database it migrates itself. Running `alembic check` here as well would need the
 # developer's own database to be at head, which is a different and weaker guarantee.
+
+# --- deploy ----------------------------------------------------------------
+# The production stack is a separate compose file, not a profile of the development one.
+# The development file bind-mounts source and runs `--reload`; the production file runs
+# immutable images with no mounts. Those two cannot both be a default, so they are two
+# files and the reader is never asked which one they are looking at.
+#
+# `--env-file` is explicit rather than relying on the default `.env` lookup, because a
+# production deployment that silently picked up a developer's local `.env` would run with
+# development secrets — and `Settings._production_is_not_a_development_checkout` refuses
+# the published ones, but only the ones it knows about.
+PROD_COMPOSE := docker compose --env-file .env.production -f docker-compose.prod.yml
+
+.PHONY: prod-up
+prod-up:
+	@test -f .env.production || { \
+		echo "No .env.production. Start from the template:"; \
+		echo "  cp .env.production.example .env.production"; \
+		echo "then fill in POSTGRES_PASSWORD, JWT_SECRET, and the rest."; \
+		exit 1; \
+	}
+	$(PROD_COMPOSE) up -d --build
+	@echo "The site is on the address in SITE_ADDRESS (default https://localhost)."
+	@echo "Run 'make smoke' once it is healthy."
+
+.PHONY: prod-down
+prod-down:
+	$(PROD_COMPOSE) down
+
+# Destructive: drops the production Postgres, Redis, MinIO, and Caddy volumes.
+.PHONY: prod-reset
+prod-reset:
+	$(PROD_COMPOSE) down -v
+
+# The seed runs *inside* the stack, and that is not a convenience. The production database
+# publishes no port (see docker-compose.prod.yml), so a host-run script would reach whatever
+# DATABASE_URL is in the ambient .env — the development database — while its output claimed to
+# have seeded the deployment. `scripts/` is copied into the production image for this reason.
+#
+# `-m scripts.seed_demo` and not `scripts/seed_demo.py`: `python <path>` puts the *script's*
+# directory on sys.path, so `import app` resolves only because the developer's venv has the
+# project installed editable. The production image installs dependencies but not the project —
+# `app/` gets there by `COPY`, so it is importable from the working directory and nowhere else.
+# The path form fails in the container with "No module named 'app'". `-m` from /app puts /app
+# on sys.path, which is the one thing the image actually guarantees.
+.PHONY: prod-seed
+prod-seed:
+	$(PROD_COMPOSE) exec backend python -m scripts.seed_demo $(ARGS)
+
+# Writes through the service layer, so the demo tenant has a real audit trail and real SLA
+# timers. Idempotent: refuses to run over an existing Acme Support unless --reset is given.
+#
+# Targets whatever DATABASE_URL the ambient .env names — the local/dev database. Against a
+# running production stack the database has no published port, so this would seed the wrong
+# one; `make prod-seed` is the deployment's version and runs inside the network.
+#
+# Same `-m` form as the target above, for the same reason: the command should not depend on
+# the editable install being present, since that is a property of this checkout rather than of
+# the project.
+.PHONY: seed
+seed:
+	cd backend && .venv/Scripts/python.exe -m scripts.seed_demo $(ARGS)
+
+# Points at a running deployment through its proxy, which is the only way to test that
+# Caddy routes, that TLS terminates, and that a WebSocket upgrade survives the hop.
+#
+# `-m` for the same reason as the seed targets: the path form's `import app` depends on this
+# checkout being installed editable, which is a property of a developer's venv and not of the
+# repository. Every target that runs a script under `scripts/` uses this form.
+.PHONY: smoke
+smoke:
+	cd backend && .venv/Scripts/python.exe -m scripts.deploy_smoke $(ARGS)

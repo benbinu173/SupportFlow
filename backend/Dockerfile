@@ -50,6 +50,14 @@ COPY --chown=appuser:appuser app ./app
 COPY --chown=appuser:appuser alembic ./alembic
 COPY --chown=appuser:appuser alembic.ini ./
 
+# `scripts/` is operator tooling, and it ships for the same reason `alembic` does: the
+# deployment runbook invokes it. `scripts/seed_demo.py` is how §56's demo tenant is created,
+# and the production database publishes no port — deliberately, see `docker-compose.prod.yml`
+# — so the seed has to run *inside* the compose network, which means inside this image. A
+# seed that could only be run from a developer's host against a published port would be a
+# seed the documented deployment cannot use.
+COPY --chown=appuser:appuser scripts ./scripts
+
 USER appuser
 EXPOSE 8000
 

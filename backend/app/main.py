@@ -22,6 +22,8 @@ from app.api.websocket import router as websocket_router
 from app.core.config import get_settings
 from app.core.database import dispose_engine
 from app.core.exceptions import AppError, ErrorCode, error_body
+from app.core.logging import configure_logging
+from app.core.middleware import RequestIDMiddleware, SecurityHeadersMiddleware
 from app.core.redis import close_client as close_redis_client
 from app.core.storage import ensure_bucket
 from app.core.storage import reset_client as reset_storage_client
@@ -171,6 +173,14 @@ def _code_for_status(status_code: int) -> ErrorCode:
 def create_app() -> FastAPI:
     settings = get_settings()
 
+    # **First, before the app object and before any logger is touched.** `configure_logging`
+    # selects the renderer and the level for the whole process, and structlog is configured with
+    # `cache_logger_on_first_use`, so a logger used before this line would keep the default
+    # console renderer for the life of the process. The module-level `logger` above is created
+    # eagerly and is exactly such a logger — its first *use* is what matters, and that is well
+    # after this call.
+    configure_logging(settings)
+
     app = FastAPI(
         title=settings.PROJECT_NAME,
         version="0.1.0",
@@ -190,7 +200,17 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        # Without this the browser hides `X-Request-ID` from JavaScript, and the header the last
+        # middleware below exists to return would be readable by curl and invisible to the one
+        # client that could show it to a user.
+        expose_headers=["X-Request-ID"],
     )
+
+    # Registration order is application order reversed: the last added is the outermost. The
+    # request id is therefore added last, so it is bound before the security headers run — see
+    # `app/core/middleware.py`.
+    app.add_middleware(SecurityHeadersMiddleware, include_hsts=settings.is_production)
+    app.add_middleware(RequestIDMiddleware)
 
     # Order matters: `AppError` is the most specific, and Starlette resolves handlers
     # by walking the exception's MRO, so a subclass hits the right one regardless.

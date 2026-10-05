@@ -475,12 +475,74 @@ step.
 
 ## 11. Deployment shape
 
-Local development runs infrastructure (Postgres, Redis, MinIO, Mailpit) in Docker
-while the API, worker, and frontend run natively for fast reloads. Full-stack Compose
-files exist for parity checks and CI.
+**Local development** runs infrastructure (Postgres, Redis, MinIO, Mailpit) in Docker via
+`docker-compose.yml` while the API, worker, beat, and frontend run natively for fast reloads. That file
+bind-mounts source and passes `--reload`; it is a development document, and the comments in it say so.
 
-Production runs the same container images behind a load balancer: multiple API
-instances, separate worker and beat processes, managed Postgres and Redis, and
-object storage. Migrations run as a discrete step before the new backend rolls out.
-The target platform is deliberately undecided; nothing in the architecture depends on
-a specific cloud.
+**Production is a second file, `docker-compose.prod.yml`, not a profile of the first.** A single file
+answering both "mount my working copy" and "ship an immutable image" has to pick one answer per service,
+and whichever it picks is wrong for the other use. So the deployment is:
+
+```
+                      ┌──────────────────────────────┐
+   :80 :443 ─────────►│  caddy     TLS + path routing│
+                      └───────┬──────────────┬───────┘
+                              │              │
+             /api/* /ws /health*        everything else
+                              │              │
+                   ┌──────────▼───┐   ┌──────▼───────┐
+                   │ backend :8000│   │ frontend :80 │
+                   └──┬────────┬──┘   │ nginx, dist/ │
+                      │        │      └──────────────┘
+      ┌───────────────┘        └──────────────┐
+      │                                       │
+┌─────▼──────┐  ┌─────────────┐  ┌─────────────▼──┐  ┌────────────┐
+│ postgres   │  │ worker      │  │ migrate        │  │ beat       │
+│ pgvector17 │  │ celery -Q   │  │ alembic upgrade│  │ singleton  │
+└────────────┘  │ notif,sla,  │  │ (one-shot)     │  └────────────┘
+                │ ai,knowledge│  └────────────────┘
+                └──────┬──────┘
+                       │
+        ┌──────────────┴──────────────┐
+   ┌────▼─────┐               ┌───────▼────┐
+   │ redis    │               │ minio      │
+   │ appendonly│              │ S3 objects │
+   └──────────┘               └────────────┘
+```
+
+**What terminates TLS.** Caddy, and only Caddy — it issues and renews certificates itself, so the
+deployment cannot drift into an expired one. It owns the path split above, which is the same split the
+Vite dev proxy makes, so development and production route identically. Caddy's data volume holds the
+certificates and the ACME account state and **is not optional**: without it every restart requests a new
+certificate and Let's Encrypt's rate limit turns that into a deployment that cannot obtain one for a
+week. `tls internal` is the documented localhost path; a real domain gets ACME.
+
+**Caddy reverse-proxying the WebSocket is not automatic** — it needs upgrade headers, and a proxy that
+silently drops them is the classic way a realtime feature dies in production while working locally.
+`scripts/deploy_smoke.py` is the check: it opens a socket through the proxy, authenticates, creates a
+ticket over HTTP, and waits for the `ticket.created` event. Nothing in the test suite can make that
+assertion, because the suite talks to the app in-process.
+
+**What is stateful.** Postgres, Redis (`appendonly yes`, so a restart does not discard queued email and
+SLA work), MinIO, and Caddy's certificate volumes. Everything else is replaceable: the API holds no
+state that is not in Postgres or Redis, which is what makes `docker compose up --scale backend=3` behind
+Caddy a supported scale-out — §59's claim, made operational — and what makes the frontend a directory of
+pre-built files. **`beat` is the exception in the other direction**: it is a singleton by construction,
+because two schedulers each fire every entry on their own clock and the SLA sweep then runs twice per
+interval. The compose file sets `replicas: 1` and says not to change it.
+
+**Migrations are a discrete step, not a startup side effect.** A one-shot `migrate` service runs
+`alembic upgrade head`, and every long-running service waits on
+`condition: service_completed_successfully`. `up` therefore cannot produce an API running against the
+previous schema, and because `upgrade head` is idempotent a redeploy with no new revision is a no-op.
+
+**Only Caddy publishes a port.** Postgres, Redis, MinIO, and the API are reachable on the compose
+network and nowhere else; publishing 5432 would put an authentication prompt on the public internet and
+make the password the only thing between a stranger and every tenant's data.
+
+**How images reach a host.** `.github/workflows/release.yml` builds both production images on a version
+tag and pushes them to GHCR **with provenance and an SBOM**, attaching the digest. There is no cloud
+account and therefore no deploy step in CI — a workflow that "deployed" would either do nothing or lie.
+The deploy is a runbook in the README: pull by digest, run the migrate service, restart, smoke. The
+target platform remains deliberately undecided and nothing in the architecture depends on one; what is
+now written down is the *shape* a host has to satisfy.

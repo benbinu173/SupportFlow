@@ -3658,4 +3658,538 @@ part of the 1584; the walkthrough asserts the same thing before it uploads, beca
 that one reader opens and another does not is the sort of fixture that fails at the pipeline rather than
 at the assertion — so `201` alone would not be evidence that the extraction had anything to extract.
 
+---
+
+## ADR-033 — Hardening found one weld, and the deployment is a second compose file
+
+**Status:** accepted · Phase Y–Z
+
+**Context.** §Y (*"TESTING / HARDENING"*) and §Z (*"PRODUCTION DEPLOYMENT"*) are the last two phases in
+the roadmap, and §64 names the artifacts a finished project owes. Several of them had never existed:
+no seed script (§56), no README deployment section (§55.19), no CD workflow, no frontend image, no TLS
+terminator, and — established by grep rather than by reading — **no `structlog.configure` call anywhere
+in `app/`**, which meant every log line this project has ever written went through structlog's default
+`ConsoleRenderer`.
+
+This phase is unlike the thirty-two before it. Its primary deliverable is *evidence about the existing
+system* rather than new surface, so the useful output is an audit that reports what it found **and what
+it looked at and found correct**. Decision 10 is the first half; Decision 11 is the second, and the
+second is the half usually omitted.
+
+**Decision 1 — `app/core/logging.py` is the one place a renderer and a level are chosen.**
+
+Logging was never configured, so the codebase logged prose to stdout with no level a filter could
+select on, no timestamp in a sortable form, and no request id to group by. `merge_contextvars` sat in
+the default processor chain merging an empty mapping on every call.
+
+The fix is one `configure_logging(settings)` — JSON in production, `ConsoleRenderer` everywhere else,
+driven by a new `LOG_LEVEL` setting. Two things about its shape are decisions rather than details:
+
+* **Not a `DEBUG` flag.** A developer reading a terminal wants the coloured renderer whether or not
+  debug logging is on; a container wants the parseable one whether or not it is.
+* **Called from both processes.** The API (`app.main.create_app`) and the worker
+  (`app.workers.celery_app`) are separate processes with separate logger registries, and each calls it
+  in its own process. A worker that emitted console lines into the same collector the API fills with
+  JSON is the problem only half solved.
+
+`cache_logger_on_first_use=True` is what makes `get_logger` at module import cheap, and it has a sharp
+edge worth naming: the configuration must be in place *before* the first use. `create_app` therefore
+configures at the top rather than in `lifespan`, and `tests/unit/test_logging.py` pins that ordering.
+Third-party stdlib loggers (SQLAlchemy, botocore, Celery) are routed through the same renderer via
+`ProcessorFormatter`'s `foreign_pre_chain`, because "two shapes in one stream" is the condition this
+module exists to prevent. **uvicorn's own loggers are deliberately not rewritten** — `uvicorn.error`
+and `uvicorn.access` are installed with `propagate=False` and reaching them means handing uvicorn a
+`--log-config`, which is a deployment concern and is noted in the README instead.
+
+**Decision 2 — Correlation is ASGI middleware, and the inbound id is bounded.**
+
+`RequestIDMiddleware` mints an id (or adopts a client's), binds it through
+`structlog.contextvars.bound_contextvars`, and echoes it as `X-Request-ID`. It also writes it to
+`scope["state"]`, so a handler that wants to correlate something it writes can read
+`request.state.request_id`. **It is not in the §42 error envelope, and the full test suite is what
+decided that** — Finding 10 records the eighteen isolation tests that rejected it.
+
+Three choices in twenty lines of code:
+
+* **An inbound id is honoured, and that is a considered risk.** Always minting would sever the trace a
+  gateway already assigned, which is the one thing correlation is for. The value groups log lines and
+  is trusted for nothing else — but "trusted for nothing" stops being true if a client can put a
+  megabyte into every line, so anything over **64 characters is replaced, not truncated**. A truncated
+  id is a wrong id that looks right.
+* **`bound_contextvars`, not `bind`/`clear`.** It restores whatever was bound before, so this
+  middleware cannot wipe context owned by its caller.
+* **Registered last in `create_app`.** Starlette applies middleware in reverse registration order, so
+  the last added is the outermost — the id is bound before any other middleware can log.
+
+**Decision 3 — §54's headers are one middleware, and HSTS is production-only.**
+
+`SecurityHeadersMiddleware` sets `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+`Referrer-Policy: no-referrer`, and `Cross-Origin-Opener-Policy: same-origin` at
+`http.response.start`, which is what makes a 404, a 401, a `FileResponse`, and a 500 all covered by
+one mechanism rather than by the routes somebody remembered. It fills gaps rather than overruling a
+route — the attachment download sets its own `nosniff` with a comment explaining why, and a middleware
+that overwrote it would leave that comment describing a line that no longer decides anything.
+
+`Strict-Transport-Security` is **sent only in production**, and the asymmetry is the decision. On a
+localhost development server — which *is* plaintext — HSTS pins the browser to a scheme the server
+cannot serve, and the developer's next request fails with an error naming neither HSTS nor the setting
+responsible. It is also the one header here that is a commitment rather than a restriction.
+
+There is deliberately **no `Content-Security-Policy`** from this middleware: a CSP governs what a
+*document* may load, and none of these responses is a document. The frontend's nginx sets one, where it
+means something.
+
+Both middlewares are raw ASGI callables rather than `BaseHTTPMiddleware` subclasses. `BaseHTTPMiddleware`
+runs the app in a child task and buffers the response body to do it, which is why it breaks
+`StreamingResponse` — and this project streams attachment downloads and holds WebSockets open. Neither
+middleware touches a non-`http` scope: a socket has no headers to set and no request to correlate.
+
+**Decision 4 — `Settings` refuses its own production contradictions at startup.**
+
+`_production_is_not_a_development_checkout` rejects two things, and both are a deployment that starts
+cleanly and is wrong in a way nothing else reports:
+
+1. **`DEBUG=true` beside `ENVIRONMENT=production`.** `DEBUG` is not a log level here; it is the flag
+   that gets left on when a `.env` is copied to a server.
+2. **A `JWT_SECRET` this repository publishes.** Every value in the blocklist is committed in
+   plaintext — `.env.example`'s template or `ci.yml`'s CI-only secret. A signing key anyone can read
+   lets anyone mint a token for any tenant, which is the one credential whose compromise is total. The
+   check is a blocklist rather than an entropy heuristic because the set of secrets *this repo ships*
+   is finite and knowable, and guessing at what a weak secret looks like is not.
+
+A `model_validator` rather than two `field_validator`s, for the same reason
+`_the_model_is_served_by_the_provider` is one: `DEBUG` alone is legal, `ENVIRONMENT=production` alone
+is legal, and only the pair is a contradiction.
+
+**Decision 5 — the deployment is `docker-compose.prod.yml`, not a fourth profile.**
+
+The development file bind-mounts source and runs `--reload`; a production file ships immutable images
+with no mounts. Those two cannot both be a default, so they are two files and no reader is ever asked
+which one a command is looking for. Relative to development, the production file: uses the
+`production` build target (no test dependencies, no toolchain in the image), has no bind mounts,
+`restart: unless-stopped` everywhere, a one-shot `migrate` service the API waits on
+(`condition: service_completed_successfully`, so `up` cannot produce an API against the previous
+schema), resource limits, and **no mailpit**.
+
+**Only Caddy publishes a port.** Postgres, Redis, MinIO, and the API are reachable inside the compose
+network and nowhere else; publishing 5432 would put an authentication prompt on the public internet and
+make the password the only thing between a stranger and every tenant's data.
+
+Three smaller decisions in that file are each a bug not shipped:
+
+* **The extensions SQL file is mounted, not the directory.** The development directory also holds
+  `02-test-database.sql`, which hardcodes `CREATE DATABASE supportflow_test`. Mounting the directory
+  would create a test database in production: empty, unused, never backed up.
+* **The worker's healthcheck is replaced.** The image's own HEALTHCHECK curls `localhost:8000`; the
+  worker runs no web server, so it would sit at `unhealthy` while doing its job perfectly.
+  `celery inspect ping` asks the process that is actually running.
+* **`beat` has `replicas: 1` and `healthcheck: disable: true`.** Beat is a singleton by construction —
+  two instances each fire every schedule entry, so the SLA sweep runs twice per interval and every
+  alert is staged twice. Nothing in the code can prevent it, so it is enforced where a reader looks.
+
+**Decision 6 — TLS terminates at Caddy, and a socket through the proxy is the only proof.**
+
+§Z item 8 is HTTPS. Caddy was chosen for the reason that matters at this size: automatic certificate
+issuance and renewal are a config line rather than a cron job, so the deployment cannot drift into an
+expired certificate. `docker/Caddyfile` does the path routing — `/api/*`, `/ws`, and `/health*` to
+`backend:8000`, everything else to `frontend:80` — which is the same split the Vite dev proxy already
+makes, so development and production route identically. A real domain gets Let's Encrypt; the
+documented localhost path uses `tls internal`.
+
+**Caddy reverse-proxying a WebSocket is not automatic** — it needs the upgrade headers — and a proxy
+that silently drops upgrades is the classic way this breaks. So `scripts/deploy_smoke.py` opens a real
+socket through Caddy, authenticates, creates a ticket over HTTP, and waits for the `ticket.created`
+event to arrive. **It is the only test in the repository that can fail for this reason**: the suite
+uses an in-process client and would keep passing if Caddy stopped routing `/ws`, if a container never
+started, or if the certificate expired.
+
+The smoke script checks, in order: liveness, readiness and every dependency it covers, the seeded
+administrator's login, the security headers **as deployed** (HSTS present is what proves
+`ENVIRONMENT=production`), tenant isolation from *both* sides — tenant B's ticket returns `200` to B and
+`404` to A, because a one-sided check would pass for a ticket that does not exist — and the socket. TLS
+verification is off by default because the local stack uses Caddy's internal CA; `--verify-tls` is the
+mode that protects anything.
+
+**Decision 7 — the frontend deploys as static files on one origin.**
+
+§41's UI is frontend work and stays unbuilt; this phase ships the Phase-C *scaffold* in a real
+container, and says so rather than implying a product. `frontend/Dockerfile` builds with Node 22 and
+serves `dist/` from nginx, whose config carries the SPA history fallback and the cache policy that
+matters: hashed assets immutable, `index.html` never cached — the mistake that serves a stale app
+forever.
+
+`VITE_API_BASE_URL` and `VITE_WS_URL` are **empty** in the container build, so the SPA calls its own
+origin and Caddy decides where the API is. A hostname baked in at build time would be a second source
+of truth, wrong the moment the domain changes.
+
+**Decision 8 — CD publishes images to GHCR; the deploy is a runbook.**
+
+There is no cloud account, so a workflow that "deployed" would either do nothing or lie. What is real
+and verifiable is building and publishing the images: `.github/workflows/release.yml` runs on a version
+tag, builds both production images, pushes them to GHCR with provenance and an SBOM, and attaches the
+digest. The deploy step is documented in the README as a runbook — pull by digest, migrate, restart,
+smoke — because that is the honest artifact when there is no target. §52's twenty-three rows are
+answered individually in that section, **including the rows this phase cannot make true**.
+
+**Decision 9 — the seed writes through the service layer and fabricates no AI result.**
+
+`backend/scripts/seed_demo.py` creates §56's demo tenant. The ticket is *created* through
+`ticket_service.create_ticket` and the status flows are *walked* through
+`ticket_service.change_status`/`close_ticket`, so the demo organization has a real audit trail, real
+timeline entries, and real SLA timers, and is indistinguishable from a hand-built one.
+
+Two departures, both deliberate:
+
+* **`@acme.example.com`, not §56's `@acme.local`.** `.local` is a special-use TLD and the project's own
+  `Email` type refuses it (`app/schemas/fields.py`). Weakening production validation to accommodate
+  demo data is the wrong direction, so the *data* moved and the docstring says why.
+* **No AI result is invented.** §60 forbids fake AI results and fabricated analytics. `create_ticket`
+  already queues classification and sentiment (§18 steps 1–2), so the seed leaves all 60 analysis rows
+  `pending` with no result — which is the true state of every ticket before its worker picks it up. The
+  script prints that state and says what a real run costs.
+
+One thing in `seed_demo.py` writes outside the service layer, and it is documented in the file:
+backdating. No service call accepts a timestamp, and a demo whose thirty tickets were all created in
+the same second renders every time-series panel as one spike. `_backdate` shifts each ticket's own
+timestamps and its children's by a single per-ticket delta, through `update()` with bound parameters.
+
+**Decision 10 — the audit's findings.**
+
+Ten, in the order they matter. Three are reported rather than patched, and the reason is given for each.
+Four were found by bringing the stack up rather than by reading it, and the last was found by the test
+suite refusing a change — which is the half of this decision that is an argument for running a
+deployment instead of describing one, and for running the whole suite instead of the files you touched.
+
+**Finding 1 — an analysis can be welded shut, and the one-line fix is not sufficient.** *Reported.*
+
+`run_analysis` (`app/services/ai_analysis_service.py:640-660`) marks rows `PROCESSING`, commits, and
+then calls `_execute` under `except AIServiceError`. Any other exception propagates out of the task;
+`task_acks_late=True` with Celery's default `task_acks_on_failure_or_timeout=True` means the message is
+**acknowledged rather than redelivered**, so the row stays `PROCESSING` permanently. That matters
+because `ai_repository.in_flight_analyses` (line 130) counts `PENDING` **and** `PROCESSING` as in flight,
+so `request_analysis` refuses to queue that operation ever again — *"Nothing in flight is queued
+twice"* — and **no beat entry reaps a stale claim**: `beat_schedule` has exactly one entry, the SLA
+sweep. The ticket's analysis for that operation, and for a summary, becomes permanently unrequestable,
+silently. `knowledge_service.run_ingestion` (`:539`) has the identical shape around `_FAILURES`.
+
+The trigger surface is narrower than it first appears, and the audit established this rather than
+assuming it: `ai_service` converts **every** `AIError` into `AIServiceError` (`app/ai/errors.py` states
+it as *"never escapes `ai_service` un-caught"*), so a malformed or refused model answer is already
+caught. What is left is a database error or a bug — which is exactly the class an unexpected exception
+belongs to, and exactly the class the handler cannot enumerate.
+
+**Why it is reported and not patched here.** Widening `except AIServiceError` to `except Exception` is
+a two-word change that would make this *worse* in the database-error case: SQLAlchemy's session is
+poisoned by a failed statement, so the next `session.commit()` (`:688`) raises `PendingRollbackError`,
+taking the whole batch's rows to `PROCESSING` — and any operation already completed in this run is
+still uncommitted at that point, so rolling back discards its outcome too. The correct fix is a
+transaction-shape change — commit each operation's outcome as it happens, so a later failure cannot
+discard an earlier result — or a reaper that returns a claim older than a threshold to `pending`. Both
+need the failure path exercised by a test that raises a non-`AIServiceError` through the task. Recorded
+here as the one open defect Phase Y found, with its reachability and its remedy, rather than closed with
+a change nobody has run.
+
+**Finding 2 — the analysis claim is read-then-write, and the comment overstates it.** *Reported.*
+
+`run_analysis` claims rows by loading them, setting `status = PROCESSING` in Python, and committing —
+there is no `SELECT … FOR UPDATE` and no conditional `UPDATE … WHERE status = 'pending'`. Two
+concurrent deliveries could both claim the same row. More concretely, the filter is
+`status not in _TERMINAL`, and `_TERMINAL` is `{COMPLETED, FAILED}` — so a row already in `PROCESSING`
+**is** claimable, and the inline comment (*"a row only ever leaves `pending` once, and a second delivery
+finds nothing to claim"*) describes the opposite of what the code does. The two places that reason about
+`PROCESSING` also disagree: `in_flight_analyses` treats it as in-flight, while this filter treats it as
+unclaimed.
+
+The re-claim is not simply a bug — it is the only crash-recovery mechanism there is, since a worker
+killed mid-run leaves a `PROCESSING` row and there is no reaper to return it. So the decision is to
+**correct the comment, not the code**, and to record the bound on the exposure: duplicate provider spend
+is possible when a hard-time-limited worker is killed and its message requeued, but genuine concurrency
+requires a message to outlive `broker_transport_options["visibility_timeout"]` (3600 s) while the task
+time limit is 120 s, so the window is closed by configuration rather than by the claim. Adding
+`FOR UPDATE` was rejected: it would hold a row lock across a network call to a provider for up to the
+time limit.
+
+**Finding 3 — `frontend/.dockerignore` did not exist.** *Fixed in this phase.*
+
+`frontend/Dockerfile` copies `package.json`/`package-lock.json`, runs `npm ci`, then `COPY . .`. With no
+ignore file the second copy carried the host's `node_modules`: the production build reported
+`transferring context: 144.65MB 134.1s` — having already reported 81.57 MB in 41 s earlier in the same
+run — for a dependency tree the image installs correctly on its own. It is not only slowness — a host
+tree can hold native binaries for the host's platform, and a leaked `node_modules` shadows the one
+`npm ci` just built, which surfaces as an unrelated native crash at runtime. The new file excludes
+`node_modules/`, `dist/`, and `.env*`; the last because a developer's
+`VITE_API_BASE_URL=http://localhost:8000` inlined at build time would point every deployed page at their
+machine.
+
+**Finding 4 — two sort keys have no supporting index.** *Reported, not migrated.*
+
+`_TICKET_SORT_COLUMNS` (`app/repositories/ticket_repository.py`) offers `TicketSortKey.UPDATED_AT` and
+`TicketSortKey.PRIORITY`, and no declared index can serve either ordering — `ix_tickets_org_created_at`
+covers the default `created_at`, and `ix_tickets_org_status_priority` leads with `status`, so it is
+unusable when no status filter is present. The consequence is a sort over a tenant's whole ticket set.
+
+The decision is **not to add a migration**, for two reasons the spec supplies: §53 says not to optimize a
+query nobody has run slowly, and this phase committed to *"No new upgrade operations detected"* as
+evidence that four phases of additions needed no schema change. An index is not free — it is a write
+cost on every ticket insert to speed a sort nobody has reported. Recorded with its reasoning so the next
+phase that needs it finds the analysis rather than redoing it.
+
+**Finding 5 — the production seed could not run in the image built for it.** *Fixed in this phase.*
+
+Found by running the documented deployment rather than by reading it, which is the only way this class
+of defect surfaces. `make prod-seed` invoked `python scripts/seed_demo.py` inside the backend container,
+and it died with:
+
+```
+File "/app/scripts/seed_demo.py", line 53, in <module>
+    from app.core.config import get_settings
+ModuleNotFoundError: No module named 'app'
+```
+
+`python <path>` puts the **script's** directory on `sys.path`, not the working directory. So
+`import app` resolved for every developer who ever ran this script — because `pip install -e .` had the
+project installed editable — and could not resolve in the image, which installs *dependencies* and gets
+`app/` only through `COPY`. The two environments differ in exactly the property the invocation depended
+on, and the developer's environment was the one that could not fail.
+
+The fix is `python -m scripts.seed_demo` from `/app`, which puts the working directory on `sys.path` —
+the one thing the image guarantees. `make seed`, `make prod-seed`, and `make smoke` all use the module
+form now, and both scripts' docstrings record why. Two things make this worth a finding rather than a
+footnote: the seed is the *only* way §56's data exists in a deployment, so a broken invocation is a
+deployment that cannot be demonstrated at all; and the same trap is sitting in `deploy_smoke.py`, the
+one check that can prove Caddy routes and TLS terminates.
+
+The general lesson, which is why it is written down: **a command that works only because of an editable
+install is a command that has never been run in the environment it is documented for.** `make smoke` and
+`make prod-seed` are the two targets whose whole purpose is to be run against a deployment, and they
+were the two that would have failed there first.
+
+**Finding 6 — nginx discarded the security headers on the one response that needed them.** *Fixed in
+this phase.*
+
+`frontend/nginx.conf` set the Phase Y headers at `server` scope and then set `Cache-Control` in two
+`location` blocks. nginx's `add_header` is **not additive across blocks**: a location with any
+`add_header` of its own discards the parent's set entirely. So:
+
+* `location /assets/` lost all four security headers.
+* `location = /index.html` lost `nosniff`, `X-Frame-Options`, `Referrer-Policy`, and
+  `Cross-Origin-Opener-Policy` — because the block had *two* `add_header`s of its own and the second
+  was a CSP, which is the tell that the trap was half-known: the CSP had been repeated deliberately,
+  and the four beside it had not.
+
+`index.html` is the only response this server returns that is a document, which is exactly where
+`X-Frame-Options` and a CSP are enforced at all. The visible behaviour — a page that loads and caches
+correctly — was right the whole time, and the invisible behaviour was missing, which is why reading the
+file did not find this and comparing the two blocks did. Both were found by asking which headers the
+*intended* policy requires on each response rather than by trusting the server-scope list to reach
+everywhere.
+
+The fix is `frontend/nginx-headers.conf`, included in every block that sets a header of its own — three
+includes, one list. It carries a CSP on `/assets/` responses where it is inert, and that is the
+deliberate cost: one list in one place cannot drift out of step, and a second list could.
+
+**Finding 7 — an optional Caddy setting, left at its default, stopped Caddy from starting.** *Fixed in
+this phase.*
+
+The Caddyfile's global block opened with `email {$ACME_EMAIL:}` and a comment reading *"Empty is legal
+and means no notices."* That comment was wrong, and the way it was wrong is worth recording. An unset
+variable expands to an empty token; Caddy's `email` directive requires exactly one argument; so the
+config failed to adapt:
+
+```
+{"level":"error","msg":"adapting config using caddyfile: parsing caddyfile tokens for 'email':
+ wrong argument count or unexpected line ending after 'email', at /etc/caddy/Caddyfile:12"}
+```
+
+Caddy exited with status 1 and the container restart-looped, so `https://localhost` refused every
+connection and the smoke test's first probe reported `WinError 10061`. **The failure was caused by an
+optional setting being absent, which is the default state of every optional setting.** The deployment's
+entire public surface was down because of a line whose own comment said the empty case was fine.
+
+The direction of the fix matters more than the fix. Wiring an optional address through the environment
+cannot work here — the directive has no "unset" form — so `ACME_EMAIL` is **removed** from the Caddyfile,
+from `docker-compose.prod.yml`, and from `.env.production.example`, rather than given a placeholder
+default. A placeholder (say `admin@example.com`) would have made Caddy start and silently registered an
+ACME account at an address nobody reads, which is the badly-configured deployment the comment claimed to
+be preventing. The Caddyfile now records the one line a real domain adds, and why it is not a variable.
+
+**Finding 8 — the frontend healthcheck probed the wrong IP family.** *Fixed in this phase.*
+
+`frontend/Dockerfile`'s `HEALTHCHECK` ran `wget --spider http://localhost/`, and the container sat at
+`unhealthy` from the moment it started while nginx served every request correctly. Measured inside the
+running container rather than guessed at:
+
+```
+--- 127.0.0.1 ---   exit=0
+--- [::1] ---       exit=1
+listeners: tcp 0 0 0.0.0.0:80 LISTEN
+```
+
+`/etc/hosts` maps `localhost` to `::1` *and* `127.0.0.1`, busybox wget resolves the IPv6 address first,
+and nginx's `listen 80;` binds IPv4 only. The probe was refused while the server was up. The fix is
+`http://127.0.0.1/` and a comment, because the next person to shorten it back to `localhost` will
+reintroduce a healthcheck that lies.
+
+Both of these, and Finding 6 before them, share a shape worth naming: **they were invisible in the file
+and immediate under `up`.** Reading `nginx.conf` does not reveal `add_header`'s inheritance rule, a
+Caddyfile comment asserting a default is "legal" is not evidence that it is, and a healthcheck that
+names `localhost` looks more portable than one that names an address. The deployment had never been
+started before this phase — the README described a stack nobody had run — and the first honest `up`
+produced three defects in the first five minutes.
+
+**Finding 9 — the release workflow declared an input it never read.** *Fixed in this phase.*
+
+`.github/workflows/release.yml` triggered on `workflow_dispatch` with a required `tag` input, and its
+comment explained why the input was required rather than defaulting to the branch: *"publishing `main`'s
+current commit under a version tag is not something a release should be able to do by accident."* The
+input was then referenced nowhere in the file. Checkout took the default ref and
+`docker/metadata-action` derives its `type=semver` tags from `github.ref`, so a manual dispatch would
+have built the **branch head** and pushed it with no version tags at all — the exact outcome the comment
+claimed to prevent, arrived at by the mechanism meant to prevent it.
+
+An input that appears to control something and does not is worse than no input: it invites a person to
+type a tag, believe the release is about that commit, and get images about a different one. The fix is
+to delete the input and use the mechanism that genuinely works — `workflow_dispatch` can be run against
+a tag, which sets `github.ref` to `refs/tags/v1.0.0`, and that is what checkout and the metadata action
+both read. The tag is chosen where GitHub already knows how to choose it, and nothing has to be trusted
+to agree with what was typed.
+
+**Finding 10 — the correlation id in the error envelope broke eighteen isolation tests.** *Fixed in
+this phase.*
+
+Phase Y added `request_id` to the §42 error body "so a user can quote it". The first full suite run of
+the phase then reported **18 failures**, every one of them a security test asserting that a refusal is
+indistinguishable from a missing record:
+
+```
+tests/security/test_tenant_isolation.py::test_a_cross_tenant_404_is_identical_to_a_missing_record_404
+tests/api/test_auth.py::test_a_wrong_password_and_an_unknown_email_are_indistinguishable
+    ... 16 more, across test_attachments, test_notifications, test_ai_isolation,
+        test_knowledge_isolation, test_notification_isolation, test_row_scopes, test_sla_isolation
+```
+
+Each compares two response bodies with `==`. A per-request random field makes every such comparison
+false. It does not leak anything — both responses carry a random string, and neither reveals which case
+occurred — so this was not a security regression. It was a *contract* regression: the error body had
+stopped being a function of the error.
+
+Two responses were available, and the direction chosen is the whole substance of this finding:
+
+* **Rewrite the eighteen to compare bodies with the field stripped.** This preserves the id in the
+  body. It also means the security property is held by eighteen test authors remembering an
+  incantation, and that the next isolation test written with a plain `==` fails for a reason that has
+  nothing to do with isolation.
+* **Take the id out of the body.** The `X-Request-ID` header already carries the same value on every
+  response — success and error alike — and any client that can read the JSON body can read the header.
+  The body copy was redundant, and the redundancy was the entire cause.
+
+The second. The id belongs in a header; that is what `X-Request-ID` is, and it is what a gateway in
+front of this service already understands. The eighteen tests pass unmodified, `error_body` is a pure
+function of `(code, message)` again, and a new isolation test written tomorrow will hold the property
+by default rather than by vigilance.
+
+The smoke script gained the check that would have caught this from outside the process: a cross-tenant
+refusal and a refusal for an id that never existed are compared **byte for byte**, not just on status
+code. That is §37's actual requirement, and it is now asserted against the deployed stack.
+
+**Decision 11 — the audit's negative results.**
+
+The half usually omitted, and the half that says whether the audit was an audit.
+
+* **N+1 queries and lazy loads: clean.** No model declares `lazy=`. Exactly two eager loads exist, both
+  explicit and both on a path that needs the related row (`joinedload` in the email task, and
+  `deps.py:120`'s `user.organization`, where the hazard is named in a comment). `TicketRead` carries
+  scalar columns only, so serializing a page cannot trigger a per-row query.
+  `sla_service.decorate` issues **two queries per page, not two per ticket**. `analytics_repository`
+  takes `agent_name` from a `LEFT JOIN` rather than resolving it per row. The one relationship traversal
+  in the request path is eager-loaded.
+* **Capability coverage: mechanically guaranteed, not spot-checked.**
+  `tests/security/test_route_protection.py` walks the routing table recursively and asserts two
+  independent claims for every route — *authenticated* (the auth dependency is somewhere in its
+  dependency tree, or the route is on an explicit public allowlist) and *authorized* (it declares its
+  capability via `require_permission`). The allowlists are equality-checked, so a new route cannot land
+  without a decision being made about it, and the WebSocket route gets its own named allowlist rather
+  than a comment saying it is exempt.
+* **The retry and acknowledgement matrix is deliberate, and its shape is consistent.** `task_acks_late`
+  plus `task_reject_on_worker_lost` means a killed worker's message is requeued rather than lost, and
+  the price — at-least-once — is narrowed for email by `notifications.emailed_at`
+  (`_ALREADY_SENT`), which is what makes a redelivery a no-op rather than a second email. The email task
+  retries **only** `TransientEmailError`, with 60-second exponential backoff plus jitter and
+  `max_retries=5`; a refused recipient fails on the first attempt rather than spending five minutes
+  re-sending something the server already rejected. The AI and knowledge tasks deliberately **do not
+  retry at this level**, because `ai_service._run` is where §17's retry policy lives and a second loop
+  would multiply the two. The SLA sweep does not retry either, and does not need to: nothing about it is
+  one-shot, and the next beat cycle picks up whatever a broker failure skipped.
+* **A poison message cannot loop.** `task_acks_on_failure_or_timeout` is left at its `True` default, so
+  a task that exhausts its retries is acknowledged instead of being redelivered forever. This is the
+  setting whose absence makes `acks_late` dangerous, and its default is what makes the claim in
+  Decision 10 Finding 1 a latent hole rather than a live one.
+* **Time limits are inside the visibility window.** Soft 60 s and hard 120 s against a 3600 s
+  `visibility_timeout`, so a task's message cannot be redelivered while the task is still running — the
+  configuration that bounds Finding 2.
+* **No secrets in logs.** The worker logs an exception's *type* and never its message, because a
+  connection error's text embeds the broker URL and a recipient refusal's embeds an address. The email
+  task's engine is built with `echo` off and not from `DEBUG`, since a statement log carries parameters
+  and the parameters there are a recipient's address.
+
+**The four deliberate breaks.** A test that cannot fail tests nothing, so four changes were made to
+working code, each expected to produce exactly one failure, and each reverted afterwards:
+
+1. **The request-id binding removed** from `RequestIDMiddleware` — deleting the `bound_contextvars`
+   call, which is the entire reason the middleware exists, since an id in a response header correlates
+   nothing. **All 13 middleware and logging tests still passed.** The header is written by
+   `send_with_request_id`, separately from the binding; no test touched the binding, so
+   the correlation feature was untested end to end. `test_the_id_is_bound_to_the_logs_the_request_writes`
+   was added to cover it (and it fails against the break, and passes against the fix). This is the most
+   valuable thing the exercise produced: the break was *supposed* to fail a test and found a hole
+   instead.
+2. **The HSTS production gate dropped** — `include_hsts=settings.is_production` replaced with
+   `include_hsts=True`. `test_hsts_is_absent_outside_production` failed, as intended, and it was the
+   only failure.
+3. **The `/ws` route repointed** at `frontend:80` instead of `backend:8000`. The plan called for
+   removing Caddy's WebSocket upgrade headers; **that break cannot be performed, because this Caddyfile
+   has none to remove** — Caddy upgrades transparently, which is the reason it was chosen over nginx in
+   Decision 6. Repointing the route is the break that can actually fail, and it did: the smoke test
+   reported `18 passed, 1 failed`, the socket check failing with a `200` whose body was the SPA's HTML.
+   The failure output alone identifies the cause, which is what a smoke test is for.
+
+Break 3's response body is worth one more sentence, because it verified something else by accident: the
+HTML Caddy returned from nginx carried `Content-Security-Policy`, `X-Content-Type-Options`,
+`X-Frame-Options`, `Referrer-Policy`, and `Cross-Origin-Opener-Policy` together on `index.html`. Under
+the pre-Finding-6 configuration that response would have had only `Cache-Control` and the CSP. The
+headers were checked as deployed, on the exact response class that was broken, without a test being
+written for it.
+
+4. **The correlation id put back into the error body** — `error_body` returning a per-response
+   `uuid4().hex` alongside `code` and `message`, which is the shape Finding 10 removed. The smoke
+   script's new byte-for-byte refusal check failed with the offending body printed, as intended.
+
+   **The first attempt at this break did not fail, and that is the more useful result.** It was made in
+   `_http_exception_handler`, which renders "no such route" 404s — but both requests the check compares
+   are *ticket* 404s, raised as `AppError`s and rendered by `_app_error_handler`. The break was live
+   (a direct `curl` showed a different id on each response) and the check still passed, because it was
+   measuring a code path the break had not touched. Had the break been trusted at that point, the
+   conclusion would have been "this check cannot fail" — the opposite of the truth. Placing it in
+   `error_body`, where the original defect had been, failed the check immediately.
+
+   That is the same lesson as the three above, one level up: **a break tests the check only if it
+   lands on the path the check exercises**, and a break that "did not fail" is evidence about the
+   break at least as often as about the test.
+
+**The numbers.** `pytest` — 1602 passed, 0 failed, 0 skipped (516 s). `pytest -m security` — 168 passed.
+`ruff check`, `ruff format --check`, and `mypy app alembic scripts` — clean, 218 files formatted and 141
+source files checked. `vitest` — 3 files, 14 tests. `alembic check` — *No new upgrade operations
+detected*, the fourth consecutive phase to add features without a schema change. `scripts/deploy_smoke.py`
+— 23 passed, 0 failed, against the live stack through Caddy.
+
+The first full run of this phase reported **18 failures** (Finding 10); the run after that reported none,
+and the difference between the two is one field removed from one dict.
+
+**Cost.** The deployment file is a second document to keep in step with the first, and the two already
+differ in ways only a reader comparing them will catch. Logging configuration is one more startup step
+that must happen before any module-level logger is used, which is an ordering constraint nothing at the
+type level enforces. The audit leaves one defect open deliberately, which means `PROCESSING` remains a
+state that can be terminal in fact and not in name — and Finding 1's remedy is a transaction-shape
+change owed to a later phase rather than a bug closed here.
+
 
