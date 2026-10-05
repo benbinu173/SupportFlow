@@ -25,7 +25,13 @@ import pytest
 from sqlalchemy.engine import make_url
 
 from app.core.config import get_settings
-from app.workers.celery_app import AI_QUEUE, NOTIFICATIONS_QUEUE, SLA_QUEUE, celery_app
+from app.workers.celery_app import (
+    AI_QUEUE,
+    KNOWLEDGE_QUEUE,
+    NOTIFICATIONS_QUEUE,
+    SLA_QUEUE,
+    celery_app,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -193,12 +199,13 @@ def test_one_worker_process_takes_one_task_at_a_time() -> None:
 def test_every_task_route_names_a_queue_that_exists() -> None:
     """§51's Phase P asks for task routing, and Phase Q adds the second queue.
 
-    Three queues now, each named for its purpose, and the route table's entries are what make
-    each destination explicit instead of relying on the default queue's name. The queues that
-    will join them are `reports` (S) and `knowledge` (X) — neither of which is declared here,
-    because declaring a queue nothing publishes to is a worker process waiting for work that
-    does not exist. `ai` was on that list from Phase P until Phase U produced it, which is the
-    rule this docstring is really about: **a queue arrives the phase its producer does.**
+    Four queues now, each named for its purpose, and the route table's entries are what make
+    each destination explicit instead of relying on the default queue's name. The queue that
+    will join them is `reports` (S) — not declared here, because declaring a queue nothing
+    publishes to is a worker process waiting for work that does not exist. `ai` and
+    `knowledge` were both on that list from Phase P until the phases that produced them
+    (U and X), which is the rule this docstring is really about: **a queue arrives the phase
+    its producer does.**
 
     Asserted as an exact table rather than as "the expected entries are present", so a route
     added without a queue to serve it — or a queue added without a route publishing to it —
@@ -212,23 +219,25 @@ def test_every_task_route_names_a_queue_that_exists() -> None:
         "app.workers.email_tasks.*": {"queue": NOTIFICATIONS_QUEUE},
         "app.workers.sla_tasks.*": {"queue": SLA_QUEUE},
         "app.workers.ai_tasks.*": {"queue": AI_QUEUE},
+        "app.workers.knowledge_tasks.*": {"queue": KNOWLEDGE_QUEUE},
     }
     assert {route["queue"] for route in routes.values()} == {
         NOTIFICATIONS_QUEUE,
         SLA_QUEUE,
         AI_QUEUE,
+        KNOWLEDGE_QUEUE,
     }
 
 
 def test_the_worker_command_names_every_routed_queue() -> None:
-    """The three-queue trap, closed by reading the two files that start a worker.
+    """The four-queue trap, closed by reading the two files that start a worker.
 
     A Celery worker consumes the queues it is told to and nothing else. With one queue that
     is invisible — the default is the only queue that exists, so a missing `-Q` still
-    works. With three, a worker started without `-Q ai` **consumes nothing from it** while
-    looking perfectly healthy: it connects, reports ready, and leaves every analysis sitting
-    in Redis forever. There is no error, no metric, and no log line, because from Celery's
-    point of view nothing is wrong.
+    works. With four, a worker started without `-Q knowledge` **consumes nothing from it**
+    while looking perfectly healthy: it connects, reports ready, and leaves every document
+    sitting `pending` in Redis forever. There is no error, no metric, and no log line,
+    because from Celery's point of view nothing is wrong.
 
     That is a deployment failure this suite cannot reach — it starts no worker — so it is
     checked where it is decided instead. Both files are parsed rather than grepped for a
@@ -239,7 +248,7 @@ def test_the_worker_command_names_every_routed_queue() -> None:
     **The README is deliberately not in this list**, though it also spells the command out.
     It is instructions for a person, and a stale line there costs one confused reader; the
     Makefile and compose are what actually start a worker, and a `-Q` that is wrong there
-    costs every analysis ever queued.
+    costs every document ever queued.
     """
     routed = {route["queue"] for route in celery_app.conf.task_routes.values()}
 
@@ -420,6 +429,34 @@ def test_the_analysis_task_is_registered_under_its_routed_name() -> None:
         if analyze_ticket.name.startswith(pattern.rstrip("*"))
     ]
     assert matched == ["app.workers.ai_tasks.*"]
+
+
+def test_the_ingestion_task_is_registered_under_its_routed_name() -> None:
+    """Phase X's producer, checked the way Phases Q and U were.
+
+    The knowledge task is the first in the project whose route pattern sits beside another
+    under `app.workers.*` and whose name could conceivably be captured by the wrong one, so the
+    `matched` assertion below is doing slightly more work than it did for the analysis task: it
+    is not enough that *a* pattern matches, only that the task's own pattern does.
+
+    Imported inside the test, for the reason the analysis task's test gives — the module builds
+    a `NullPool` engine at import scope, and only the test that needs the registry should do
+    that.
+    """
+    from app.workers.knowledge_tasks import ingest_document
+
+    assert "app.workers.knowledge_tasks" in celery_app.conf.include
+
+    registered = celery_app.tasks[ingest_document.name]
+    assert registered == ingest_document
+    assert registered.name == "app.workers.knowledge_tasks.ingest_document"
+
+    matched = [
+        pattern
+        for pattern in celery_app.conf.task_routes
+        if ingest_document.name.startswith(pattern.rstrip("*"))
+    ]
+    assert matched == ["app.workers.knowledge_tasks.*"]
 
 
 def test_the_worker_does_not_replace_the_root_logger() -> None:

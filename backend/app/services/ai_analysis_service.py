@@ -101,7 +101,7 @@ from app.schemas.ai import (
     SentimentResult,
     SuggestedReply,
 )
-from app.services import ai_service, audit_service, notification_service
+from app.services import ai_service, audit_service, knowledge_service, notification_service
 from app.websocket import manager as realtime
 
 logger = structlog.get_logger(__name__)
@@ -112,8 +112,10 @@ logger = structlog.get_logger(__name__)
 #: reads is not the ticket text these two read. **Suggested replies are §21, and Phase W gave
 #: them `request_suggested_response` and `/ai/suggest-response` for the same reason**: the
 #: material is the ticket *and* the conversation, and the answer is a draft rather than a field
-#: on the row. The knowledge base is §22 and Phase X, and it is not here either. The tuple is
-#: ordered because the rows are written in this order and a client reading them back sees it.
+#: on the row. **§23's knowledge answer is not here either, and its reason is the strongest of
+#: the three**: it is not an operation *on a ticket* at all — it is a question someone asks, and
+#: Phase X answers it on a route rather than on an `ai_analyses` row. The tuple is ordered
+#: because the rows are written in this order and a client reading them back sees it.
 ANALYSIS_OPERATIONS: tuple[AIOperation, ...] = (
     AIOperation.CLASSIFY,
     AIOperation.SENTIMENT,
@@ -142,11 +144,17 @@ _CONTENT_LABEL = "the customer's support ticket"
 #: a summary is asked about a thread of replies, not about the description that opened it.
 _CONVERSATION_LABEL = "the support conversation so far"
 
-#: The same, for §21's block — which is both of the above in one user message, so the label
-#: names both. Still the caller's own words and never anything a customer wrote, which is the
-#: rule `app/ai/prompts.py` states and the reason it is a constant here rather than a string
-#: built from the ticket's subject.
-_DRAFT_LABEL = "the customer's support ticket and the conversation so far"
+#: The same, for §21's block — which is the two above in one user message, plus §22's retrieved
+#: passages when there are any, so the label names what the block can contain. Still the caller's
+#: own words and never anything a customer wrote, which is the rule `app/ai/prompts.py` states
+#: and the reason it is a constant here rather than a string built from the ticket's subject.
+#: "any passages" rather than "the passages" because the overwhelming majority of drafts have
+#: none — a tenant that never opened the knowledge base, or a question nothing cleared the
+#: threshold for — and the model should not be told to expect a block that is not there.
+_DRAFT_LABEL = (
+    "the customer's support ticket, the conversation so far, and any knowledge base passages "
+    "retrieved for it"
+)
 
 #: Stored on a row whose operation this build has no implementation for. See `_execute`.
 _NO_IMPLEMENTATION = "This analysis operation is not implemented in this version."
@@ -719,9 +727,11 @@ async def _execute(
     records as a failure. That case is unreachable while the operations a route can queue are
     exactly the four implemented below — and reachable the moment they are not, because a
     task is handed ids over a broker and a deployment mid-rollout can deliver a row from a
-    version that knew an operation this one does not. §22's `KNOWLEDGE_ANSWER` is already
-    declared and unimplemented, so the case has a name today. Failing the row says so on the
-    ticket where a person will see it, rather than dying in a worker log.
+    version that knew an operation this one does not. **Phase X implemented the last of the five
+    operations and did not add a branch here**: §23's `KNOWLEDGE_ANSWER` is a question a person
+    asks, answered by `knowledge_service.answer` on its own route, so a row carrying it is a row
+    that should not exist — and this is what says so on the ticket where a person will see it,
+    rather than dying in a worker log.
 
     **The ticket is written here, per operation, and not from the row afterwards.** The
     mapping from a validated model to the columns it feeds is the one place this module and
@@ -771,8 +781,19 @@ async def _execute(
         conversation = await ai_repository.load_conversation(
             session, context.organization_id, ticket_id=ticket.id
         )
+        # §21's "relevant knowledge" step, and it is **fail-open**: a knowledge base that cannot
+        # be reached must not stop a draft being written. The retrieval is one embedding call,
+        # and an embedding provider having a bad afternoon is not a reason to refuse to help an
+        # agent reply — a draft that is merely less grounded is worth more than no draft. The
+        # failure is logged with its type and the run carries on with the two blocks that already
+        # exist, which is why a retrieval outage is invisible to an agent except as a reply that
+        # cites nothing.
+        passages = await _knowledge_for_draft(session, context, ticket)
         drafted = await ai_service.generate_response(
-            session, context, _draft_request(ticket, conversation), ticket_id=ticket.id
+            session,
+            context,
+            _draft_request(ticket, conversation, passages),
+            ticket_id=ticket.id,
         )
         # §41's distinction as a row rather than as a flag. The model's draft becomes a
         # `Message` with `sender_type = AI_DRAFT`, which `ai_draft_is_internal` (Phase D) makes
@@ -846,23 +867,65 @@ def _summary_request(conversation: Sequence[Message]) -> AIRequest:
     )
 
 
-def _draft_request(ticket: Ticket, conversation: Sequence[Message]) -> AIRequest:
-    """The §21 call for one ticket and its conversation.
+def _draft_request(
+    ticket: Ticket, conversation: Sequence[Message], knowledge: Sequence[str]
+) -> AIRequest:
+    """The §21 call for one ticket, its conversation, and any passages retrieved for it.
 
     Its own function for `_summary_request`'s reason: `_request_for` takes a `Ticket` and
-    reads its two text fields, and this one is handed both. `max_tokens` comes from settings
-    in all three, for the reason `AIRequest`'s docstring gives — it has one home.
+    reads its two text fields, and this one is handed all three. `max_tokens` comes from
+    settings in all three, for the reason `AIRequest`'s docstring gives — it has one home.
 
-    The fence is still the provider's. `prompts.draft_content` assembles the ticket's words and
-    the conversation's and stops there, which is what keeps one implementation of the mechanism
-    rather than three.
+    `knowledge` is required rather than defaulted so that every caller has decided what to
+    retrieve, and the decision to retrieve *nothing* is then a value (`[]`) rather than an
+    omission — the fail-open path in `_execute` passes an empty sequence on purpose, and a
+    default here would make that look the same as forgetting to pass it.
+
+    The fence is still the provider's. `prompts.draft_content` assembles the ticket's words, the
+    conversation's, and the passages and stops there, which is what keeps one implementation of
+    the mechanism rather than three.
     """
     return AIRequest(
         instruction=prompts.SUGGESTED_REPLY_INSTRUCTION,
-        content=prompts.draft_content(ticket, conversation),
+        content=prompts.draft_content(ticket, conversation, knowledge),
         content_label=_DRAFT_LABEL,
         max_tokens=get_settings().AI_MAX_TOKENS,
     )
+
+
+async def _knowledge_for_draft(
+    session: AsyncSession, context: WorkerContext, ticket: Ticket
+) -> list[str]:
+    """§22's passages for a draft, or `[]` if the knowledge base cannot be reached.
+
+    **Fail-open, and the containment is the point.** `knowledge_service.retrieve` makes one
+    embedding call, and that call can fail; an agent waiting for a suggested reply is not
+    served by a 503 from a feature they did not ask for. `AIServiceError` — which is what
+    `ai_service` raises when a provider is unreachable or untrustworthy — is logged with its
+    type and turned into an empty list, so the draft is built from the ticket and the
+    conversation alone. **A narrower catch than `run_analysis`'s per-operation one on purpose**:
+    a database error or a bug in the retrieval query still propagates, because swallowing those
+    would hide a real fault behind a reply that merely cites nothing.
+
+    The query is the ticket's own words, subject and description, which is the material §21
+    is about. Sentiment is not in it: retrieval is a similarity search over documents, and
+    "frustrated" is not a phrase a policy page contains.
+
+    **A tenant with no published chunks never reaches the provider** — `retrieve` asks
+    `has_published_chunks` first — so the common case costs one indexed read rather than an
+    embedding, and §21's behaviour for such a tenant is exactly what it was before Phase X.
+    """
+    query = f"{ticket.subject}\n\n{ticket.description}"
+    try:
+        matches = await knowledge_service.retrieve(session, context, query, ticket_id=ticket.id)
+    except AIServiceError as exc:
+        logger.warning(
+            "knowledge_draft_retrieval_failed",
+            ticket_id=str(ticket.id),
+            error_type=type(exc).__name__,
+        )
+        return []
+    return [match.content for match in matches]
 
 
 def _reduced(

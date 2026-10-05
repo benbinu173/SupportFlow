@@ -3189,5 +3189,473 @@ than stubbed (Decision 8). And **a draft of a ticket nobody has replied to** can
 because every ticket the script raises has a conversation; the scripted provider in the integration
 suite makes that case deterministic, which is where it is tested.
 
+## ADR-032 — A knowledge base is only as good as what it refuses to answer
+
+**Status:** accepted · Phase X
+
+**Context.** §22, §23, and §24 are one feature in three parts, and the build specification calls it a
+*"flagship feature"*: *"RAG KNOWLEDGE BASE"*, *"RAG QUERY FLOW"*, and *"RAG HALLUCINATION CONTROL"*.
+It is the last AI capability the system was designed around and never built — every other operation
+answers from priors, and §22 is what lets an answer be grounded in the organization's own documents.
+`docs/architecture.md` §7 has carried the intended flow since Phase B, in the present tense and
+unbuilt.
+
+**Every layer below the service already existed, and had since Phase D.** The baseline migration
+creates the `vector` extension, both tables, and the HNSW index; the models are fully built; the
+enums, permissions, and audit actions are all declared. **So Phase X adds no migration — the fourth
+phase in a row** — and `alembic check` reporting *"No new upgrade operations detected"* is the
+mechanical proof rather than a claim.
+
+| Already declared | Where | Says what |
+|---|---|---|
+| `KnowledgeDocument` | `app/models/knowledge_document.py` | `is_published`/`status` are independent; a partial index on `is_published = true AND status = 'completed'`; a trgm index on `title` awaiting an admin title search |
+| `KnowledgeChunk` + HNSW | `app/models/knowledge_chunk.py` | `EMBEDDING_DIMENSIONS = 1536`; `vector_cosine_ops`; chunks carry `organization_id` **so a tenant-filtered search needs no join** |
+| `ProcessingStatus`, `DocumentSourceType` | `app/models/enums.py` | `pending/processing/completed/failed`; `upload/url/manual` |
+| `AIOperation.EMBED`, `KNOWLEDGE_ANSWER` | `app/models/enums.py` | unused |
+| `AuditAction.KNOWLEDGE_DOCUMENT_CREATED/DELETED` | `app/models/enums.py` | unused |
+| `Permission.KB_LIST/KB_UPLOAD/KB_DELETE/AI_QUERY_KNOWLEDGE` | `app/core/permissions.py` | granted: admin all; manager and agent list/read/query; customer none |
+
+Six scaffolding comments named this phase and are discharged by it rather than left standing.
+`provider.py`'s *"Phase X adds the method with the provider that can answer it"*; ADR-027 Decision 1's
+*"Phase X adds `generate_embedding` together with the provider that can answer it"*; `celery_app.py`'s
+*"the queues that will join them are `reports` (S) and `knowledge` (X) — neither of which is declared
+here"*; `ai_analysis_service._execute`'s *"§22's `KNOWLEDGE_ANSWER` is already declared and
+unimplemented"*; ADR-031 Decision 8's *"§21's knowledge step waits for Phase X"*; and
+`docs/architecture.md` §7.
+
+**Decision 1 — §17's five methods are served by two protocols, and §23's answer is a sixth on the
+first.**
+
+`app/ai/provider.py` now declares three shapes. `Provider` is the super-protocol — one attribute,
+`name`, the value the ledger records — so `ai_service._run` can be typed against something both kinds
+of call satisfy, and a union would be a retry loop with a branch in it. `AIProvider` carries the
+generation methods. `EmbeddingProvider` carries `generate_embedding` alone.
+
+**ADR-027's deferral is discharged rather than reversed.** It refused to declare the method because
+`ClaudeProvider` would be forced to carry one it could never serve. That argument did not stop being
+true when the vendor arrived — it applies to *two* providers now, since neither Anthropic nor Groq
+publishes an embedding model — so the method lands on the protocol whose implementations can answer
+it. The alternative, one `AIProvider` with five methods and two implementations that raise
+`NotImplementedError` on one of them, is the stub this codebase refuses everywhere else.
+
+**§23's answer is not a seventh protocol.** It is prose plus the passages it used, which is a
+generation call and nothing else: every generation vendor serves it exactly as it serves the other
+four, through the same tool-call mechanism and the same `validate_output` gate. A protocol exists
+where implementations *differ*, and there is nothing here for one to differ about. §17's own word for
+its list is *"example"*, which is what makes the sixth name a compliance rather than a departure.
+
+`AIResult[T]` is **reused unchanged**. An embedding response reports `prompt_tokens` — the vendor's
+own count of what it embedded — `completion_tokens = 0` because nothing was generated, and
+`cost_usd` prices that with `output_per_mtok = 0` reproduced exactly. No new ledger mechanics, no new
+column, no second retry loop: a genuine second vendor runs through the identical `_run` that Phase T
+wrote for the first.
+
+**Decision 2 — the embedding request is a list of texts, not an `AIRequest`.** `AIRequest` carries an
+`instruction`, a `content_label`, and a `max_tokens`; an embedding call has none of the three, and
+handing it one would mean inventing an instruction for a model that does not read one. So
+`ai_service._run` is generalized over its request type — `_run[RequestT, T: BaseModel]` — and gains
+one keyword-only `model` parameter, because an embedding call is priced and recorded under
+`EMBEDDING_MODEL` rather than `AI_MODEL`. Everything else about `_run` is reused as-is: §17's retry
+policy, the jittered backoff, one ledger row per attempt, and the rule that it never commits.
+
+**Embedding is batched, one call per `EMBEDDING_BATCH_SIZE = 64` passages.** The vendor bills the
+same tokens either way, and one call is one timeout instead of forty — which matters because the
+caller is a Celery task ingesting a document rather than a person watching a spinner. One ledger row
+per batch is the honest unit: a batch is one request to a vendor and one line of spend.
+
+**Decision 3 — `is_published` is set by the ingestion worker, and §22 says why.** §22's pipeline ends
+*"document becomes searchable"*, and the model's own partial index is
+`is_published = true AND status = 'completed'`. So a successful ingestion sets `status = COMPLETED`,
+`processed_at`, `chunk_count`, and `is_published = true`.
+
+**No create-payload field and no publish route.** A field whose `false` value nothing can undo is a
+trap, and §22's checklist for this phase is *"document upload, extraction, chunking, embeddings,
+pgvector, semantic search, grounded generation, source references"* — withdrawing a document is not
+on it. `knowledge_document.py`'s `is_published` comment, which said *"not exposed before review"*, is
+rewritten to the truth: the column is independent of `status` so a later phase can pull a document
+out of retrieval without deleting it, and this phase does not build that.
+
+There is a second consequence, and it is the one that keeps publishing out of the audit trail. §34's
+list has exactly two knowledge actions, and this phase implements exactly those two — so *publishing*
+is not audited, and it is the worker's job rather than a route's precisely because a route that
+published would be an unaudited mutation performed by a person.
+
+**Decision 4 — three source kinds, and upload is its own route because it is a different transport.**
+
+| Route | `source_type` | What the server does |
+|---|---|---|
+| `POST /api/v1/knowledge` | `manual` or `url` | the text is already in the body, or is fetched and extracted |
+| `POST /api/v1/knowledge/upload` | `upload` | validate, store the object privately, extract in the worker |
+
+`KnowledgeDocumentCreate` takes `title` plus **exactly one** of `content` / `url`, enforced by a model
+validator, and `source_type` is a derived property rather than a field. **The kind follows from the
+body rather than being declared in it**, so the body cannot say two things and a client cannot send
+`source_type=manual` alongside a URL. The act is the same act either way — register a document and
+hand it to the ingestion pipeline — which is why it is one route and not two.
+
+Upload is a route of its own because it is a different transport: a multipart body the server must
+validate and store, which is the distinction `app/api/attachments.py` already draws and the reason
+`POST /knowledge` takes JSON and only JSON. **The original filename is not persisted**: the schema has
+no column for it, the required `title` is the document's name, and a stored client filename is a
+second name for the same thing that nothing reads.
+
+**Decision 5 — ingestion is a pipeline of pure functions plus one worker.** Three new modules, split
+by what each is allowed to touch:
+
+- **`app/services/document_text.py`** — no database, no network, no vendor. `extract`, `clean`, and
+  `chunk`, every one a pure function of its arguments, which is what lets the chunker be tested
+  without a fixture or an event loop and what makes re-chunking a function call rather than a
+  re-ingestion. Three readers for three formats: `pypdf` for PDF, a small `html.parser.HTMLParser`
+  subclass for HTML, and a decode for everything else in `READABLE_MEDIA_TYPES`. A type outside that
+  set is refused rather than decoded into mojibake, which is the answer an image deserves. The HTML
+  reader is hand-written for the reason `app/core/file_validation.py` gives for hand-writing signature
+  tables: the job is to walk a tag stream and drop `script` and `style`, BeautifulSoup does far more,
+  and a native-free dependency that does exactly this is cheaper than a library nobody can be sure is
+  not rendering something.
+- **`app/services/knowledge_service.py`** — the rules, and the only module that knows what a document
+  row means. `create_manual`, `create_from_url`, `create_upload`, `list_documents`, `get_document`,
+  `delete_document`, `enqueue_ingestion`, `run_ingestion`, `retrieve`, `answer`.
+- **`app/workers/knowledge_tasks.py`** — the `ai_tasks.py` shape exactly: a module-level `NullPool`
+  engine, `event_loop.run`, ids as strings, and **no retry at the task level** because §17's policy has
+  already been applied to every call the task makes. Redelivery is handled by the row's status.
+
+**Chunking targets ~800 estimated tokens with ~100 of overlap.** `CHUNK_TARGET_TOKENS` is the size a
+passage should be: too small and a passage cannot contain an answer, too large and one vector has to
+stand for several subjects at once. `CHUNK_OVERLAP_TOKENS` exists because a boundary is drawn by
+arithmetic rather than by meaning — a sentence stating a condition can sit exactly across one, and
+neither half alone would retrieve — and it is kept small because those tokens are embedded twice and
+billed twice. `_MAX_SEGMENT_TOKENS = CHUNK_TARGET_TOKENS - CHUNK_OVERLAP_TOKENS` is what keeps the
+invariant in `chunk` provable rather than merely likely.
+
+`token_count` holds an estimate from the four-characters-per-token ratio OpenAI publishes for English
+prose, and it is stated as what it is: **a number that sizes a chunk, never a bill.** The billed
+counts are the provider's own and the ledger records those. **`tiktoken` was considered and
+rejected**: it downloads its BPE file on first use, which would make the first ingestion of a fresh
+deployment depend on a third party's CDN being up, and a chunk boundary is not a place where
+exactness buys anything. The target is conservative by roughly four times against
+`text-embedding-3-small`'s 8191-token input limit, so an estimate that is wrong about a pathological
+document still cannot exceed it.
+
+`MAX_CHUNKS = 500` is the per-document cap, and reaching it **fails** the document rather than
+truncating it: a document silently indexed halfway answers nothing past the cut, and nothing would say
+so. The cap exists because a document that grew without one would spend an unbounded amount of the
+organization's money on embeddings in a single task.
+
+**Failure is contained, in both directions.** A provider that is down, a fetch that is refused, and a
+document that yields no text all end the same way: `status = FAILED` and an `error_message` holding
+the *reason*, never a provider's raw payload — `app/ai/errors.py`'s existing rule, and the reason is
+rendered to an admin, so it is the same class of text a client may see. And a document that yields no
+text is **an error rather than an empty success**: a scanned PDF extracts to nothing, and a
+`completed` document with no chunks would answer nothing and look fine.
+
+**A row that is not `pending` is skipped, and that is stricter than `run_analysis`.** There, `pending`
+and `processing` are both claimable; here one delivery owns the document, because the alternative is
+two workers appending the same chunks and colliding on `uq_knowledge_chunks_document_id_chunk_index`.
+A crash mid-ingestion therefore leaves a document in `processing` that nothing will pick up, and the
+recovery is the delete route and a fresh upload — which is honest, visible in the list, and not a
+silent half-ingestion. The row is committed as `processing` *before* the first network call, so
+"running" is a state another process can see, which is what makes a redelivered task a no-op rather
+than a second embedding bill.
+
+**Decision 6 — a feature that fetches a URL for a user is an SSRF primitive, and the guard is the
+address.** `app/services/url_fetch.py` fetches a `url` document. The API can reach addresses the
+person asking cannot: `http://localhost:8000/…` is the deployment's own admin surface,
+`http://169.254.169.254/` is a cloud metadata endpoint that hands out credentials, and
+`http://10.0.0.5/` is whatever is inside the private network the service runs in. So the guard is not
+an extra.
+
+**The guard checks the address, not the name.** A blocklist of hostnames is defeated by a name that
+resolves to `127.0.0.1`, and a check applied only to the URL the client sent is defeated by a public
+page that redirects to the metadata endpoint. So **every hop is resolved with `getaddrinfo` and every
+address it resolves to must be a globally routable one** — a name resolving to both a public and a
+private address is refused rather than gambled on, and refusal happens on the hop that offends rather
+than on the one that started it. Redirects are followed **by hand**, because a redirect is exactly
+where a checked URL becomes an unchecked one: `follow_redirects=True` would move the request before the
+guard could look at where it went. The hop count (`MAX_REDIRECTS = 5`), the body size
+(`MAX_URL_BYTES = 5 MiB`), and the final URL's length (`MAX_URL_CHARS = 1000`, the column's width) are
+all bounded, and the content type is checked against `document_text.READABLE_MEDIA_TYPES` — imported
+rather than restated, because two copies of "what can be read" is how a page comes to be fetched as a
+text document and refused as an unreadable one a second later.
+
+**What the guard does not close, stated plainly.** `getaddrinfo` and the connection that follows it are
+two lookups, so a name whose answer changes between them — DNS rebinding — can still reach a private
+address. Closing that needs the connection pinned to the address that was checked, which `httpx` does
+not expose; it would mean hand-rolling the socket. The guard therefore raises the cost of the attack
+from "spell a hostname" to "control a DNS server and win a race", and the honest thing is to write that
+in the module rather than to describe the guard as complete.
+
+**The fetch happens in the worker, never in the request.** The row is written with the URL as its
+reference and the worker fetches it under the guard, so a request cannot be made to wait on a
+stranger's server — §16's *"the API should not wait unnecessarily"* satisfied structurally, and the
+`201` is honest about it because `pending` is on the row.
+
+**Decision 7 — the question path retrieves, answers, or says the base lacks it.**
+
+`POST /api/v1/knowledge/search` embeds the question (`AIOperation.EMBED`, a real call in the request
+path, because a question is asked by a person who is waiting), searches published and completed chunks
+**scoped to the caller's tenant**, and then takes one of two branches.
+
+**Nothing clears the threshold → no answer call at all.** The response is §24's sentence, written by
+this server, with `sources: []` and **no ledger row** — `was_cached` would be a lie, because nothing
+answered from a cache and the call was never going to be made. Cheaper and strictly more honest: there
+is no model in the loop to answer from its priors, and nothing that could fabricate a citation.
+
+**Something clears it → one grounded call.** `prompts.KNOWLEDGE_INSTRUCTION` is §24's four rules made
+concrete, and `prompts.knowledge_content` numbers the passages into one fenced block. The threshold is
+`RETRIEVAL_MIN_SIMILARITY` and it is applied **by the query, not afterwards**: filtering the top `k` in
+Python would answer a different question — "of the `k` nearest, which clear the bar" — and would return
+fewer rows than asked for. An empty return therefore means "nothing was close enough" rather than
+"nothing was found", and the caller answers both the same way, because §24's refusal is the honest
+response to either.
+
+**The `EXISTS` guard exists so a tenant with nothing to search pays nothing.** `retrieve` asks
+`has_published_chunks` before it embeds anything: one indexed `LIMIT 1` read answers whether retrieval
+*could* return anything, so an organization that has never ingested a document never pays for a vector
+it cannot use. §53 names repeated AI calls as waste, and a call that cannot succeed is the purest form
+of it. `embedding IS NOT NULL` is part of that question rather than defensive — a chunk row is written
+before its vector is known, and a predicate this function did not share with `search_chunks` would let
+a tenant with only half-ingested rows pay for an embedding to search a set the search would then return
+nothing from.
+
+**Citations come from the retrieval, never from the model's prose.** `used_sources` are 1-based indices
+into the passages actually supplied; `_cite` maps them to those chunks and **drops any index outside
+that range with a log line**. Dropping rather than failing, because dropping is not fabricating and a
+model that cited `[7]` when handed three passages still produced a usable answer. The result is ordered
+by descending similarity rather than by the order the model typed, and de-duplicated — a passage named
+twice is one passage. `prompts._citable_passages`'s own comment notes that a passage's text can contain
+a line shaped like a citation number, which is what makes the mapping, rather than the prose, the thing
+§24's *"do not fabricate citations"* rests on.
+
+**No `grounded` boolean.** `sources == []` is the whole of that fact, and two fields for one fact is
+how they come to disagree.
+
+**Decision 8 — §21's drafts retrieve too, and retrieval there is fail-open.** `prompts.draft_content`
+gains a third block — the additive change ADR-031 Decision 8 forecast, landing in one function with its
+tests — and `_draft_request` passes it. The query is the ticket's own words, subject and description;
+sentiment is not in it, because retrieval is a similarity search over documents and "frustrated" is not
+a phrase a policy page contains.
+
+**A knowledge outage must not stop drafting.** `_knowledge_for_draft` catches `AIServiceError`, logs it
+with its type, and returns `[]`, so the draft proceeds on the two blocks that already exist. A drafting
+feature that dies when retrieval is down is worse than a draft that is merely less grounded. **The
+catch is deliberately narrower than `run_analysis`'s per-operation one**: a database error or a bug in
+the retrieval query still propagates, because swallowing those would hide a real fault behind a reply
+that merely cites nothing.
+
+**And a tenant with no published chunks makes no embedding call at all**, because `retrieve`'s guard
+runs first — which is what keeps every existing §21 test making exactly the calls it made before, and
+keeps a tenant that has never opened the knowledge base from paying for a vector they cannot use. The
+block is unnumbered: a draft cites nothing, so `[3]` in a reply an agent may send to a customer is
+noise at best and a leaked internal reference at worst. `_DRAFT_LABEL` widened to name the third block,
+with "any" rather than "the" because the overwhelming majority of drafts have none.
+
+**Decision 9 — six routes, one new error code, no new permission.**
+
+| Route | Capability | Notes |
+|---|---|---|
+| `POST /api/v1/knowledge` | `KB_UPLOAD` + `limit_upload` | 201 + `KnowledgeDocumentRead`; queues ingestion; audits `KNOWLEDGE_DOCUMENT_CREATED` |
+| `POST /api/v1/knowledge/upload` | `KB_UPLOAD` + `limit_upload` | multipart; the object is stored before the row commits |
+| `GET /api/v1/knowledge` | `KB_LIST` | paginated; `q` filters the title |
+| `GET /api/v1/knowledge/{document_id}` | `KB_LIST` | the matrix has no "view document" row, so reading takes the list capability — as `GET /customers/{id}` does |
+| `DELETE /api/v1/knowledge/{document_id}` | `KB_DELETE` | deletes the row (chunks cascade by the FK) **and** the stored object; audits `KNOWLEDGE_DOCUMENT_DELETED` |
+| `POST /api/v1/knowledge/search` | `AI_QUERY_KNOWLEDGE` + `limit_ai` | the grounded answer |
+
+**A query writes no audit row**, because §34's list has no knowledge-query entry and a search is not a
+mutation. §3's rows for all four knowledge capabilities are already in the role sets, so
+`app/core/permissions.py` does not change and `tests/unit/test_permissions.py` proves the matrix still
+matches `docs/requirements.md`.
+
+**`DELETE` is the first delete route in the system, and its ordering is deliberate.** The object goes
+first, then the rows: an object whose row is gone is unreachable and a lifecycle rule can collect it,
+while a row whose object is gone is a document an admin can see and cannot re-ingest. Storage refusing
+with a 503 means nothing is deleted, so the deleting does not half-happen. Only an `upload` document
+has an object — a `manual` one has no `source_reference`, and a `url` one has the client's own URL,
+which is not storage's to remove. `delete_object` is idempotent because S3's delete is, which suits the
+one caller: a retried deletion should not fail the request that is trying to clean up.
+
+**`ErrorCode.KNOWLEDGE_DOCUMENT_NOT_FOUND` is added**, the one gap in a vocabulary whose own docstring
+claims to be complete. A document in another tenant is a 404, indistinguishable from one that never
+existed — ADR-009's rule.
+
+`GET /knowledge?q=` filters the title with an `ILIKE` and is the consumer for the trgm index Phase D
+declared as *"Title search in the admin list view"*; without it, that index is a promise nothing keeps.
+
+**Decision 10 — one dependency and six settings, each with a consumer.** **`pypdf`** is one pure-Python
+dependency, for the case §22 names first: *"product documentation"* and *"refund policies"* are PDFs,
+and `file_validation.ALLOWED` already admits `application/pdf`, so a user will upload one.
+`text/markdown` joins `ALLOWED` beside `text/plain` (`.md`/`.markdown`) — a policy written in markdown
+is plain text, the IANA registry gives it its own type, and the attachment table inherits the entry
+because the table is shared, which is stated rather than accidental.
+
+Exactly six settings, and the count is a decision:
+
+- **`EMBEDDING_PROVIDER`** (`Literal["openai", "fake"]`), **`EMBEDDING_API_KEY`**, **`EMBEDDING_MODEL`** —
+  the `AI_*` trio mirrored, and for the reason that block already gives: *"One key, not one per vendor…
+  A second variable would be a setting one of the two providers never reads."* An embedding vendor is
+  genuinely a second vendor (ADR-008), so it needs its own three. `EMBEDDING_API_KEY` joins the
+  `_blank_credential_is_absent` validator; `fake` is gated to `ENVIRONMENT=test` exactly as
+  `AI_PROVIDER` is (§60); and the model/provider pairing joins `_the_model_is_served_by_the_provider`,
+  which is the one place a 401 becomes a startup error rather than a failed ingestion.
+- **`RETRIEVAL_TOP_K = 5`** and **`RETRIEVAL_MIN_SIMILARITY = 0.3`** — §24's threshold is a policy about
+  when this product is allowed to answer, and where a policy lives is a decision worth stating.
+  `KnowledgeQuestion` therefore has **no `top_k`**: a client that could raise it would be spending the
+  organization's budget on a bigger context, and the number that decides whether an answer is allowed
+  at all is not one a caller should be able to move.
+- **`MAX_KNOWLEDGE_DOCUMENT_BYTES = 10 MiB`** — the upload ceiling, mirroring `MAX_ATTACHMENT_BYTES`,
+  and the knob that bounds what one document can cost to embed.
+
+`app/ai/pricing.py` gains `text-embedding-3-small` as `ModelRate("openai", Decimal("0.02"),
+Decimal("0"))`, so `cost_usd` prices an embedding call with no new arithmetic. `.env.example`'s
+`--- AI ---` block gains the three keys with no values.
+
+**Decision 11 — the vendor is one module, and the one status it reads differently matters.**
+`app/ai/openai_embedding.py` follows `app/ai/groq.py` exactly: a per-loop cached `httpx` client, no SDK,
+this project's own timeout, `max_retries=0` because the retry loop is `ai_service`'s, a `429`/`5xx`/timeout
+mapped to `AITransientError` and anything else to `AIPermanentError`, a vendor's own error message never
+passed along, and `validate_output(Embedding, payload)` as the single §18 gate.
+
+**A `429` whose `error.code` is `insufficient_quota` is permanent, and it is not a detail.** Groq's 429
+means "slow down" and retrying is exactly right; this one means the account is out of credit and cannot
+succeed however long the caller waits, so treating it as transient would spend the whole attempt budget —
+three sleeps and three refused requests — to arrive at the same failure. The code is checked before the
+status, and one allowlist query buys a faster and more accurate failure.
+
+**The response's `index` is what orders the vectors, and the count is checked against the number of
+texts sent** — the one shape check a schema validator cannot make, because it cannot see the request. A
+caller is about to write those vectors against the passages it split a document into, and one vector
+attached to the wrong passage is an answer that reads fluently and cites the wrong policy; nothing
+downstream could detect it. `_embed`'s `zip(..., strict=True)` is the second half of that guarantee.
+
+`Embedding` lives in `app/schemas/knowledge.py` rather than beside the four generation schemas, and the
+reason is its validator: the one thing that can be wrong with a vector list is its width, the width is
+a fact about this package's storage, and importing `EMBEDDING_DIMENSIONS` makes the two declarations
+one. A 3072-dimension vector is an `AIOutputError` here rather than a driver error at insert. Per
+`_failure_summary`'s rule the number is on the chained `ValidationError` rather than in the reason, so
+the failure reads `did not match Embedding: <root>: value_error` and the cause says *"a vector was 3072
+wide; the column is 1536"*.
+
+**No fence on an embedding call, and its absence is deliberate.** The generation providers wrap
+untrusted text because a document can contain instructions and a language model reads instructions. An
+embedding model does not: the `input` field is data to be mapped into a vector, and there is no
+instruction in the request for a document to hijack. Applying `as_untrusted` here would put fence
+markers *into* the embedded text, which would change the vector for no gain.
+
+`FakeEmbeddingProvider` joins `app/ai/fake.py` with **two modes**, because the two answer questions
+that need different things from a vector. Hashed — every text embedded by a deterministic function of
+its own bytes — is the right double for everything about ingestion, where the property is that the rows
+were written in order with the right width and the model's name on them, and the wrong one for
+retrieval, where a test would be asserting a property a hash cannot have. Scripted — a mapping from
+text to a chosen vector — is how a test makes similarity a *decision*. A scripted text that is not in
+the mapping **raises** rather than falling back to the hash, because a silent fallback is what turns a
+ranking assertion into a coincidence.
+
+**What this deliberately does not do.**
+
+- **No migration, and no new enum member.** §34's list has exactly two knowledge actions and this phase
+  implements exactly those two, so publishing is not audited — which is why it is the worker's job and
+  not a route's.
+- **No unpublish, no rename, no `PATCH`.** `is_published` is written once, by the worker, when ingestion
+  succeeds; withdrawing a document means deleting it, which is audited. The column's independence from
+  `status` is what a later phase's editorial switch is for.
+- **No re-embed sweep.** `embedding_model` on each chunk is what makes one possible after a model
+  change; this phase writes the column and does not read it.
+- **No OCR.** A scanned PDF extracts to nothing, and that lands as a *failed* document whose reason says
+  the extraction produced no text — not as an empty document that answers nothing and looks fine.
+- **No hybrid search, no re-ranking, no query rewriting.** One vector query, one threshold, one prompt —
+  §22's flow, and the spec's.
+- **No streaming answers, no answer cache.** §23 asks for an answer and its sources.
+- **No document text in the read representation.** `content` is retained so a document can be
+  re-chunked, and `source_reference` is withheld because for an upload it is an object-storage key —
+  the argument `app/schemas/attachment.py` makes about `storage_key` applies unchanged. A document's
+  readable surface is its title and its chunks, and a list of twenty documents should not carry twenty
+  documents' worth of text.
+- **No conversation-aware question rewriting.** §23 asks a question; the retrieval does not read the
+  ticket.
+
+**Cost.** One dependency (`pypdf`), no migration, six settings, and one new error code. The standing
+cost is the one a second vendor always carries: `Settings` now validates **two** model/provider pairings
+rather than one, so a deployment can be misconfigured in a way that only the embedding half notices —
+which is why the pairing check is a startup error rather than a failed first ingestion. The other
+standing cost is the chunker's two numbers, which decide this feature's retrieval quality and are
+therefore the two worth arguing about; they are module constants rather than settings because
+re-chunking after a strategy change is possible at all only because the model retains `content`.
+
+**Verification.** The suite is **1584 tests**, all passing — 1398 at ADR-031's close, so 186 for this
+phase's own surface. `alembic check` reports *"No new upgrade operations detected"*, **the fourth phase
+in a row** to do so and the mechanical proof of Decision 5's claim: every column, index, and enum member
+this phase writes — both tables, the HNSW index, `ProcessingStatus`, `DocumentSourceType`,
+`AIOperation.EMBED`, `AIOperation.KNOWLEDGE_ANSWER`, and the two `AuditAction`s — has existed since
+Phase D. `ruff check` is clean, `ruff format --check` covers 212 files, and `mypy app alembic scripts`
+covers 137.
+
+**The full suite earned its runtime by failing.** The first complete run reported **two failures** in
+`tests/unit/test_ai_analysis_service.py`: both call `_draft_request` directly, Phase X added its third
+parameter, and neither had been updated — `TypeError: _draft_request() missing 1 required positional
+argument: 'knowledge'`. They are the failing kind of test rather than the missing kind, which is the
+better failure, but the phase's own files were green and only the whole-suite run reached them. Both
+were updated to build all three blocks and to vary the passage list with the conversation, since it is
+the other one that may legitimately be empty; the file is green at 13 tests, and the suite above is the
+re-run.
+
+**Three breaks were made deliberately, and each failed the tests that cover it.** They are worth
+recording individually, because they fail in three different ways.
+
+*The tenant predicate removed from the retrieval query.* Deleting **both** arms — the chunk's
+`organization_id` and the document's — failed **exactly one test of 55**,
+`test_a_nearest_neighbour_in_another_tenant_is_never_returned`, and it failed on the assertion the phase
+exists for: `assert [source["document_id"] for source in body["sources"]] == [north_document]` →
+*At index 0 diff: `<southwind's id>` != `<northwind's id>`*. The other tenant's passage is not merely
+present, it is **first**, because that test scripts its vectors so that it is the nearest neighbour in
+the whole table by arithmetic. Worth recording alongside: removing **either arm alone** still passes.
+The two clauses are redundant on purpose — a chunk carries its own `organization_id` so a
+tenant-filtered search needs no join — and that redundancy is exactly what makes a single-arm break
+survivable, which is why the break recorded here removes both.
+
+*The citation range guard removed.* Replacing `_cite`'s `1 <= number <= len(matches)` check with a direct
+`matches[number - 1]` — the naive implementation that trusts the model — failed **two tests of 40** in
+`tests/api/test_knowledge.py`, both with `IndexError: list index out of range` at the mapping, and both
+logged as `unhandled_exception` on `POST /api/v1/knowledge/search`. `test_a_question_with_a_retrieved_
+passage_is_answered_and_cited` is the one written for it: its model names passages `[1, 9]` when there is
+one passage. Decision 7 says dropping is not fabricating and that a model miscounting still produced a
+usable answer; this is what the alternative looks like from a client — a `500` instead of a citation.
+
+*The `EXISTS` guard removed from `retrieve`.* Letting every question embed before checking whether the
+tenant has anything published failed **four tests of 57**, across two files: the guard's own
+`test_an_organization_with_no_published_chunks_makes_no_embedding_call` and
+`test_the_prompt_is_the_ticket_alone_when_there_is_nothing_to_retrieve` in
+`tests/integration/test_knowledge_draft_grounding.py`, and
+`test_a_question_with_nothing_published_gets_the_specifications_sentence` and
+`test_a_manager_and_an_agent_may_list_and_ask_but_not_add_or_delete` in `tests/api/test_knowledge.py`.
+The failure mode is the one worth naming: in the suite `EMBEDDING_PROVIDER=openai` with no key, so the
+unexpected call does not merely cost money — it fails, the log line is
+`ai_call_failed ... reason='EMBEDDING_API_KEY is not configured'`, and two tests that were asserting a
+refusal now assert a `503`. **An `EXISTS` question that leaks a provider call turns a refusal into an
+outage**, which is a stronger argument for Decision 7 than cost alone.
+
+Each break was reverted, and the reverts confirmed by re-running the five knowledge files green —
+**70 tests, 0 failures**.
+
+**The live end-to-end did not run, and this is why.** `.env` holds a Groq key and no embedding key:
+`EMBEDDING_API_KEY` is absent, and neither Anthropic nor Groq publishes an embedding model, so there was
+no vendor to make a real vector with. `scripts/phase_x_walkthrough.py` was still exercised — it checks
+the key before it opens a socket — and it printed its own refusal and exited `0`:
+
+    EMBEDDING_API_KEY is not set, so there is no live retrieval to walk through.
+
+**`EMBEDDING_PROVIDER=fake` was available and is deliberately not what this is.** It would have kept the
+upload, the object storage, the worker, the chunker, the pgvector column, the ledger, and every route
+real — and the *ranking* would still have been a hash of the text, so an answer that came out right
+would have come out right by luck. The suite is where that configuration belongs, because there the
+vectors are scripted and the ranking is a decision; here it would be a demonstration of nothing. So
+this document claims no live RAG run, and the retrieval properties above rest on the tests that assert
+them with chosen vectors rather than on a transcript.
+
+**The PDF fixture is asserted where it can be.** Both the unit tests and the walkthrough build a PDF by
+hand rather than committing a binary, for the reason `app/core/file_validation.py` gives about signature
+tables: one page of extractable text is what is needed, and a checked-in PDF is a file nobody can review,
+diff, or explain. `tests/unit/test_document_text.py` reads its own fixture back through `pypdf` and is
+part of the 1584; the walkthrough asserts the same thing before it uploads, because a hand-built PDF
+that one reader opens and another does not is the sort of fixture that fails at the pipeline rather than
+at the assertion — so `201` alone would not be evidence that the extraction had anything to extract.
 
 

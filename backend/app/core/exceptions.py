@@ -72,6 +72,11 @@ class ErrorCode(StrEnum):
     # not an `ai_draft`. Telling a caller which of the three it hit would confirm that a
     # message id it guessed exists and is not a draft (ADR-009).
     AI_DRAFT_NOT_FOUND = "AI_DRAFT_NOT_FOUND"
+    # §22's document, and the one knowledge code that was missing. A document in another
+    # tenant is reported as this rather than as a denial, for the reason every `*_NOT_FOUND`
+    # here works that way: confirming that an id exists somewhere else is a fact about another
+    # tenant's data.
+    KNOWLEDGE_DOCUMENT_NOT_FOUND = "KNOWLEDGE_DOCUMENT_NOT_FOUND"
 
     # --- Transport-level ---------------------------------------------------
     # Raised by the framework, not by domain code: the *route* does not exist, or the
@@ -206,6 +211,7 @@ _NOT_FOUND_MESSAGES: dict[ErrorCode, str] = {
     ErrorCode.SLA_POLICY_NOT_FOUND: "No SLA policy is configured for that priority.",
     ErrorCode.NOTIFICATION_NOT_FOUND: "Notification not found.",
     ErrorCode.AI_DRAFT_NOT_FOUND: "Draft not found.",
+    ErrorCode.KNOWLEDGE_DOCUMENT_NOT_FOUND: "Knowledge document not found.",
 }
 
 

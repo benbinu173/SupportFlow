@@ -60,6 +60,7 @@ from app.schemas.ai import (
     SentimentResult,
     SuggestedReply,
 )
+from app.schemas.knowledge import KnowledgeAnswer
 
 logger = structlog.get_logger(__name__)
 
@@ -328,6 +329,18 @@ class GroqProvider:
             description=("Record a draft reply for the support agent to review and send."),
         )
 
+    async def answer_question(self, request: AIRequest) -> AIResult[KnowledgeAnswer]:
+        """§23 — a grounded answer, and the passages it says it used."""
+        return await self._structured(
+            request,
+            KnowledgeAnswer,
+            tool="record_answer",
+            description=(
+                "Record an answer to the question, grounded in the passages above, and the "
+                "numbers of the passages the answer used."
+            ),
+        )
+
     async def _structured[T: BaseModel](
         self,
         request: AIRequest,
@@ -338,12 +351,12 @@ class GroqProvider:
     ) -> AIResult[T]:
         """One call, and the only code path in this module that talks to the network.
 
-        The same reduction `claude.py` makes: the four operations differ in their tool name,
-        their schema, and the sentence describing the tool, and nothing else. So there is one
-        implementation of the timeout, the translation, the finish-reason handling, and the
-        validation — and, because the tool *names* are identical across both providers, a
-        deployment can be switched between vendors without anything that reads a ledger or a
-        log line learning a new vocabulary.
+        The same reduction `claude.py` makes: the five generation operations differ in their
+        tool name, their schema, and the sentence describing the tool, and nothing else. So
+        there is one implementation of the timeout, the translation, the finish-reason
+        handling, and the validation — and, because the tool *names* are identical across both
+        providers, a deployment can be switched between vendors without anything that reads a
+        ledger or a log line learning a new vocabulary.
         """
         client = _shared_client()
 

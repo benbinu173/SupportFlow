@@ -16,13 +16,15 @@ than as "unpriced" — a wrong number rather than a missing one, which is the wo
 Adding a model is therefore a code change, and that is the point: the rate has to come from
 somewhere, and this is where it is written down.
 
-**Prices are USD per million tokens**, as published, from two sources. Anthropic's model
+**Prices are USD per million tokens**, as published, from three sources. Anthropic's model
 pricing page, <https://platform.claude.com/docs/en/about-claude/pricing>, read **2026-09-17**
 — Sonnet 5's $2/$10 was announced as introductory pricing through 2026-08-31 and that page
-now records it as standard, so the scheduled increase did not happen. And Groq's model page,
-<https://console.groq.com/docs/model/openai/gpt-oss-120b>, read **2026-09-22**. That is
-exactly the kind of change that would silently corrupt a running ledger if the rate were read
-from the provider at display time instead of recorded at write time.
+now records it as standard, so the scheduled increase did not happen. Groq's model page,
+<https://console.groq.com/docs/model/openai/gpt-oss-120b>, read **2026-09-22**. And OpenAI's
+pricing page, <https://platform.openai.com/docs/pricing>, read **2026-10-04**, for the one
+embedding model Phase X can call. That is exactly the kind of change that would silently
+corrupt a running ledger if the rate were read from the provider at display time instead of
+recorded at write time.
 
 **A rate names its provider, and that is load-bearing.** Before there were two vendors a model
 name was enough to identify a rate, because every name in the table belonged to the same one.
@@ -78,6 +80,18 @@ class ModelRate:
 # same rule `Settings` follows about unused keys. Groq is reachable with eleven models and
 # this table carries one of them, for the same reason — `openai/gpt-oss-120b` is the one whose
 # tool calling this project has actually verified.
+#
+# **The last row is an embedding model, and its output rate of zero is a fact rather than an
+# unknown.** An embedding call has no completion tokens — the same input produces the same
+# vector, so there is nothing generated to bill — and OpenAI's page quotes one number for it.
+# That is a different thing from the zero this module refuses elsewhere, which is the price we
+# do not know. The two are distinguished by being written down in different places: an unknown
+# price raises from `rate_for`, and this one multiplies out to the input cost alone.
+#
+# It is also why `EMBEDDING_MODEL` can be validated by exactly the same two checks `AI_MODEL`
+# is — priced at all, and served by the provider it is configured against. Phase X added this
+# row and no arithmetic: `cost_usd` already computes `prompt * input + completion * output`,
+# and a zero in the second term is a zero.
 RATES: dict[str, ModelRate] = {
     "claude-sonnet-5": ModelRate("anthropic", Decimal("2"), Decimal("10")),
     "claude-opus-5": ModelRate("anthropic", Decimal("5"), Decimal("25")),
@@ -85,6 +99,7 @@ RATES: dict[str, ModelRate] = {
     "claude-fable-5-1": ModelRate("anthropic", Decimal("10"), Decimal("50")),
     "claude-fable-5": ModelRate("anthropic", Decimal("10"), Decimal("50")),
     "openai/gpt-oss-120b": ModelRate("groq", Decimal("0.15"), Decimal("0.60")),
+    "text-embedding-3-small": ModelRate("openai", Decimal("0.02"), Decimal("0")),
 }
 
 

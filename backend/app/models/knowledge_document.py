@@ -97,8 +97,13 @@ class KnowledgeDocument(UUIDPrimaryKeyMixin, OrganizationScopedMixin, TimestampM
         Integer, nullable=False, default=0, server_default=text("0")
     )
 
-    # Editorial gate, independent of processing state. Defaults to false so a
-    # freshly ingested document is not exposed to retrieval before review.
+    # Editorial gate, independent of processing state. **The ingestion worker sets it, and it
+    # is set true**, together with `status = completed` — §22's pipeline ends *"document
+    # becomes searchable"*, and the partial index above is exactly `is_published = true AND
+    # status = 'completed'`, so a document that ingested is a document retrieval can return.
+    # The two columns are separate rather than one because a later phase can withdraw a
+    # document from retrieval without deleting it; Phase X writes both and builds no such
+    # route.
     is_published: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )

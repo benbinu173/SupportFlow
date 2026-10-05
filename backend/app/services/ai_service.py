@@ -6,11 +6,20 @@ two live in `app/ai/` and `app/core/config.py`. The other four are this module, 
 here rather than in the provider because they are **policy** and policy applied per vendor
 is policy with as many implementations as there are vendors.
 
-**Four entry points, one core.** §17's four operations each get a function, because the
+**Six entry points, one core.** §17's operations and §23's each get a function, because the
 schema a caller wants is a property of the operation and the provider already knows it — a
 generic `call(output=...)` would ask the caller to name a schema the provider cannot vary,
 and would need a cast on the way in and another on the way out. `_run` is that generic
-function, and the four public ones are three lines each over it.
+function, and the six public ones are three lines each over it.
+
+**`_run` is generic in two directions, and the embedding call is why.** It is generic over the
+operation's schema `T`, as it always was, and now over the request type `RequestT` — because
+`EmbeddingProvider.generate_embedding` takes a list of texts rather than an `AIRequest`; see
+`app/ai/provider.py` for why it does. The retry policy, the jittered backoff, the per-attempt
+ledger row, the `cost_usd` call, and the refusal to commit are written once and serve all six,
+which is the strongest available evidence that the two protocols were split in the right
+place. The one thing that varies is `model`, which is why it is a parameter: an embedding call
+is priced and recorded under `EMBEDDING_MODEL` and the other five under `AI_MODEL`.
 
 **A failed call is still recorded.** `AIUsage`'s own docstring: *"A failed call still
 consumed quota and may still have been billed, so it is recorded rather than dropped."*
@@ -48,7 +57,7 @@ unweakened. The two kinds differ in what they *say*, not in what they can carry:
 `WorkerContext` has no role and no permissions, so it cannot authorize anything, and these
 functions do not ask it to.
 
-**The four public functions return `AIResult[T]`, not `T`.** An `AIAnalysis` row records the
+**The public functions return `AIResult[T]`, not `T`.** An `AIAnalysis` row records the
 prompt and completion tokens a call was billed, and the only object that knows them is the
 provider's `AIResult` — this module holds it and would otherwise discard it, leaving three
 declared columns permanently empty. Callers read `.value`. The alternative, re-querying the
@@ -68,10 +77,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.claude import ClaudeProvider
 from app.ai.errors import AIError, AITransientError
-from app.ai.fake import FakeProvider
+from app.ai.fake import FakeEmbeddingProvider, FakeProvider
 from app.ai.groq import GroqProvider
+from app.ai.openai_embedding import OpenAIEmbeddingProvider
 from app.ai.pricing import cost_usd
-from app.ai.provider import AIProvider, AIRequest, AIResult
+from app.ai.provider import (
+    AIProvider,
+    AIRequest,
+    AIResult,
+    EmbeddingProvider,
+    Provider,
+)
 from app.core.config import Settings, get_settings
 from app.core.exceptions import AIServiceError
 from app.core.tenancy import TenantContext, WorkerContext
@@ -83,6 +99,7 @@ from app.schemas.ai import (
     SentimentResult,
     SuggestedReply,
 )
+from app.schemas.knowledge import Embedding, KnowledgeAnswer
 
 logger = structlog.get_logger(__name__)
 
@@ -118,6 +135,31 @@ _PROVIDERS: dict[str, Callable[[], AIProvider]] = {
     "anthropic": ClaudeProvider,
     "groq": GroqProvider,
     "fake": FakeProvider,
+}
+
+
+def _embedding_provider() -> EmbeddingProvider:
+    """The configured embedding provider — a second vendor, and a second table.
+
+    `_provider`'s shape exactly, and a second table rather than an entry in the first because
+    the two protocols have no implementation in common: `ClaudeProvider` cannot embed and
+    `OpenAIEmbeddingProvider` cannot generate, so a single table would be a table whose values
+    fail the type of whichever lookup did not select them. That is ADR-008's split arriving at
+    the one place a vendor is chosen.
+
+    A test that wants scripted vectors patches this function, the seam `_provider` already
+    offers. `EMBEDDING_PROVIDER=fake` is also honoured, and `Settings` refuses it outside the
+    test environment for §60's reason.
+    """
+    return _EMBEDDING_PROVIDERS[get_settings().EMBEDDING_PROVIDER]()
+
+
+#: The two implementations of §22's protocol. `openai` is the real one — neither Anthropic nor
+#: Groq publishes an embedding model — and `fake` is the hashed or scripted double in
+#: `app/ai/fake.py`, which `Settings` keeps out of a real deployment.
+_EMBEDDING_PROVIDERS: dict[str, Callable[[], EmbeddingProvider]] = {
+    "openai": OpenAIEmbeddingProvider,
+    "fake": FakeEmbeddingProvider,
 }
 
 
@@ -242,15 +284,16 @@ def record_cache_hit(
     )
 
 
-async def _run[T: BaseModel](
+async def _run[RequestT, T: BaseModel](
     session: AsyncSession,
     context: TenantContext | WorkerContext,
     *,
     operation: AIOperation,
-    provider: AIProvider,
-    call: Callable[[AIRequest], Awaitable[AIResult[T]]],
-    request: AIRequest,
+    provider: Provider,
+    call: Callable[[RequestT], Awaitable[AIResult[T]]],
+    request: RequestT,
     ticket_id: uuid.UUID | None,
+    model: str | None = None,
 ) -> AIResult[T]:
     """Call once, retry the retryable, ledger every attempt, and return the result.
 
@@ -266,9 +309,20 @@ async def _run[T: BaseModel](
     get the same unusable answer — §53 names "repeated AI calls" as waste, and paying twice
     for one malformed answer is precisely that. Both fail on the first attempt and the
     ledger says so.
+
+    **`model` defaults to the generation model, and the one caller that passes it is the
+    embedding one.** `_stage_usage` prices the row from this string, so it has to be the model
+    the vendor actually billed — recording an embedding call under `AI_MODEL` would put a rate
+    that never applied into a column a cost report sums. It is a parameter rather than a
+    `get_settings()` call inside the function so that reading it and using it are the same act.
+
+    **`provider` is typed as `Provider`, not `AIProvider`.** The super-protocol declares `name`
+    and nothing else, which is exactly what this loop needs from a provider it did not choose.
+    A union of the two protocols would work and would be a loop with a branch in it; this way
+    the embedding call and the five generation calls run the identical code.
     """
     settings = get_settings()
-    model = settings.AI_MODEL
+    model = model or settings.AI_MODEL
 
     for attempt in range(1, settings.AI_MAX_ATTEMPTS + 1):
         started = time.perf_counter()
@@ -472,4 +526,84 @@ async def generate_response(
         call=provider.generate_response,
         request=request,
         ticket_id=ticket_id,
+    )
+
+
+async def answer_question(
+    session: AsyncSession,
+    context: TenantContext | WorkerContext,
+    request: AIRequest,
+    *,
+    ticket_id: uuid.UUID | None = None,
+) -> AIResult[KnowledgeAnswer]:
+    """§23 — answer a question from passages §22 retrieved, naming the ones it used.
+
+    **The passages are already retrieved when this is called**, and that is the whole of the
+    division of labour: searching is `knowledge_service`'s, and it does it before deciding
+    whether a call is worth making at all — an organization with nothing above the similarity
+    threshold never reaches this function, and never pays for an answer from a model that has
+    nothing to answer from. So this is one more schema behind one more tool name, and §24's
+    grounding is a property of the `AIRequest` it is handed rather than of anything here.
+
+    `used_sources` comes back as the model wrote it and is **not** checked here. The indices
+    refer to the passages the caller numbered into `request.content`, and only the caller holds
+    that list — so resolving an index into a chunk is the caller's job for the same reason
+    `_embedding_provider` is this module's: the knowledge is where the data is.
+
+    The caller commits the ledger row this stages, including when it raises.
+    """
+    provider = _provider()
+    return await _run(
+        session,
+        context,
+        operation=AIOperation.KNOWLEDGE_ANSWER,
+        provider=provider,
+        call=provider.answer_question,
+        request=request,
+        ticket_id=ticket_id,
+    )
+
+
+async def embed_texts(
+    session: AsyncSession,
+    context: TenantContext | WorkerContext,
+    texts: list[str],
+    *,
+    ticket_id: uuid.UUID | None = None,
+) -> AIResult[Embedding]:
+    """§22 — the vectors for `texts`, one per text, in the order they were given.
+
+    **A list, not one text at a time**, for the reason the protocol gives: the vendor bills the
+    same tokens either way and one call is one timeout instead of forty. The caller is a Celery
+    task ingesting a document rather than a person watching a spinner, and a document with
+    forty chunks would otherwise be forty round trips with §17's retry policy applied to each.
+
+    **This is the one call priced under `EMBEDDING_MODEL`**, which is why `model` is passed
+    rather than defaulted. `completion_tokens` is zero because nothing was generated — a fact
+    about embeddings and not a missing count — and `app/ai/pricing.py` records the same fact as
+    a zero output rate, so `cost_usd` reproduces the input charge alone with no new arithmetic.
+
+    **`Embedding` is the schema, and it is validated like any other provider output**, which
+    is what refuses a 3072-dimension vector here rather than letting a driver error surface at
+    insert. The reason names the schema (`did not match Embedding`) and the number is on the
+    chained `ValidationError`, because `provider._failure_summary` reports `loc` and `type` and
+    never a Pydantic `msg` — see `app/schemas/knowledge.py`. The count check — one vector per
+    text — is the provider's, because it is the only layer that still holds the request.
+
+    No fence, and unlike the five generation calls that is deliberate rather than an omission;
+    `app/ai/openai_embedding.py`'s docstring gives the reason.
+
+    The caller commits the ledger row this stages, including when it raises.
+    """
+    settings = get_settings()
+    provider = _embedding_provider()
+    return await _run(
+        session,
+        context,
+        operation=AIOperation.EMBED,
+        provider=provider,
+        call=provider.generate_embedding,
+        request=texts,
+        ticket_id=ticket_id,
+        model=settings.EMBEDDING_MODEL,
     )

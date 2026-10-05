@@ -62,12 +62,12 @@ api:
 web:
 	cd frontend && npm run dev
 
-# `-Q notifications,sla,ai` and not just `-Q notifications`: a worker consumes precisely the
-# queues it names, so omitting one leaves its tasks sitting in Redis forever with no error on
-# either side. The wiring test asserts this list equals `task_routes`.
+# `-Q notifications,sla,ai,knowledge` and not just `-Q notifications`: a worker consumes
+# precisely the queues it names, so omitting one leaves its tasks sitting in Redis forever
+# with no error on either side. The wiring test asserts this list equals `task_routes`.
 .PHONY: worker
 worker:
-	cd backend && .venv/Scripts/python.exe -m celery -A app.workers.celery_app worker --pool=solo --loglevel=info -Q notifications,sla,ai
+	cd backend && .venv/Scripts/python.exe -m celery -A app.workers.celery_app worker --pool=solo --loglevel=info -Q notifications,sla,ai,knowledge
 
 # A second process, and there must be exactly one of it. Beat publishes on a schedule; it
 # consumes nothing, so it takes no pool flag and no `-Q`. Two beats each fire every entry,

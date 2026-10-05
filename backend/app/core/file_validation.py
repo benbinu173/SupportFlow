@@ -70,6 +70,13 @@ ALLOWED: Mapping[str, AllowedType] = {
         # declared type both say text *and* the bytes match no other type's signature,
         # so renaming a PNG to .txt does not get it in as text.
         AllowedType("text/plain", (), frozenset({".txt", ".log", ".csv"})),
+        # Markdown, added in Phase X beside the type above because §22's documents are the
+        # case *and* because the table is shared: `.md` now uploads as a ticket attachment
+        # too. That is a consequence rather than an oversight — a markdown file is plain
+        # text, `text/markdown` is the type the IANA registry gives it, and a table that
+        # refused it for attachments to serve knowledge documents would be two tables.
+        # Like `text/plain` it has no signature, so the same three-way agreement applies.
+        AllowedType("text/markdown", (), frozenset({".md", ".markdown"})),
     )
 }
 
@@ -94,6 +101,23 @@ class UnsupportedUpload(Exception):
     The reason is never returned to the client: which check failed is of no use to a
     legitimate caller and of considerable use to someone probing the validator.
     """
+
+
+def extension_of(filename: str) -> str:
+    """The lowercase extension of `filename`'s final component, with its dot, or `""`.
+
+    The Windows basename is taken first, for `sanitize_filename`'s reason: on Windows a
+    `PurePosixPath` leaves `C:\\Users\\me\\shot.png` intact as one component whose suffix is
+    `.png` only by luck, and `C:\\Users\\me.d\\shot` would report `.d`. Required rather than
+    optional on a POSIX filesystem too — a filename is a string a client chose, and one that
+    arrives with a path on it is ordinary rather than hostile.
+
+    Public because two callers need the same answer for two purposes: `validate` compares it
+    against the allowlist, and `app/services/knowledge_service.py` appends it to an object key
+    so the stored file's type survives into the worker that has to read it. One function, so a
+    change to what "the extension" means cannot move in only one of them.
+    """
+    return PurePosixPath(PureWindowsPath(filename).name).suffix.lower()
 
 
 def normalize_content_type(declared: str | None) -> str:
@@ -141,7 +165,7 @@ def validate(*, filename: str, declared_content_type: str | None, head: bytes) -
     The caller streams the file for its size separately, because size is a fact about
     the whole body and this function only sees its first `HEAD_SIZE` bytes.
     """
-    extension = PurePosixPath(PureWindowsPath(filename).name).suffix.lower()
+    extension = extension_of(filename)
 
     expected = EXTENSIONS.get(extension)
     if expected is None:

@@ -5,13 +5,31 @@ means: `classify_ticket`, `analyze_sentiment`, `summarize_conversation`,
 `generate_response`. Nothing above this module imports a vendor SDK, and nothing below it
 knows what an `AIOperation` is. Swapping providers means writing one more class here.
 
-**`generate_embedding` is absent, and that is ADR-008 being honoured rather than
-forgotten.** §17 lists five methods; ADR-008 records that embeddings come from a
-*separate* vendor behind the same interface and defers that choice to Phase X. Declaring
-the method now would force every provider to carry one it cannot serve — a stub with no
-caller, which is what this codebase refuses everywhere else: settings wait for their
-consumer, the `ai` queue waits for a producer. Phase X adds the method with the provider
-that can answer it.
+**`generate_embedding` arrived in Phase X, on a protocol of its own.** §17 lists five methods
+on one interface, and this module now serves them from two: `AIProvider` carries the four
+generation operations, and `EmbeddingProvider` carries the fifth. That is ADR-008 being
+honoured rather than revisited — it recorded that embeddings come from a *separate* vendor
+behind the same interface, and ADR-027 deferred the method because declaring it on
+`AIProvider` would force `ClaudeProvider` to carry one it can never serve. The argument did not
+stop being true when the vendor arrived; it applies to two providers now instead of one. So
+§17's single conceptual interface is two protocols in one module, and the split is the whole of
+the deviation. `Provider` below is the one thing they share: the name the ledger records.
+
+**§23 added a fifth *generation* operation, and §17's own word for its list is "example".** The
+grounded answer §23 asks for — prose plus the passages it used — is not one of §17's five
+names, and it is not an embedding, so it belongs on `AIProvider` beside the other four rather
+than on a third protocol: a protocol exists where implementations *differ*, and every
+generation vendor serves this one exactly as it serves the others, through the same tool-call
+mechanism and the same `validate_output` gate. So §17's five names are served by two
+protocols, and §23's answer is the sixth operation behind them.
+
+**`EmbeddingProvider.generate_embedding` takes texts, not an `AIRequest`.** An `AIRequest`
+carries an instruction, a content label, and a token ceiling; an embedding call has none of the
+three, and handing it one would mean inventing an instruction for a model that does not read
+one. The call is a list of strings in and a list of vectors out, which is a shape `AIResult`
+already carries: `prompt_tokens` is the vendor's own count of what it embedded,
+`completion_tokens` is zero because nothing was generated, and `cost_usd` prices that as the
+input cost alone.
 
 **Validation lives in `validate_output`, not in each provider.** §18 wants one guarantee —
 *"Never assume LLM output is automatically valid"* — and a guarantee implemented once per
@@ -44,6 +62,7 @@ from app.schemas.ai import (
     SentimentResult,
     SuggestedReply,
 )
+from app.schemas.knowledge import Embedding, KnowledgeAnswer
 
 #: How many distinct field failures are named in an `AIOutputError`. A model that
 #: ignored the schema can fail on every field at once, and the message is logged —
@@ -161,12 +180,12 @@ def _inline(node: Any, defs: dict[str, Any]) -> Any:
     Pydantic emits a non-primitive field as `{"$ref": "#/$defs/Sentiment"}` beside a
     `$defs` block, and the tool schema actually sent to the provider should contain
     neither: the schema is read by a model as much as by a validator, and an indirection
-    it has to chase is one more thing to get wrong. Two of the four schemas carry such a
-    field — `SentimentResult.sentiment` and, since Phase U, `Classification.priority` —
-    each at one level of nesting.
+    it has to chase is one more thing to get wrong. Two of the five schemas that reach a
+    provider as a tool carry such a field — `SentimentResult.sentiment` and, since Phase U,
+    `Classification.priority` — each at one level of nesting.
 
     A self-referential schema would exhaust the recursion limit rather than loop
-    forever — none of the four is, and `tests/unit/test_ai_structured_output.py` walks
+    forever — none of the five is, and `tests/unit/test_ai_structured_output.py` walks
     every schema that reaches the provider.
     """
     if isinstance(node, list):
@@ -200,18 +219,30 @@ def _tool_schema(output: type[BaseModel]) -> dict[str, Any]:
     return cast("dict[str, Any]", _inline(schema, defs))
 
 
-class AIProvider(Protocol):
-    """§17's interface. One method per operation the AI layer can perform.
+class Provider(Protocol):
+    """What every implementation in this package has in common.
+
+    One attribute, and it is the one thing `ai_service` needs from a provider it did not
+    choose: the value written into `ai_usage.provider`. Declared once, on its own protocol,
+    so the retry loop can be typed against it and ledger either kind of call — a loop that
+    knew about two protocols would be a loop with a branch in it.
+    """
+
+    #: Written into the ledger's `provider` column, so a cost report can say which vendor
+    #: produced the spend even after the deployment has moved to another one.
+    name: str
+
+
+class AIProvider(Provider, Protocol):
+    """§17's interface, minus the method no generation provider can serve. One method per
+    generation operation the AI layer can perform.
 
     Every method raises `AITransientError`, `AIPermanentError`, or `AIOutputError` and
     nothing else — an implementation that let a vendor exception escape would make the
     retry policy in `ai_service` depend on which provider was configured.
 
-    `name` is written into the ledger's `provider` column, so a cost report can say which
-    vendor produced the spend even after the deployment has moved to another one.
+    `name` comes from `Provider` above, for the reason it is declared there.
     """
-
-    name: str
 
     async def classify_ticket(self, request: AIRequest) -> AIResult[Classification]:
         """§18 — category, subcategory, and confidence for a ticket."""
@@ -227,4 +258,47 @@ class AIProvider(Protocol):
 
     async def generate_response(self, request: AIRequest) -> AIResult[SuggestedReply]:
         """§21 — a draft reply for an agent to review and send themselves."""
+        ...
+
+    async def answer_question(self, request: AIRequest) -> AIResult[KnowledgeAnswer]:
+        """§23 — answer a question from retrieved passages, naming the ones it used.
+
+        The `request.content` here is the retrieved passages and the question, assembled by
+        `app/ai/prompts.py`'s `knowledge_content`; `used_sources` in the answer are 1-based
+        numbers into those passages, and `app/services/knowledge_service.py` resolves them
+        against the chunks it actually supplied rather than trusting them. An implementation
+        does nothing special with that — it is one more schema behind one more tool name, which
+        is the point of this protocol's shape.
+        """
+        ...
+
+
+class EmbeddingProvider(Provider, Protocol):
+    """§22's embedding boundary — the second half of §17's interface, and a separate vendor.
+
+    `claude.py` and `groq.py` do not implement this, and `openai_embedding.py` does not
+    implement the five above. That is the point rather than an accident: ADR-008 chose a
+    separate embedding vendor in Phase C and ADR-027 refused to put a method on `AIProvider`
+    that its implementations could never serve. Neither Anthropic nor Groq publishes an
+    embedding model, so a deployment configures one of each and `Settings` checks the pairing
+    of both.
+
+    **It raises the same three types, for the same reason**, so `ai_service._run` — the one
+    retry policy, the one ledger, the one place a failure is priced — serves this call exactly
+    as it serves the other four.
+    """
+
+    async def generate_embedding(self, texts: list[str]) -> AIResult[Embedding]:
+        """Vectors for `texts`, one per text, in the order they were given.
+
+        A batch rather than one text at a time: the vendor bills the same tokens either way and
+        one call is one timeout instead of forty, which matters because a caller here is a
+        Celery task ingesting a document rather than a person watching a spinner.
+
+        An implementation **must** return exactly one vector per input. A short list is an
+        `AIOutputError` and not a partial success: the caller is about to write chunk rows
+        against those vectors, and a misalignment there would attach one passage's meaning to
+        another passage's text, which is the kind of wrong answer nothing downstream could
+        detect.
+        """
         ...

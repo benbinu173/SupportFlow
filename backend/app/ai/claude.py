@@ -58,6 +58,7 @@ from app.schemas.ai import (
     SentimentResult,
     SuggestedReply,
 )
+from app.schemas.knowledge import KnowledgeAnswer
 
 logger = structlog.get_logger(__name__)
 
@@ -236,6 +237,18 @@ class ClaudeProvider:
             description=("Record a draft reply for the support agent to review and send."),
         )
 
+    async def answer_question(self, request: AIRequest) -> AIResult[KnowledgeAnswer]:
+        """§23 — a grounded answer, and the passages it says it used."""
+        return await self._structured(
+            request,
+            KnowledgeAnswer,
+            tool="record_answer",
+            description=(
+                "Record an answer to the question, grounded in the passages above, and the "
+                "numbers of the passages the answer used."
+            ),
+        )
+
     async def _structured[T: BaseModel](
         self,
         request: AIRequest,
@@ -246,8 +259,8 @@ class ClaudeProvider:
     ) -> AIResult[T]:
         """One call, and the only code path in this module that talks to the network.
 
-        Every operation reduces to this, which is the point: the four §17 methods differ
-        in their tool name, their schema, and the sentence describing the tool — nothing
+        Every operation reduces to this, which is the point: the five generation operations
+        differ in their tool name, their schema, and the sentence describing the tool — nothing
         else — so there is exactly one implementation of the timeout, the translation, the
         stop-reason handling, and the validation.
         """

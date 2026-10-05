@@ -379,9 +379,16 @@ def test_the_model_reads_the_ticket_and_then_the_conversation(
     assert "It will not download." in request.content
     assert "Their file store is degraded." in request.content
     assert "[agent (internal note)]" in request.content
-    # The label is ours and names both blocks — `AIRequest`'s contract, restated here because
-    # this is the one prompt whose answer a person can send onward without retyping it.
-    assert request.content_label == "the customer's support ticket and the conversation so far"
+    # The label is ours and names what the block can contain — `AIRequest`'s contract, restated
+    # here because this is the one prompt whose answer a person can send onward without retyping
+    # it. **Phase X widened it to name a third block**, the retrieved passages, and it names them
+    # with "any" rather than "the" because most drafts have none; the content of a draft with
+    # nothing retrieved is unchanged, which is what `test_ai_suggestion.py`'s sibling in
+    # `tests/integration/test_knowledge_draft_grounding.py` asserts byte for byte.
+    assert request.content_label == (
+        "the customer's support ticket, the conversation so far, and any knowledge base "
+        "passages retrieved for it"
+    )
 
 
 def test_a_ticket_nobody_has_replied_to_can_still_be_drafted_for(

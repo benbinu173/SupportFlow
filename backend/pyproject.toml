@@ -27,6 +27,11 @@ dependencies = [
     "pwdlib[argon2]==0.3.1",       # ADR-001
     "email-validator==2.3.0",      # required by pydantic.EmailStr
     "python-multipart==0.0.20",
+    "pypdf==6.19.0",              # §22 — text extraction from an uploaded PDF. Pure Python and
+                                  # ships `py.typed`, which is what `python-magic` could not
+                                  # offer: see `app/core/file_validation.py` on native
+                                  # dependencies and `app/services/document_text.py` on the one
+                                  # reader this actually needs
     "structlog==25.5.0",
 ]
 

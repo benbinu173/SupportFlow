@@ -14,6 +14,7 @@ from app.api.attachments import router as attachments_router
 from app.api.audit import router as audit_router
 from app.api.auth import router as auth_router
 from app.api.customers import router as customers_router
+from app.api.knowledge import router as knowledge_router
 from app.api.messages import router as messages_router
 from app.api.notifications import router as notifications_router
 from app.api.sla import router as sla_router
@@ -53,3 +54,8 @@ router.include_router(sla_router, prefix="/sla", tags=["sla"])
 # `/analytics/sentiment` — spec §6 lists `/api/v1/analytics/*` and §36 names all five. A
 # prefix here, like `/sla`: one resource area, every path under it.
 router.include_router(analytics_router, prefix="/analytics", tags=["analytics"])
+# `/knowledge`, `/knowledge/upload`, `/knowledge/search`, and `/knowledge/{document_id}` — a
+# prefix here, like `/sla` and `/analytics`: one resource area, every path under it. A knowledge
+# document has no parent to hang off, unlike a message or an analysis, so the flat mounting is
+# the honest one rather than a choice between two shapes.
+router.include_router(knowledge_router, prefix="/knowledge", tags=["knowledge"])

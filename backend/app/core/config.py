@@ -263,6 +263,60 @@ class Settings(BaseSettings):
     # workers throttled by the same limit do not return in lockstep.
     AI_RETRY_BACKOFF_SECONDS: float = Field(default=1.0, ge=0)
 
+    # --- Embeddings --------------------------------------------------------
+    # Three settings mirroring the `AI_*` trio above rather than reusing it, and the reason
+    # is that block's own: `AI_API_KEY` is *"the credential for `AI_PROVIDER`"*, and
+    # embeddings come from a different vendor deliberately (ADR-008). One key covering two
+    # vendors would be a setting that one of them never reads.
+    #
+    # Phase X bound this to OpenAI, the only vendor in `app/ai/pricing.py` that publishes an
+    # embedding model — neither Anthropic nor Groq does, which is why ADR-027 kept
+    # `generate_embedding` off `AIProvider` until there was an implementation behind it.
+    EMBEDDING_PROVIDER: Literal["openai", "fake"] = "openai"
+
+    # Optional, for the reason `AI_API_KEY` is optional: AI is a feature a deployment can
+    # simply not have, so a checkout with no embedding key runs the whole test suite and
+    # starts. The knowledge routes refuse at the point of use, loudly, rather than at import.
+    # An empty string is absent — see `_blank_credential_is_absent`.
+    EMBEDDING_API_KEY: str | None = None
+
+    # Validated against the same rate table, by the same two checks: the model must be
+    # priced, and it must be served by `EMBEDDING_PROVIDER`. `text-embedding-3-small` is 1536
+    # dimensions, which is what `EMBEDDING_DIMENSIONS` declares on the column — one decision
+    # written in two places, and changing either is a migration and a re-embed rather than a
+    # config edit, as `app/models/knowledge_chunk.py` says.
+    EMBEDDING_MODEL: str = "text-embedding-3-small"
+
+    # --- Retrieval ---------------------------------------------------------
+    # **These two are the policy of when this product is allowed to answer**, which is why
+    # they are settings and not constants in the service that reads them.
+    #
+    # §24's relevance threshold. Below it, the answer is that the knowledge base does not
+    # contain sufficient information, and **no model is called at all** — so raising this
+    # makes the product refuse more and invent less, and lowering it makes it answer more and
+    # cite worse. 0.3 is a starting point for `text-embedding-3-small`, where a genuinely
+    # relevant passage typically scores well above it and an unrelated one below; a deployment
+    # with a corpus of its own is expected to move it after reading what its own questions
+    # score. Bounded to a probability because cosine similarity is one.
+    RETRIEVAL_MIN_SIMILARITY: float = Field(default=0.3, ge=0, le=1)
+
+    # How many passages reach the prompt. Bounded above at 50 because this is a ceiling on
+    # what one question may cost — every passage is tokens sent to a model — and a deployment
+    # that asked for a thousand would be buying a context window rather than an answer. Five
+    # is §23's "top relevant chunks": several chances to catch the right passage, few enough
+    # that the prompt stays about the question.
+    RETRIEVAL_TOP_K: int = Field(default=5, ge=1, le=50)
+
+    # --- Knowledge base ----------------------------------------------------
+    # The ingestion ceiling, in the shape `MAX_ATTACHMENT_BYTES` established and enforced the
+    # same way: by counting bytes as they stream, never by trusting `Content-Length`. It is
+    # smaller than the attachment ceiling on purpose, and the difference is what the file
+    # becomes: an attachment is stored and served back, while a document is *read*, split, and
+    # embedded, and every byte of it is tokens this deployment pays for. Ten mebibytes of
+    # prose is roughly two and a half million tokens, which is already far past any policy
+    # document a support desk has.
+    MAX_KNOWLEDGE_DOCUMENT_BYTES: int = 10 * 1024 * 1024
+
     # --- CORS -------------------------------------------------------------
     # Explicit allowlist. Required because the refresh cookie is sent with
     # credentials, which forbids a wildcard origin.
@@ -301,7 +355,9 @@ class Settings(BaseSettings):
             raise ValueError("JWT_SECRET must be at least 32 characters")
         return v
 
-    @field_validator("SMTP_USERNAME", "SMTP_PASSWORD", "AI_API_KEY", mode="before")
+    @field_validator(
+        "SMTP_USERNAME", "SMTP_PASSWORD", "AI_API_KEY", "EMBEDDING_API_KEY", mode="before"
+    )
     @classmethod
     def _blank_credential_is_absent(cls, v: object) -> object:
         """Treat an empty string as "not set".
@@ -315,16 +371,47 @@ class Settings(BaseSettings):
             return None
         return v
 
-    @field_validator("AI_PROVIDER")
+    @field_validator("AI_MODEL", "EMBEDDING_MODEL", mode="before")
+    @classmethod
+    def _blank_model_is_the_default(cls, v: object, info: ValidationInfo) -> object:
+        """Treat an empty model name as "not set", so the field's default applies.
+
+        **`_blank_credential_is_absent`'s argument, one field type over.** `.env.example` ships
+        the model keys with no value next to the credentials, and a developer who copies it gets
+        `EMBEDDING_MODEL=""` in the environment — which pydantic-settings reads as a *value*, not
+        as an absence, so the default would never be reached. The startup then fails on
+        `_model_has_a_published_rate` with *"'' has no published rate"*, a message about a model
+        nobody chose.
+
+        The blank is a real thing to write — it is how the example file says "you do not have to
+        set this" — so it is understood rather than forbidden. A typo is unaffected: only the
+        empty string is redirected, and any other unpriceable name still fails loudly.
+
+        Read from `model_fields` rather than restated, so the default has one home and this
+        cannot drift from the field it serves. `info.field_name` is optional in pydantic's
+        types — it is always set here, because the decorator names both fields — and the lookup
+        is written to tolerate its absence rather than to assert it away.
+        """
+        field = cls.model_fields.get(info.field_name or "")
+        if isinstance(v, str) and not v.strip() and field is not None:
+            return field.default
+        return v
+
+    @field_validator("AI_PROVIDER", "EMBEDDING_PROVIDER")
     @classmethod
     def _fake_provider_is_test_only(cls, v: str, info: ValidationInfo) -> str:
-        """Refuse the scripted provider outside the test environment.
+        """Refuse a scripted provider outside the test environment.
 
-        §60 forbids *"fake AI results"* in the final implementation, and ADR-008 says the
-        fake *"exists for tests only"*. Both are statements about a deployment, and the
-        only place that knows what kind of deployment this is, is here. A comment on the
-        fake class would be a rule a future commit could not break; this is a rule that
-        commit fails on.
+        §60 forbids *"fake AI results"* in the final implementation, and ADR-008 says the fake
+        *"exists for tests only"*. Both are statements about a deployment, and the only place
+        that knows what kind of deployment this is, is here. A comment on the fake class would
+        be a rule a future commit could not break; this is a rule that commit fails on.
+
+        **One validator for both selectors**, because the rule is about the word `fake` rather
+        than about which of the two protocols it is bound to — and two copies of it would be
+        two places to forget when a third provider arrives. The message names the field that
+        failed, so a deployment running from a `.env.example` it copied learns which line it
+        left set.
 
         `ENVIRONMENT` is read from `info.data` rather than from a second settings object,
         which is what makes the failure happen during validation of the very configuration
@@ -332,15 +419,19 @@ class Settings(BaseSettings):
         """
         if v == "fake" and info.data.get("ENVIRONMENT") != "test":
             raise ValueError(
-                "AI_PROVIDER=fake is only allowed when ENVIRONMENT=test "
+                f"{info.field_name}=fake is only allowed when ENVIRONMENT=test "
                 "(spec §60: no fake AI results in the final implementation)"
             )
         return v
 
-    @field_validator("AI_MODEL")
+    @field_validator("AI_MODEL", "EMBEDDING_MODEL")
     @classmethod
-    def _model_has_a_published_rate(cls, v: str) -> str:
+    def _model_has_a_published_rate(cls, v: str, info: ValidationInfo) -> str:
         """Refuse a model `app/ai/pricing.py` cannot price.
+
+        One validator for both models, because the question is the same one: is this name in
+        the rate table at all? Which vendor serves it is the *next* check, and it is the one
+        that can say what the right name would be.
 
         Imported inside the validator rather than at module scope because `app/ai/pricing.py`
         raises `AIPermanentError` through `app/ai/errors.py`, and configuration should not
@@ -354,7 +445,8 @@ class Settings(BaseSettings):
             rate_for(v)
         except AIPermanentError as exc:
             raise ValueError(
-                f"AI_MODEL={v!r} has no published rate. Priced models: {', '.join(priced_models())}"
+                f"{info.field_name}={v!r} has no published rate. "
+                f"Priced models: {', '.join(priced_models())}"
             ) from exc
         return v
 
@@ -370,24 +462,40 @@ class Settings(BaseSettings):
         configuration mistake, so it is reported by configuration, where the process refuses
         to start at all.
 
-        Runs after the field validators, so `AI_MODEL` has already been proven priceable and
+        Runs after the field validators, so both models have already been proven priceable and
         `rate_for` cannot raise here for the reason it exists.
 
-        The fake is exempt: it is reached only under `ENVIRONMENT=test`, it needs no vendor,
-        and a test asserting retry behaviour has no interest in which real model is configured.
+        **Phase X gave it a second pairing rather than a second validator.** Generation and
+        embedding are two vendors by design (ADR-008), so `AI_MODEL`/`AI_PROVIDER` and
+        `EMBEDDING_MODEL`/`EMBEDDING_PROVIDER` are two independent pairings — and this is the
+        one place that answers "which vendor serves this name?", which is the question both
+        are asking.
+
+        Each is skipped when its provider is the fake: that one is reached only under
+        `ENVIRONMENT=test`, needs no vendor, and a test asserting retry behaviour has no
+        interest in which real model is configured.
         """
         from app.ai.pricing import models_for, rate_for
 
-        if self.AI_PROVIDER == "fake":
-            return self
+        if self.AI_PROVIDER != "fake":
+            served_by = rate_for(self.AI_MODEL).provider
+            if served_by != self.AI_PROVIDER:
+                raise ValueError(
+                    f"AI_MODEL={self.AI_MODEL!r} is served by {served_by!r}, not by "
+                    f"AI_PROVIDER={self.AI_PROVIDER!r}. Models for {self.AI_PROVIDER!r}: "
+                    f"{', '.join(models_for(self.AI_PROVIDER)) or '<none>'}"
+                )
 
-        served_by = rate_for(self.AI_MODEL).provider
-        if served_by != self.AI_PROVIDER:
-            raise ValueError(
-                f"AI_MODEL={self.AI_MODEL!r} is served by {served_by!r}, not by "
-                f"AI_PROVIDER={self.AI_PROVIDER!r}. Models for {self.AI_PROVIDER!r}: "
-                f"{', '.join(models_for(self.AI_PROVIDER)) or '<none>'}"
-            )
+        if self.EMBEDDING_PROVIDER != "fake":
+            embedding_vendor = rate_for(self.EMBEDDING_MODEL).provider
+            if embedding_vendor != self.EMBEDDING_PROVIDER:
+                raise ValueError(
+                    f"EMBEDDING_MODEL={self.EMBEDDING_MODEL!r} is served by "
+                    f"{embedding_vendor!r}, not by "
+                    f"EMBEDDING_PROVIDER={self.EMBEDDING_PROVIDER!r}. Models for "
+                    f"{self.EMBEDDING_PROVIDER!r}: "
+                    f"{', '.join(models_for(self.EMBEDDING_PROVIDER)) or '<none>'}"
+                )
         return self
 
     @property

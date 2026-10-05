@@ -41,12 +41,12 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
-# Three queues now, each named for its purpose. §51's Phase P asks for "task routing", and
+# Four queues now, each named for its purpose. §51's Phase P asks for "task routing", and
 # the route table's entries are what makes each destination explicit instead of relying on
 # the default queue's name — and the line that changes when the next producer arrives. The
-# queues that will join them are `reports` (S) and `knowledge` (X) — neither of which is
-# declared here, because declaring a queue nothing publishes to is a worker process waiting
-# for work that does not exist. `ai` was on that list from Phase P until Phase U produced it.
+# one queue still unbuilt is `reports` (S), and it is not declared here: declaring a queue
+# nothing publishes to is a worker process waiting for work that does not exist. `knowledge`
+# was on that list from Phase P until Phase X produced it, and `ai` was on it until Phase U.
 NOTIFICATIONS_QUEUE = "notifications"
 
 # Phase Q. Separate from `notifications` because the two have nothing in common: one holds
@@ -63,6 +63,13 @@ SLA_QUEUE = "sla"
 # or paused independently — analysis is the part of this system that costs money per call.
 AI_QUEUE = "ai"
 
+# Phase X. Separate from the other three for the fourth version of the same argument: an
+# ingestion fetches a stranger's web page, walks a PDF, and then makes one embedding call, and
+# none of that should sit in front of an email or an SLA alert. It is also, like `ai`, a queue a
+# deployment may want to scale or pause on its own — a bulk re-ingestion is a burst of outbound
+# requests and embedding spend that has nothing to do with how fast tickets are answered.
+KNOWLEDGE_QUEUE = "knowledge"
+
 celery_app = Celery(
     "supportflow",
     broker=str(settings.CELERY_BROKER_URL),
@@ -74,6 +81,7 @@ celery_app = Celery(
         "app.workers.email_tasks",
         "app.workers.sla_tasks",
         "app.workers.ai_tasks",
+        "app.workers.knowledge_tasks",
     ],
 )
 
@@ -131,6 +139,7 @@ celery_app.conf.update(
         "app.workers.email_tasks.*": {"queue": NOTIFICATIONS_QUEUE},
         "app.workers.sla_tasks.*": {"queue": SLA_QUEUE},
         "app.workers.ai_tasks.*": {"queue": AI_QUEUE},
+        "app.workers.knowledge_tasks.*": {"queue": KNOWLEDGE_QUEUE},
     },
     # --- Schedule -----------------------------------------------------------
     # Beat's whole configuration, and the first entry this project has ever had: Phase P

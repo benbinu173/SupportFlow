@@ -284,8 +284,17 @@ def test_there_are_routes_to_check(api: FastAPI) -> None:
     the API to declare **two** capabilities — `AI_REQUEST_SUGGESTION` and
     `MESSAGE_POST_REPLY` — because it performs two acts at once and neither one alone
     describes it.
+
+    **Phase X moved it by six**, which is the largest step since the router mounts and the
+    same kind of step: the knowledge base is a whole resource area rather than an operation
+    over an existing one. It is four paths and six methods — upload is a route of its own
+    because it is a different transport (§22's PDFs arrive as multipart), and the collection
+    appears twice with two capabilities because reading a library and writing to it are
+    different acts (`KB_LIST` against `KB_UPLOAD`). The margin below the real total is what
+    it has always been, so this still fails when the walk stops finding things rather than
+    when a phase adds a route.
     """
-    assert len(_entries(api)) >= 38
+    assert len(_entries(api)) >= 44
 
 
 def test_the_walk_finds_every_documented_route(api: FastAPI) -> None:
@@ -724,4 +733,37 @@ def test_every_route_declares_the_capability_the_matrix_assigns(api: FastAPI) ->
         ("GET", "/api/v1/analytics/agents"): {Permission.ANALYTICS_ORG},
         ("GET", "/api/v1/analytics/sla"): {Permission.ANALYTICS_OWN},
         ("GET", "/api/v1/analytics/sentiment"): {Permission.ANALYTICS_OWN},
+        # --- Knowledge ----------------------------------------------------
+        # Six routes and four capabilities, and **the collection appears three times
+        # under three different guards** — which is the point of listing it here rather
+        # than the shape being a mistake. `KB_LIST` reads, `KB_UPLOAD` writes, and
+        # `KB_DELETE` removes; §3's matrix gives a manager and an agent the first, admin
+        # alone the second and third, and a customer none of them. A single capability for
+        # "the knowledge base" would have made the library as writable as it is readable.
+        #
+        # `GET /knowledge/{document_id}` takes `KB_LIST` rather than a capability of its
+        # own, because §3's matrix has no "view document" row — the same reasoning
+        # `/customers/{id}` → `CUSTOMER_LIST` takes above. A document's chunks are its
+        # readable surface, and someone who may list documents may read one.
+        #
+        # `/upload` is a route of its own rather than a `content_type` on the collection,
+        # for the reason `app/api/attachments.py` gives: it is a different transport. A PDF
+        # arrives as multipart and is validated, sized, and stored before a row exists,
+        # which is not a decision a JSON body can express.
+        #
+        # `/search` is `AI_QUERY_KNOWLEDGE` — a capability of its own, and the **fifth** in
+        # this file's AI family, because §3 has a row for it that the other four do not
+        # share. Asking the knowledge base is not asking about a ticket: there is no ticket
+        # in the path, and the answer is drawn from documents the whole tenant can read.
+        # It is also the only knowledge route carrying `limit_ai` — it calls an embedding
+        # model and, when a passage clears the threshold, a generation model, so it is
+        # billed per call and is rate-limited per user like the other model-calling routes.
+        # The four document routes carry `limit_upload` (the two creates) instead, which is
+        # why none of them appears with a limiter here: a limiter declares no capability.
+        ("GET", "/api/v1/knowledge"): {Permission.KB_LIST},
+        ("POST", "/api/v1/knowledge"): {Permission.KB_UPLOAD},
+        ("POST", "/api/v1/knowledge/upload"): {Permission.KB_UPLOAD},
+        ("GET", "/api/v1/knowledge/{document_id}"): {Permission.KB_LIST},
+        ("DELETE", "/api/v1/knowledge/{document_id}"): {Permission.KB_DELETE},
+        ("POST", "/api/v1/knowledge/search"): {Permission.AI_QUERY_KNOWLEDGE},
     }

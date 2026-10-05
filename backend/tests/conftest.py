@@ -110,6 +110,28 @@ os.environ.setdefault("WS_AUTH_TIMEOUT_SECONDS", "1")
 os.environ["AI_PROVIDER"] = "anthropic"
 os.environ["AI_MODEL"] = "claude-sonnet-5"
 
+# Embeddings, Phase X, pinned as a pair for the same reasons and one more of its own.
+#
+# **`openai`, not `fake`, and that is the same choice the block above makes** — pinned as the
+# *real* vendor rather than the scripted one. `Settings` refuses `fake` outside
+# `ENVIRONMENT=test` (§60), so a suite pinned to it would refuse to construct a production
+# `Settings` at all: `test_is_production_flag` and the docs-absent test both build one, and both
+# would fail with a message about embeddings rather than about what they assert. Scripted vectors
+# arrive the way scripted generations do — by patching `ai_service._embedding_provider`, the seam
+# that function exists for.
+#
+# What the pin buys is the same as above: no test's vectors depend on a file outside the
+# repository. `FakeEmbeddingProvider` produces `EMBEDDING_DIMENSIONS`-wide vectors, so the
+# pgvector column, the width validator, and the ingestion pipeline are all exercised against a
+# real database without a single outbound request.
+#
+# `EMBEDDING_API_KEY` is deliberately not set. An absent key is a working configuration (the
+# knowledge routes refuse at the point of use), and leaving it absent means a test that
+# accidentally reached the real provider fails loudly with "not configured" rather than spending
+# money. `tests/unit/test_config.py` unsets these where it asserts the defaults.
+os.environ["EMBEDDING_PROVIDER"] = "openai"
+os.environ["EMBEDDING_MODEL"] = "text-embedding-3-small"
+
 # Imported after the environment is populated, which is why this block sits below
 # the statements above. Ruff's E402 allows `os.environ` setup before imports
 # precisely because this pattern is unavoidable for test configuration.
@@ -137,6 +159,7 @@ CUSTOMERS = f"{API}/customers"
 TICKETS = f"{API}/tickets"
 NOTIFICATIONS = f"{API}/notifications"
 SLA = f"{API}/sla"
+KNOWLEDGE = f"{API}/knowledge"
 
 # Comfortably past the configured 12-character minimum, and not a credential anyone
 # would mistake for a real one.
@@ -378,6 +401,37 @@ def queued_analyses(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, lis
     return queued
 
 
+@pytest.fixture(autouse=True)
+def queued_ingestions(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    """Record the documents ingestion was queued for, and queue none. **Autouse.**
+
+    Phase X's version of `queued_emails` and `queued_analyses`, and autouse for their reason:
+    the three knowledge create routes all end in `enqueue_ingestion`, so a test that registers a
+    document — any test, for any purpose — reaches a broker. Left alone they would publish real
+    messages to whatever Redis `CELERY_BROKER_URL` names, which is harmless when it is the test
+    database and a confusing, slow failure when it is not.
+
+    **A pair, not a counter.** `ingest_document` takes a document id and an organization id, and
+    the tenant is half of what the queued task has to be told — `test_knowledge.py`'s
+    `test_the_queued_task_names_the_tenant` asserts on it, and a recorder that kept only the
+    document id could not. Both are already strings at the call site, so these are exactly what
+    a worker would receive over the wire.
+
+    A list rather than a counter so a test can assert that something queued *nothing* — a
+    rejected upload must leave no task behind, and absence is not expressible by an integer.
+    """
+
+    from app.workers import knowledge_tasks
+
+    queued: list[tuple[str, str]] = []
+
+    def record(document_id: str, organization_id: str) -> None:
+        queued.append((document_id, organization_id))
+
+    monkeypatch.setattr(knowledge_tasks.ingest_document, "delay", record)
+    return queued
+
+
 @dataclass
 class OrgSession:
     """A registered organization, plus the credentials of one user in it.
@@ -421,6 +475,19 @@ class OrgSession:
 
     def patch(self, path: str, **kwargs: Any) -> Any:
         return self.client.patch(path, headers=self._headers(kwargs.pop("headers", None)), **kwargs)
+
+    def delete(self, path: str, **kwargs: Any) -> Any:
+        """**Added in Phase X, because it is the first `DELETE` this API has.**
+
+        `DELETE /api/v1/knowledge/{document_id}` is the only delete route in the system, so
+        until this phase there was no `OrgSession` verb for it and no test that wanted one.
+        It sits here beside the other three rather than in the knowledge test file, so the
+        next delete route finds it — and so the header merge is the same one, which is the
+        part worth not repeating.
+        """
+        return self.client.delete(
+            path, headers=self._headers(kwargs.pop("headers", None)), **kwargs
+        )
 
     def add_user(
         self,

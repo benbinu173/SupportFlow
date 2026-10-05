@@ -222,12 +222,15 @@ def test_the_summary_request_fences_nothing_itself() -> None:
     assert prompts._CLOSE not in request.content
 
 
-def test_the_draft_request_carries_the_ticket_and_the_conversation_under_its_own_label() -> None:
-    """§21's call reads both, so `_request_for` cannot build it — it takes only a `Ticket`.
+def test_the_draft_request_carries_its_three_blocks_under_its_own_label() -> None:
+    """§21's call reads the ticket, the conversation, and §22's passages, so `_request_for`
+    cannot build it — it takes only a `Ticket`.
 
-    The label is the third of the three, and it is the caller's own words naming *both* blocks
-    rather than the ticket's subject — `app/ai/prompts.py`'s rule, restated here because this
-    is the one prompt a person can send onward without retyping it.
+    The label is the third of the three, and it is the caller's own words naming all of the
+    blocks rather than the ticket's subject — `app/ai/prompts.py`'s rule, restated here because
+    this is the one prompt a person can send onward without retyping it. **Phase X widened the
+    label and added the third block**, and the passage is asserted separately from the other two
+    because it is the one whose presence varies: most drafts have none.
     """
     request = ai_analysis_service._draft_request(
         _ticket(subject="Cannot log in"),
@@ -235,6 +238,7 @@ def test_the_draft_request_carries_the_ticket_and_the_conversation_under_its_own
             _message(SenderType.CUSTOMER, "It will not download."),
             _message(SenderType.AGENT, "Checking with the vendor.", is_internal=True),
         ],
+        ["Refunds take five working days to reach an account."],
     )
 
     assert isinstance(request, AIRequest)
@@ -243,6 +247,7 @@ def test_the_draft_request_carries_the_ticket_and_the_conversation_under_its_own
     assert "Cannot log in" in request.content
     assert "It will not download." in request.content
     assert "Checking with the vendor." in request.content
+    assert "Refunds take five working days to reach an account." in request.content
     assert request.content_label not in (
         ai_analysis_service._CONTENT_LABEL,
         ai_analysis_service._CONVERSATION_LABEL,
@@ -255,12 +260,15 @@ def test_the_draft_request_fences_nothing_itself() -> None:
 
     Built with **no** conversation as well as with one, because the ticket-only path is the
     ordinary case (`create_ticket` writes no message) and it is the path a second fence
-    implementation would be easiest to leave behind.
+    implementation would be easiest to leave behind. The passage list is varied with it, since
+    §22's block is the other one that may be absent — an empty list is a draft with nothing
+    retrieved, which is the fail-open path rather than a missing argument.
     """
     for conversation in ([], [_message(SenderType.CUSTOMER, "hello")]):
-        request = ai_analysis_service._draft_request(_ticket(), conversation)
-        assert prompts._OPEN not in request.content
-        assert prompts._CLOSE not in request.content
+        for knowledge in ([], ["Refunds take five working days."]):
+            request = ai_analysis_service._draft_request(_ticket(), conversation, knowledge)
+            assert prompts._OPEN not in request.content
+            assert prompts._CLOSE not in request.content
 
 
 # ---------------------------------------------------------------------------

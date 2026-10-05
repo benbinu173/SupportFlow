@@ -135,26 +135,33 @@ AI-review rules structural rather than conventional.
 
 ## 6. AI flow
 
-The lower half of this section is implementation, and every operation `AIProvider` declares now has a
+The lower half of this section is implementation, and every operation the provider boundary declares now has a
 line on it. **Phase T (ADR-027)** built the provider abstraction, the call path, and the ledger. **Phase
 U (ADR-029)** built §18's flow around them for the first two operations — classification and sentiment —
 with the route, the queue, and the worker. **Phase V (ADR-030)** added §20's summary on the same worker
 and a rule that decides when it does not need to run at all. **Phase W (ADR-031)** added §21's suggested
-reply, which is the fourth and last method on the protocol. What remains for the AI half of the system
-is retrieval (Phase X), and that adds an *input* to a prompt rather than a line to this diagram.
+reply. **Phase X (ADR-032)** added §22's embeddings and §23's grounded answer — a *second* vendor behind
+the same interface — and with it §21's retrieval step, which was the one line of diagram this section had
+been missing since Phase B.
 
 ```
 trigger (ticket created, or agent request)          ── ✅ U; ✅ V by request, when the conversation moved
-   → enqueue task, return immediately                    ── ✅ U, on the `ai` queue
+   → enqueue task, return immediately                    ── ✅ U, on the `ai` queue; ✅ X, on the `knowledge` queue
    → worker loads ticket within tenant scope             ── ✅ U (`ai_repository.py`, tenant in the WHERE)
-   → build prompt from a versioned template              ── mechanism in T (`app/ai/prompts.py`); classification and sentiment text in U; summarization text in V; reply text in W
-   → provider call with timeout and bounded retry        ── ✅ T
+   → build prompt from a versioned template              ── mechanism in T (`app/ai/prompts.py`); classification and sentiment text in U; summarization text in V; reply text in W; grounded-answer text in X
+   → provider call with timeout and bounded retry        ── ✅ T, for generation and for embeddings alike
    → parse into a Pydantic model  ── invalid ──▶ handled failure, no result  ✅ T
-   → persist AI_USAGE (one row per attempt)              ── ✅ T; ✅ V records a served-from-storage answer as a row with `was_cached`
+   → persist AI_USAGE (one row per attempt)              ── ✅ T; ✅ V records a served-from-storage answer as a row with `was_cached`; ✅ X records an embedding under `EMBEDDING_MODEL`
    → persist AI_ANALYSIS                                 ── ✅ U
    → update ticket AI fields                             ── ✅ U (never `tickets.priority`); a summary writes no field at all
    → publish event → clients update live                 ── ✅ U
 ```
+
+**The retrieval row §21 was waiting for.** A draft's trigger now reads §22's published passages before it
+builds a prompt, which is the same shape as every row above it and is why §7's flow is reachable from
+this one: `_draft_request` composes the ticket, the conversation, and up to `RETRIEVAL_TOP_K` passages
+into one user message. A tenant with nothing published makes no embedding call at all, and a knowledge
+base that cannot be reached does not stop the draft — see §7 and ADR-032 Decision 8.
 
 **What Phase U added on top of T.** Two routes under the ticket that owns them (ADR-029 Decision 6),
 `WorkerContext` — a tenant with no authority, so a task cannot authorize anything by construction
@@ -195,28 +202,51 @@ through the ordinary reply path, with the same `first_response_at`, notification
 cache invalidation as any other reply, and the draft row stays behind internal and untouched. The
 before/after pair in `AI_RESPONSE_ACCEPTED` is where §34's *"where appropriate"* finally has a case it
 was written for — the draft's body against the body that was sent, with `edited` saying whether they
-differ. And **§21's "relevant knowledge" step is not here**: that retrieval is §22's, and a parameter W
-always passed empty would be a stub with no caller, which is the same reasoning ADR-008 used to keep
-`generate_embedding` off the protocol. The change is additive and lands in one function in Phase X.
+differ. And **§21's "relevant knowledge" step was not there**: that retrieval is §22's, and a parameter W
+always passed empty would have been a stub with no caller, which is the same reasoning ADR-008 used to
+keep `generate_embedding` off the protocol. The change was additive, and Phase X made it — in one
+function, as forecast.
+
+**What Phase X added on top of W.** §22's document pipeline, §23's grounded answer, and the retrieval row
+that completes §21. **One interface, two vendors, and no third protocol where none was needed.** §17's
+five methods are served by `AIProvider` (the generation calls) and `EmbeddingProvider` (the fifth) —
+ADR-008's separate-vendor decision arriving, and ADR-027's deferral discharged on the protocol whose
+implementations can answer it, since neither Anthropic nor Groq publishes an embedding model. §23's
+grounded answer is a **sixth operation on `AIProvider`** and not a fourth protocol: it is prose plus the
+passages it used, every generation vendor serves it identically, and a protocol exists where
+implementations differ. `AIResult` and `ai_service._run` are reused unchanged — the retry policy, the
+jittered backoff, the one-ledger-row-per-attempt rule — so a genuinely second vendor runs the same code
+Phase T wrote for the first, which is the strongest available evidence that the boundary was drawn in the
+right place. **Ingestion is the first AI work on its own queue** (`knowledge`, ADR-032 Decision 5), the
+first that has no ticket behind it, and the first whose ledger rows are committed on the failure path by
+a claim that has to survive a redelivery: the document row is flipped to `processing` *before* the first
+network call, so a task that dies and is redelivered finds a row it may not claim rather than a second
+embedding bill.
+
+The full flow, the guard that makes a URL document safe to fetch, and the two branches of §23's question
+are §7's subject.
 
 **What runs today.** `app/services/ai_service.py` is the single call path — `classify_ticket`,
-`analyze_sentiment`, `summarize_conversation`, `generate_response` — and every one of them reduces
-to a private `_run`: select the provider, call it with the client's timeout, retry a *transient*
-failure up to `AI_MAX_ATTEMPTS` with jittered backoff, validate the answer into its schema, and
-stage one `ai_usage` row for every attempt including the failed ones. The provider is chosen by
-`AI_PROVIDER`, and **each vendor gets exactly one module, which is the only thing in the project that
-imports its client** — `app/ai/claude.py` for the `anthropic` SDK and `app/ai/groq.py` for `httpx`.
-Two real vendors behind one interface is what makes the boundary checkable rather than asserted: the
-second one cost a module and changed nothing above it (ADR-028).
+`analyze_sentiment`, `summarize_conversation`, `generate_response`, `answer_question`, and `embed_texts`
+— and every one of them reduces to a private `_run`: select the provider, call it with the client's
+timeout, retry a *transient* failure up to `AI_MAX_ATTEMPTS` with jittered backoff, validate the answer
+into its schema, and stage one `ai_usage` row for every attempt including the failed ones. The provider
+is chosen by `AI_PROVIDER` (and the embedding vendor by `EMBEDDING_PROVIDER`), and **each vendor gets
+exactly one module, which is the only thing in the project that imports its client** —
+`app/ai/claude.py` for the `anthropic` SDK, `app/ai/groq.py` and `app/ai/openai_embedding.py` for
+`httpx`. Three real vendors behind two protocols is what makes the boundary checkable rather than
+asserted: the second and third each cost a module and changed nothing above them (ADR-028, ADR-032).
 
 Three invariants, and how each is held:
 
 - **Provider-agnostic.** Application code depends on the `AIProvider` protocol
-  (`classify_ticket`, `analyze_sentiment`, `summarize_conversation`, `generate_response`) and never
-  on a vendor SDK. `generate_embedding` is deliberately **not** in it yet: ADR-008 puts embeddings
-  behind the same interface with a *different* vendor, and declaring the method now would give
-  `ClaudeProvider` a stub it can never serve. It arrives in Phase X with the provider that can
-  answer it.
+  (`classify_ticket`, `analyze_sentiment`, `summarize_conversation`, `generate_response`,
+  `answer_question`) and, for the fifth method, on `EmbeddingProvider` — and never on a vendor SDK.
+  `generate_embedding` is deliberately **not** on `AIProvider`: ADR-008 put embeddings behind the same
+  interface with a *different* vendor, and declaring the method there would give `ClaudeProvider` and
+  `GroqProvider` a stub neither can ever serve. It arrived in Phase X, on the protocol whose
+  implementations can answer it. Both protocols share `Provider`, which declares the one attribute
+  `_run` needs — `name` — so the retry loop ledgers either kind of call with no branch in it.
 - **Output is untrusted.** `app/ai/provider.py`'s `validate_output` is the one place a provider's
   payload is parsed, and it is called by both the real provider and the fake — so a model that
   answered in prose, truncated at `max_tokens`, invented an enum member, or returned a confidence of
@@ -241,45 +271,91 @@ evidence. `GET /analytics/overview` reads that table through the Phase S aggrega
 `failed_calls`, and `cached_calls` as three overlapping counts over the rows that exist — the last two
 each a subset of the first, so the number still answers "how many calls were made".
 
+Phase X is the first phase whose spend is **not** attached to a ticket: an ingestion's embedding rows
+carry `ticket_id = NULL`, because a document belongs to the organization rather than to a conversation
+and nothing asked for it. A draft's retrieval is the other case and does carry a ticket, because a
+ticket is what asked. And §23's refusal branch is the one branch in the system that deliberately writes
+**no** row at all — a `was_cached` entry would be a lie, since nothing answered from a cache and the
+call was never going to be made.
+
 **Two obligations travel with the ledger, and both belong to the caller.** `ai_service` stages rows
 and never commits, so whoever calls it commits — including after a failure, since a ledger that
 rolled back with a failed request would be missing exactly when it matters. And because
 `/analytics/overview` is cached while an `ai_usage` write does not bump the version integer, whoever
 commits also owns the `cache.invalidate` — the same pattern `ticket_service` follows after its own
-commit. Phase U's route is where both obligations land.
+commit. Phase U's route is where both obligations land; Phase X's ingestion task commits its own rows
+on the *failure* path too, because a failed embedding is still spend.
 
 Failure is contained: a provider that is down, throttled, or holding a bad key raises
 `AIServiceError` (503) and nothing else escapes, so a caller can treat every AI failure as one
-condition. Nothing on a request path is blocked by it, because nothing on a request path calls it
-yet.
+condition. **Phase X is the first phase with an AI call on a request path** —
+`POST /knowledge/search` embeds the question in the request, because a question is asked by a person
+who is waiting for its answer — and it is rate limited by `limit_ai` for exactly that reason. Every
+other AI call is still behind a queue, and a drafting request that cannot reach the knowledge base
+proceeds without it rather than failing (ADR-032 Decision 8).
 
 ## 7. RAG flow
 
-**Ingestion** (asynchronous, per document):
+Implemented in Phase X (ADR-032). This section was written in Phase B as a plan; it is now a description
+of what runs.
+
+**Ingestion** (asynchronous, per document, on the `knowledge` queue):
 
 ```
-upload → validate → object storage → metadata row (status=pending)
+POST /knowledge | /knowledge/upload   (text, a URL, or a file)
+   → validate → object storage (uploads only) → metadata row (status=pending)
    → worker: extract text → clean → chunk with overlap
-   → embed each chunk → persist chunks + vectors → status=ready
+   → embed each batch → persist chunks + vectors → status=completed, is_published=true
 ```
+
+A URL is **not** fetched in the request: the row is written with the URL as its reference and the worker
+fetches it under the guard in `app/services/url_fetch.py`, so a request cannot be made to wait on a
+stranger's server. The row is committed as `processing` *before* the first network call, so a task that
+dies and is redelivered finds a row it may not claim rather than a second embedding bill. A failure —
+a refused address, a provider outage, a document that extracts to nothing — leaves `status=failed` with
+a reason an admin can read, and never a half-indexed document that looks complete.
 
 **Query:**
 
 ```
-question → embed → vector search WHERE organization_id = ctx.organization_id
-   → top-k chunks above a relevance threshold
+question → has anything been published?  ── no ──▶ the refusal, and no provider call at all
+   │ yes
+   → embed → vector search WHERE organization_id = ctx.organization_id
+   → top-k chunks above a relevance threshold (RETRIEVAL_TOP_K, RETRIEVAL_MIN_SIMILARITY)
    │
-   ├─ nothing clears threshold → "knowledge base lacks this information"
+   ├─ nothing clears threshold → "knowledge base lacks this information", sources: []
    └─ chunks found → grounded prompt → answer + real source references
 ```
 
-Vector search uses pgvector with an HNSW index under cosine distance. The tenant
-predicate is part of the query, so retrieval cannot cross organizations — the same
-isolation guarantee as every other read, applied to the vector path.
+Vector search uses pgvector with an HNSW index under cosine distance. The tenant predicate is part of
+the query, so retrieval cannot cross organizations — the same isolation guarantee as every other read,
+applied to the vector path. **The claim is asserted on the result rather than on the query**:
+`tests/security/test_knowledge_isolation.py` lays a question onto one tenant's chunk *exactly* — making
+it the nearest neighbour in the whole table by arithmetic — and asserts that the other tenant's search
+returns its own document's id, that the stranger's text is absent from the response body, and that the
+refusal is byte-identical to a question whose document never existed.
 
-Grounding rules: answer only from retrieved context, state gaps explicitly, never
-invent policy, never fabricate a citation. Sources shown in the UI resolve to real
-stored chunks.
+Grounding rules: answer only from retrieved context, state gaps explicitly, never invent policy, never
+fabricate a citation. Sources shown in the UI resolve to real stored chunks — `KnowledgeSource.excerpt`
+is the passage's own text rather than a summary, so a citation is checkable rather than decorative.
+
+**Two deliberate divergences from the plan as written above**, both recorded in ADR-032.
+
+- **`status=ready` is `status=completed`.** Phase B's sketch used the word §22's prose uses; the enum
+  Phase D declared has four members, and the retrieval predicate is the one the partial index encodes:
+  `is_published = true AND status = 'completed'`. The worker sets both, which is what §22's *"document
+  becomes searchable"* means as a stored fact.
+- **The no-clears path makes no model call.** The plan reads as though a model always answers. It does
+  not: when nothing clears the threshold the refusal is this server's own sentence, there is no model in
+  the loop to answer from its priors, and **no ledger row** is written — a `was_cached` entry would
+  claim a saving that was never available. The `EXISTS` guard above it is what keeps a tenant that has
+  never opened the knowledge base from paying for a vector it cannot use.
+
+**§21's drafts read this flow too.** The retrieval is the same call, the query is the ticket's own words,
+and the passages arrive as an unnumbered third block in the draft prompt — a draft cites nothing, so a
+number in a reply an agent may send onward would be noise at best. A knowledge outage does not stop
+drafting, and a tenant with nothing published makes no embedding call, which is what keeps §21's
+behaviour for such a tenant exactly what it was before this phase.
 
 ## 8. Real-time flow
 
@@ -343,6 +419,15 @@ a bounded ceiling. Permanent failures (malformed output, missing record) fail fa
 a terminal state rather than burning retries. Tasks are written to tolerate
 re-delivery: a duplicate analysis updates the existing row instead of creating a
 second one.
+
+**Four queues, one per kind of work**, so a slow job cannot delay a fast one: `ai` (the ticket
+operations), `knowledge` (document ingestion), `sla`, and `notifications`. Priorities within a queue come
+from the broker rather than from the task. The two terminal states a task can find are both stated on
+the row rather than in the task: an analysis that finished is `completed` and re-running it does
+nothing, and an ingestion that is not `pending` is skipped — stricter than the analysis path, because
+two workers appending the same document's chunks would collide on a unique index, and a crash
+mid-ingestion is recovered by deleting the document and uploading it again rather than by a second
+half-indexed run (ADR-032 Decision 5).
 
 Beat owns periodic work — chiefly the SLA sweep that finds tickets nearing a
 first-response or resolution deadline and notifies the relevant staff.

@@ -36,6 +36,16 @@ from app.ai.pricing import (
 
 pytestmark = pytest.mark.unit
 
+#: Phase X's one embedding model, named once so the exception in
+#: `test_every_priced_model_has_a_positive_rate` and the tests below cannot drift apart.
+_EMBEDDING_MODEL = "text-embedding-3-small"
+
+#: Every vendor the table names. Kept as a literal set rather than derived from `RATES`, because
+#: a set derived from the table would agree with the table by construction — and the whole point
+#: of `test_every_rate_names_a_provider_that_serves_it` is that these two are written down in
+#: different places and have to agree.
+_PROVIDERS = {"anthropic", "groq", "openai"}
+
 
 # ---------------------------------------------------------------------------
 # The published rates
@@ -57,11 +67,21 @@ def test_sonnet_5_is_two_and_ten_per_million() -> None:
 
 
 def test_every_priced_model_has_a_positive_rate() -> None:
-    """A zero or negative rate is a rate-table typo, and it would be invisible otherwise."""
+    """A zero or negative rate is a rate-table typo, and it would be invisible otherwise.
+
+    **The output rate is checked only for the models that generate**, and the exception is a
+    fact about embeddings rather than a loosening: an embedding call has no completion tokens —
+    the same input produces the same vector, so there is nothing generated to bill — and OpenAI's
+    page quotes one number for it. That zero is asserted positively by
+    `test_the_embedding_model_bills_only_its_input` below, so this test is not the place it
+    could hide. Every input rate is positive without exception, because a free model is not a
+    model.
+    """
     for name in priced_models():
         rate = rate_for(name)
         assert rate.input_per_mtok > 0, name
-        assert rate.output_per_mtok > 0, name
+        if name != _EMBEDDING_MODEL:
+            assert rate.output_per_mtok > 0, name
 
 
 def test_the_configured_default_model_is_priced() -> None:
@@ -85,6 +105,49 @@ def test_gpt_oss_120b_is_fifteen_and_sixty_per_million() -> None:
     assert rate.provider == "groq"
 
 
+def test_the_embedding_model_is_two_cents_per_million_and_bills_no_output() -> None:
+    """Read from OpenAI's pricing page on 2026-10-04 — the one row Phase X added (ADR-032).
+
+    Pinned for the reason both tests above give, and the zero is the part worth pinning: it is a
+    *fact* rather than an unknown, and it is the only zero this table is allowed to contain.
+    `app/ai/pricing.py`'s docstring draws the distinction between a price we do not know — which
+    raises from `rate_for` — and a term that is genuinely zero, and this row is the second kind.
+    A reader who changed it to a non-zero number "to be safe" would be inventing a charge.
+    """
+    rate = rate_for(_EMBEDDING_MODEL)
+
+    assert (rate.input_per_mtok, rate.output_per_mtok) == (Decimal("0.02"), Decimal("0"))
+    assert rate.provider == "openai"
+
+
+def test_an_embedding_call_costs_its_input_tokens_alone() -> None:
+    """`AIResult` reports `completion_tokens = 0` for an embedding, and the arithmetic agrees.
+
+    This is the whole of Phase X's cost work — no new column, no new formula, no second rounding
+    path. 1 000 tokens in at $0.02/MTok is $0.00002, which the column's six places hold exactly;
+    an embedding large enough to matter (a 10 000-token document) is $0.0002, and the figure that
+    makes the pipeline legible is that a thousand such documents cost twenty cents.
+    """
+    assert cost_usd(_EMBEDDING_MODEL, prompt_tokens=1_000, completion_tokens=0) == Decimal(
+        "0.00002"
+    )
+    assert cost_usd(_EMBEDDING_MODEL, prompt_tokens=10_000, completion_tokens=0) == Decimal(
+        "0.0002"
+    )
+
+
+def test_an_embedding_call_with_completion_tokens_prices_them_at_zero() -> None:
+    """The rate is applied rather than special-cased: a stray completion count adds nothing.
+
+    Which is what makes the reuse honest. If a provider ever reported completion tokens on an
+    embedding response — a bug, since there is nothing generated — the ledger would record the
+    input cost and no more, rather than a number derived from a field that means nothing here.
+    """
+    assert cost_usd(_EMBEDDING_MODEL, prompt_tokens=1_000, completion_tokens=500) == Decimal(
+        "0.00002"
+    )
+
+
 def test_every_rate_names_a_provider_that_serves_it() -> None:
     """The field exists so configuration can refuse a mismatch, which needs it to be right.
 
@@ -92,15 +155,21 @@ def test_every_rate_names_a_provider_that_serves_it() -> None:
     clean bill of health from the pairing check — and the failure would reappear at the first
     call, as a 401 from a vendor holding a key for somebody else, which is the exact confusion
     the check was added to prevent.
+
+    **Phase X added the third vendor**, and it is the one this *file* is most likely to get
+    wrong: `text-embedding-3-small` reads like an OpenAI name to a person and is one, but
+    nothing in the code says so except this field. A typo here — `groq`, copied from the row
+    above — would be caught by configuration refusing `EMBEDDING_PROVIDER=openai`, which is the
+    right failure and a confusing one to reach from a rate table.
     """
     for name, rate in RATES.items():
-        assert rate.provider in {"anthropic", "groq"}, name
+        assert rate.provider in _PROVIDERS, name
         assert name in models_for(rate.provider), name
 
 
 def test_models_for_partitions_the_table() -> None:
     """Every priced model is reachable through exactly one provider, and none is orphaned."""
-    listed = [model for provider in ("anthropic", "groq") for model in models_for(provider)]
+    listed = [model for provider in sorted(_PROVIDERS) for model in models_for(provider)]
 
     assert sorted(listed) == sorted(priced_models())
     assert len(listed) == len(set(listed))

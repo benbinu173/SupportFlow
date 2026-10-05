@@ -8,9 +8,11 @@ summarization, and draft replies — with a human always in the loop before anyt
 reaches a customer. Each organization keeps a private knowledge base that grounds AI
 answers in its own documented policy rather than model invention.
 
-**Status: Phase C of 26.** Repository, tooling, documentation, containerized
-infrastructure, and CI are in place. Domain features are not built yet — see
-[Roadmap](#roadmap).
+**Status: Phases A–X complete.** Auth, RBAC, multi-tenancy, the ticket lifecycle, attachments,
+audit logging, search, notifications, SLAs, real-time fan-out, analytics, the AI layer, and the
+knowledge base are all built and covered by the test suite, and every phase's end-to-end is a
+script under [backend/scripts/](backend/scripts/). Phases Y–Z — hardening and deployment — are
+next; see [Roadmap](#roadmap).
 
 ## Why this project exists
 
@@ -109,6 +111,10 @@ rather than falling back to something insecure.
 | `AI_API_KEY` | Generation provider credential (optional — an installation that does not want AI runs without one, and the first call is what says so). Its shape follows the provider: `sk-ant-...` for Anthropic, `gsk_...` for Groq |
 | `AI_PROVIDER` / `AI_MODEL` | `anthropic`, `groq`, or `fake`; the fake is refused outside `ENVIRONMENT=test`. `AI_MODEL` must be a model `app/ai/pricing.py` can price *and* one the chosen provider actually serves — Groq's is `openai/gpt-oss-120b`. Startup refuses a mismatch, because a Groq key against `claude-sonnet-5` fails as a rejected credential and the key is not the problem |
 | `AI_MAX_TOKENS` / `AI_TIMEOUT_SECONDS` / `AI_MAX_ATTEMPTS` / `AI_RETRY_BACKOFF_SECONDS` | Output ceiling, per-call timeout, attempts per call, and the backoff base — see [AI](#ai) |
+| `EMBEDDING_API_KEY` | Embedding provider credential (optional — without it, ingestion and a knowledge search fail loudly at the point of use, and every other AI route is unaffected). **A second key, not the same one as `AI_API_KEY`**: Anthropic and Groq publish no embedding model, so the vendor that embeds is never the vendor that generates |
+| `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` | `openai` or `fake`; the fake is refused outside `ENVIRONMENT=test` exactly as `AI_PROVIDER`'s is. `EMBEDDING_MODEL` must be a model `app/ai/pricing.py` can price *and* one the provider serves — `text-embedding-3-small`, whose 1536 dimensions are what `knowledge_chunks.embedding` was declared to hold in Phase D |
+| `RETRIEVAL_TOP_K` / `RETRIEVAL_MIN_SIMILARITY` | How many passages a question retrieves (5) and the cosine similarity below which this product refuses to answer (0.3). §24's threshold is a policy about when an answer is allowed at all, so it is a setting and not a request field |
+| `MAX_KNOWLEDGE_DOCUMENT_BYTES` | The upload ceiling (10 MiB), mirroring `MAX_ATTACHMENT_BYTES`, and the knob that bounds what one document can cost to embed |
 | `S3_*` | Object storage for attachments |
 
 ## Commands
@@ -120,11 +126,11 @@ pytest -m security          # tenant-isolation and authz tests only
 ruff check . && ruff format --check .
 mypy app alembic scripts
 
-# The worker, needed for any email to actually be sent, for SLA alerts to fire, and for
-# a ticket's AI analysis to run. `-Q` must name *every* queue in `task_routes` — see the
-# SLA section for why a worker that misses one looks perfectly healthy and silently
-# consumes nothing.
-celery -A app.workers.celery_app worker --loglevel=info --pool=solo -Q notifications,sla,ai
+# The worker, needed for any email to actually be sent, for SLA alerts to fire, for a
+# ticket's AI analysis to run, and for a knowledge document to be ingested. `-Q` must name
+# *every* queue in `task_routes` — see the SLA section for why a worker that misses one looks
+# perfectly healthy and silently consumes nothing.
+celery -A app.workers.celery_app worker --loglevel=info --pool=solo -Q notifications,sla,ai,knowledge
 
 # Beat, which is the clock the SLA sweep runs on. Exactly one process: two would
 # double every sweep. The explicit schedule path is not optional — the default writes
@@ -158,6 +164,13 @@ python scripts/phase_s_walkthrough.py
 # §17's four operations, one deliberate permanent failure with a wrong key, and the spend
 # read back out of /analytics/overview. An empty AI_API_KEY skips with a message.
 python scripts/phase_t_walkthrough.py
+
+# And for the knowledge base: the API, the worker, and a real EMBEDDING_API_KEY. A PDF and a
+# markdown policy are uploaded, ingestion is waited on, a question the documents answer is
+# asked and one they do not, and a ticket's draft is grounded in the same documents. With
+# EMBEDDING_PROVIDER=fake the pipeline is real but the retrieval ranking is not — the script
+# says so rather than calling a hash-derived vector a demonstration.
+python scripts/phase_x_walkthrough.py
 
 # Frontend (from frontend/)
 npm test
@@ -330,9 +343,10 @@ organization and, for a deactivation, by the victim logging in again.
 
 Everything the API exposes now is tenant-owned. `organizations` is the tenant itself, and
 `refresh_tokens` is read by token hash before a tenant is known — neither is a resource a
-client can list. Knowledge articles arrive in Phase X and follow the identical repository
-pattern. The real-time channel is the one thing that is not a read: it is keyed by
-organization, filtered by one predicate, and covered by its own security suite. See
+client can list. Knowledge documents follow the identical repository pattern, and their chunks
+carry `organization_id` directly so §23's retrieval is tenant-filtered without a join. The
+real-time channel is the one thing that is not a read: it is keyed by organization, filtered by
+one predicate, and covered by its own security suite. See
 [docs/data-model.md](docs/data-model.md).
 
 ## Customers, tickets, and messages
@@ -612,15 +626,17 @@ status cannot use its second column for ordering.
 ## Rate limiting
 
 §45 names five endpoints to limit — login, registration, AI endpoints, knowledge-base
-processing, and file upload. Three of them exist; the other two are built in later phases
-and get no speculative setting. Every limit is a fixed window in Redis and returns
-`429 RATE_LIMITED` with a `Retry-After` header.
+processing, and file upload. All five are covered, by **four** guards: §22's three create routes
+share the upload limit and §23's question shares the AI one, because each is the same act — the same
+object written, the same provider called — as the limitation its twin already has. Every limit is a
+fixed window in Redis and returns `429 RATE_LIMITED` with a `Retry-After` header.
 
 | Endpoint | Key | Window | Default |
 |---|---|---|---|
 | `POST /auth/login` | client address | 1 minute | 10 |
 | `POST /auth/register` | client address | 1 hour | 5 |
-| `POST /tickets/{id}/attachments` | **user id** | 1 hour | 60 |
+| `POST /tickets/{id}/attachments`, `POST /knowledge`, `POST /knowledge/upload` | **user id** | 1 hour | 60 |
+| the AI routes, `POST /knowledge/search` | **user id** | 1 hour | 30 |
 
 All three guards live in one file, [backend/app/api/rate_limits.py](backend/app/api/rate_limits.py),
 so the entire limit surface is auditable in one read — the property that matters for an
@@ -727,7 +743,7 @@ python -m uvicorn app.main:app --loop app.core.event_loop:loop_factory --port 80
 # 2. the worker, from backend/ — --pool=solo because fork is not available on Windows
 #    The -Q list is not optional: a worker that does not name every routed queue consumes
 #    nothing from the ones it omits, silently. See the SLA section.
-celery -A app.workers.celery_app worker --loglevel=info --pool=solo -Q notifications,sla,ai
+celery -A app.workers.celery_app worker --loglevel=info --pool=solo -Q notifications,sla,ai,knowledge
 
 # 3. beat, from backend/ — exactly one process, and it needs no API and no worker
 celery -A app.workers.celery_app beat --loglevel=info -s /tmp/celerybeat-schedule
@@ -857,7 +873,7 @@ minutes" arriving after the deadline would be worse than the miss it describes.
 
 ```bash
 # both, from backend/ — the API is not needed for beat
-celery -A app.workers.celery_app worker --loglevel=info --pool=solo -Q notifications,sla,ai
+celery -A app.workers.celery_app worker --loglevel=info --pool=solo -Q notifications,sla,ai,knowledge
 celery -A app.workers.celery_app beat   --loglevel=info -s /tmp/celerybeat-schedule
 ```
 
@@ -1197,10 +1213,12 @@ key sent to `claude-sonnet-5` fails as a rejected credential, which sends the re
 that is perfectly good — so the mismatch is refused where the message can name both halves and list
 what would work.
 
-**`generate_embedding` is deliberately not in the interface.** §17 lists five methods, and ADR-008
-puts embeddings behind the same interface with a *different* vendor. Declaring it now would give
-`ClaudeProvider` a method it can never serve, so Phase X adds it together with the provider that can
-answer it.
+**`generate_embedding` is on a second protocol, and Phase X is why.** §17 lists five methods on one
+conceptual interface, and ADR-008 puts embeddings behind a *different* vendor. Declaring the method on
+`AIProvider` would give every generation provider a method it can never serve, so there are two
+protocols — `AIProvider` and `EmbeddingProvider` — over one shared `Provider`. ADR-027 deferred the
+method with exactly that argument, and Phase X discharged the deferral rather than reversing it: the
+method exists, on the protocol whose implementations can answer it.
 
 ### The answer is data, never instructions
 
@@ -1398,9 +1416,10 @@ double-click gets everywhere else in this module.
     # the API, from backend/ (.env needs a real AI_API_KEY for the configured provider)
     .venv/Scripts/python.exe -m uvicorn app.main:app \
         --loop app.core.event_loop:loop_factory --port 8000
-    # the worker, in a second terminal — `ai` must be in the -Q list, or the queue is never consumed
+    # the worker, in a second terminal — `ai` and `knowledge` must be in the -Q list, or the
+    # queue is never consumed and a document sits pending forever
     .venv/Scripts/python.exe -m celery -A app.workers.celery_app worker \
-        --pool=solo --loglevel=info -Q notifications,sla,ai
+        --pool=solo --loglevel=info -Q notifications,sla,ai,knowledge
 
     # then, from backend/, with a token in $TOKEN and a customer id in $CUSTOMER
     curl -s -X POST localhost:8000/api/v1/tickets -H "Authorization: Bearer $TOKEN" \
@@ -1459,6 +1478,177 @@ draft is untouched and still internal, the customer now has the reply and still 
 and `/audit-logs` carries `ai_response_accepted` with both bodies and `edited: true`; and it reads
 `/analytics/overview` either side of the acceptance to show `calls` and `cost_usd` did not move —
 §41's accept calls no model, which is also why it carries no `limit_ai`.
+
+## Knowledge base
+
+§22, §23, and §24 — the spec calls this one a *"flagship feature"*, and it is the last AI capability
+the system was designed around and had not built. Every other AI route answers from the model's priors;
+this is what lets an answer be grounded in the organization's own documents.
+[backend/app/services/document_text.py](backend/app/services/document_text.py) turns a PDF, an HTML
+page, or a text file into chunks with no database at all;
+[backend/app/services/knowledge_service.py](backend/app/services/knowledge_service.py) is the one place
+a document is registered, ingested, retrieved, and answered from; and the vector work runs in
+[backend/app/workers/knowledge_tasks.py](backend/app/workers/knowledge_tasks.py) on the `knowledge`
+queue. ADR-032 records the decisions.
+
+**The pipeline is `source → extract → chunk → embed → searchable`, and the last arrow is the worker's.**
+A create route writes a `pending` row, stores the bytes privately if there was a file, and hands a task
+to the broker; the worker reads the document back, extracts its text, cuts it into overlapping chunks,
+embeds them in batches, and sets `status = completed`, `is_published = true`, and the chunk count in one
+transaction. **Until that commit the document is invisible to retrieval**, which is why a search issued a
+second after an upload can honestly answer that it knows nothing yet. Nothing in
+[backend/app/api/knowledge.py](backend/app/api/knowledge.py) imports a provider, so §16's *"the API
+should not wait unnecessarily"* holds structurally — the one exception is the question route, below,
+where a person is waiting for an answer.
+
+**The embedding vendor is a second vendor, so it gets its own three settings.** `EMBEDDING_PROVIDER`,
+`EMBEDDING_API_KEY`, and `EMBEDDING_MODEL` mirror the `AI_*` trio because neither Anthropic nor Groq
+publishes an embedding model (ADR-008): the generation provider and the embedding provider are
+genuinely different vendors, and one key shared between them would be a setting one of the two never
+reads. `text-embedding-3-small` at 1536 dimensions is what `knowledge_chunks.embedding` has been
+declared to hold since Phase D. The protocol is a second one too — `EmbeddingProvider` beside
+`AIProvider`, both behind `Provider` — because declaring `generate_embedding` on the generation
+interface would give each vendor a method it can never serve, which is exactly why ADR-027 deferred it.
+
+### Asking a question, and the answer that is a refusal
+
+`POST /api/v1/knowledge/search` embeds the question, searches **published and completed chunks scoped to
+the caller's tenant**, and then takes one of two branches:
+
+- **No passage clears `RETRIEVAL_MIN_SIMILARITY`** → the response is §24's sentence with `sources: []`,
+  and **no model call is made at all**. There is nothing to ground an answer in, so nothing is asked to
+  write one — cheaper than a hedged answer and strictly more honest, since a model in the loop could
+  only answer from its priors or invent a citation. It is also why there is no `grounded` boolean: an
+  empty `sources` list is the whole of that fact, and a second field for one fact is how the two come to
+  disagree.
+- **Something does** → one grounded call. The model is handed the numbered passages and §24's four
+  rules, and returns an answer with its own claim about which passages it used.
+
+**The citations are the server's, not the model's.** `used_sources` are model-chosen 1-based indices;
+the service resolves each against the passages it actually supplied and **drops any index that names
+nothing**, with a log line. Dropping is not fabricating, and a model that cited `[7]` when handed three
+passages still wrote a usable answer — §24's *"do not fabricate citations"* is served by the mapping
+rather than by hoping the model obeys. The order a caller sees is by descending similarity, so the first
+source is the passage retrieval considered the best match rather than the first one the model named.
+
+**§21's suggested replies read the same retrieval.** A draft for a ticket that has knowledge to retrieve
+is grounded in it — the third block in `prompts.draft_content`, the additive change ADR-031 forecast.
+**Retrieval there is fail-open**: an embedding outage or an empty result is logged and the draft
+proceeds on the ticket and its conversation alone, because a drafting feature that dies when retrieval
+is down is worse than a draft that is merely less grounded. An organization with nothing published
+**makes no embedding call at all** — one indexed `EXISTS` answers that — so a tenant that has never
+opened the knowledge base never pays for a vector it cannot use, and every §21 test from before this
+phase still makes exactly the calls it made before.
+
+### The six routes
+
+| Route | Capability | What it does |
+|---|---|---|
+| `POST /api/v1/knowledge` | `kb:upload` (+ upload limit) | text or a URL; `201`, and the row is `pending` |
+| `POST /api/v1/knowledge/upload` | `kb:upload` (+ upload limit) | multipart; the object is stored before the row commits |
+| `GET /api/v1/knowledge` | `kb:list` | paginated; `q` filters the title |
+| `GET /api/v1/knowledge/{document_id}` | `kb:list` | one document's metadata and processing state |
+| `DELETE /api/v1/knowledge/{document_id}` | `kb:delete` | `204`; removes the chunks, the stored object, and the row |
+| `POST /api/v1/knowledge/search` | `ai:query_knowledge` (+ AI limit) | the grounded answer, or §24's refusal |
+
+Which capability each takes is §3's matrix read literally rather than invented: the matrix has no "view
+document" row, so reading takes the list capability, exactly as `GET /customers/{id}` takes
+`CUSTOMER_LIST`. **Nothing in the matrix changed in this phase** — all four capabilities were declared
+in Phase C — so this table is a reading of the existing grants, not a new policy:
+
+| Role | `kb:list` | `kb:upload` | `kb:delete` | `ai:query_knowledge` |
+|---|---|---|---|---|
+| Admin | ✅ | ✅ | ✅ | ✅ |
+| Manager | ✅ | — | — | ✅ |
+| Agent | ✅ | — | — | ✅ |
+| Customer | — | — | — | — |
+
+**Only an admin may add or remove a document.** An agent who could paste a policy into the knowledge
+base could change what every other agent's grounded answers say — a write that reaches across the
+organization rather than across one ticket — which is why §3 gives the writes to the admin and the read
+and the question to everyone who works tickets. The customer holds none of the four, so §23's retrieval
+is not reachable from the portal at all.
+
+### Who owns what
+
+- **The worker publishes; no route does.** `is_published` is written once, by a successful ingestion, in
+  the same transaction as `status = completed`. There is no publish endpoint and no field in a create
+  body, because a field whose `false` value nothing can undo is a trap; withdrawing a document means
+  deleting it, which is audited as `knowledge_document_deleted`. Publishing is *not* audited, and §34's
+  list is why — it has exactly the two knowledge actions this phase implements and no third.
+- **A URL is fetched by the worker, never by the request.** `app/services/url_fetch.py` guards the hop:
+  only `http`/`https`, and the **resolved address** rather than the hostname is checked, so a public
+  name pointing at `127.0.0.1` is refused on the hop that resolves it, and a redirect is re-checked
+  rather than followed blindly. DNS rebinding between the check and the connect is a residual risk and
+  is named rather than papered over (ADR-032).
+- **A failed document says why, in a sentence a person may read.** `error_message` holds the reason —
+  "the extraction produced no text" for a scanned PDF, for instance — and never a provider's raw
+  payload, which is `app/ai/errors.py`'s rule and holds here for the same reason: that text is rendered
+  to an admin.
+- **Deletion removes three things in the order that cannot come apart.** The stored object first, then
+  the row, whose chunks the foreign key cascades in the same statement. The failure mode is therefore a
+  document whose bytes are gone and which is still listed — visible, and fixable by deleting again —
+  never a visible document pointing at nothing.
+- **A question is a `POST` that reads nothing.** A question is up to two thousand characters of free
+  text, and a `GET` would put it in a URL, and so in every access log and `Referer` header on the way.
+  A body keeps a customer's words out of the parts of the system that record strings.
+
+### Verifying it by hand
+
+The worker must name the `knowledge` queue, or ingestion is never consumed and the document sits
+`pending` forever:
+
+    # the API, from backend/ (.env needs AI_API_KEY and EMBEDDING_API_KEY)
+    .venv/Scripts/python.exe -m uvicorn app.main:app \
+        --loop app.core.event_loop:loop_factory --port 8000
+    # the worker, in a second terminal — `knowledge` must be in the -Q list
+    .venv/Scripts/python.exe -m celery -A app.workers.celery_app worker \
+        --pool=solo --loglevel=info -Q notifications,sla,ai,knowledge
+
+    # then, from backend/, with a token in $TOKEN
+    # 1. a policy from text the client already has
+    curl -s -X POST localhost:8000/api/v1/knowledge -H "Authorization: Bearer $TOKEN" \
+         -H 'Content-Type: application/json' \
+         -d '{"title":"Refund policy","content":"Refunds are processed within five working days of approval."}'
+    # 2. a PDF from disk
+    curl -s -X POST localhost:8000/api/v1/knowledge/upload -H "Authorization: Bearer $TOKEN" \
+         -F 'title=Product handbook' -F 'file=@handbook.pdf;type=application/pdf'
+    # 3. a page from the web, fetched by the worker under the guard
+    curl -s -X POST localhost:8000/api/v1/knowledge -H "Authorization: Bearer $TOKEN" \
+         -H 'Content-Type: application/json' \
+         -d '{"title":"Status page","url":"https://example.com/status"}'
+
+    # a second later, each reads `completed` with a chunk_count — and the title filter finds one
+    curl -s "localhost:8000/api/v1/knowledge?q=refund" -H "Authorization: Bearer $TOKEN"
+    curl -s localhost:8000/api/v1/knowledge/$DOCUMENT -H "Authorization: Bearer $TOKEN"
+
+    # 4. a question the documents answer — the answer, and the passages it came from
+    curl -s -X POST localhost:8000/api/v1/knowledge/search -H "Authorization: Bearer $TOKEN" \
+         -H 'Content-Type: application/json' \
+         -d '{"question":"How long do refunds take?"}'
+    # → 200 {"answer":"Refunds are processed within five working days of approval.",
+    #        "sources":[{"document_id":"…","document_title":"Refund policy",
+    #                    "chunk_index":0,"excerpt":"Refunds are processed within…","similarity":0.87}]}
+
+    # 5. a question they do not — no model call, and nothing cited
+    curl -s -X POST localhost:8000/api/v1/knowledge/search -H "Authorization: Bearer $TOKEN" \
+         -H 'Content-Type: application/json' \
+         -d '{"question":"What is our parental leave policy?"}'
+    # → 200 {"answer":"The knowledge base does not contain sufficient information to answer that question.",
+    #        "sources":[]}
+
+    # 6. the same documents ground a ticket's draft, and the customer never sees it
+    curl -s -X POST localhost:8000/api/v1/tickets/$TICKET/ai/suggest-response -H "Authorization: Bearer $TOKEN"
+    curl -s localhost:8000/api/v1/tickets/$TICKET/ai/analyses -H "Authorization: Bearer $TOKEN"
+
+Step 5 is the one worth pausing on: the response is a `200` with a real answer sentence, because §24's
+refusal *is* the answer — the caller asked whether the organization's documents cover something, and
+"no" is a complete reply. What it does not have is a `sources` list, and reading
+`ai_usage` after it shows no new row for the question: nothing was called, so there is nothing to bill.
+
+The whole thing end to end, with a real PDF and a real markdown policy:
+
+    .venv/Scripts/python.exe scripts/phase_x_walkthrough.py
 
 ## Security posture
 
@@ -1593,6 +1783,34 @@ Implemented in Phase T:
   ledger at its real cost instead of as a zero row. Found while writing this phase's tests, and
   pinned by one that drives the real provider against a fake SDK client.
 
+Implemented in Phase X:
+
+- **§23's *"critical requirement"* — tenant isolation on retrieval — is asserted on the result, not
+  the query.** [tests/security/test_knowledge_isolation.py](backend/tests/security/test_knowledge_isolation.py)
+  gives org B a published chunk whose vector makes it the *nearest neighbour* to org A's question and
+  shows it never appears in org A's sources. That is the only form of the claim worth making: a test
+  that asserted the `WHERE` clause would pass while the ranking leaked. Asserting it on the response
+  also produced an honest finding recorded in the test — the tenant predicate has two arms, and
+  removing either one alone still passes; only removing both fails.
+- **Embeddings are validated output like any other AI result.** `Embedding` carries the width check
+  against `EMBEDDING_DIMENSIONS`, so a 3072-dimension vector is an `AIOutputError` rather than a driver
+  error at insert, and the provider checks the vector *count* against the number of texts it sent — the
+  one shape check a schema validator cannot make, because it cannot see the request.
+- **The URL fetch guard is an address decision, not a name one.**
+  [tests/unit/test_url_fetch.py](backend/tests/unit/test_url_fetch.py) refuses non-`http`/`https`
+  schemes, loopback, private, and link-local ranges, and re-checks **every redirect hop** rather than
+  the original URL — because a public hostname that resolves to `127.0.0.1` is exactly the attack a
+  hostname check misses.
+- **A knowledge document cannot be reached across tenants**, read or deleted: both are a `404`
+  identical to one that never existed, since confirming an id exists elsewhere is a fact about another
+  tenant's data (ADR-009). Both routes are asserted.
+- **§24's *"do not fabricate citations"* is a mapping, not a trust.** The model's `used_sources` are
+  indices resolved against the passages actually supplied; an index outside that range is dropped with
+  a log line, and a test drives a model that cites a passage it was never given.
+- **§21's *"never automatically send"* survives grounding.** Retrieval changed what a draft is *made
+  of* and left the type alone — a `SuggestedReply` with no sender, no status, and no confidence — so
+  the new thing that could have broken the guarantee did not.
+
 Two trade-offs are deliberate and recorded in ADR-014: the login limiter **fails open**
 when Redis is unreachable (it is an abuse control, not an authentication control, and
 failing closed would turn a Redis blip into a total login outage), and it is keyed on
@@ -1619,8 +1837,8 @@ instead; see [Rate limiting](#rate-limiting).
 | R | WebSockets, real-time fan-out | ✅ |
 | S | Analytics | ✅ |
 | T | AI foundation: provider, structured output, retry, usage ledger | ✅ |
-| U–W | AI analysis, summaries, drafts | next |
-| X | Knowledge base and RAG | |
+| U–W | AI analysis, summaries, drafts | ✅ |
+| X | Knowledge base and RAG | ✅ |
 | Y–Z | Hardening, deployment | |
 
 ## Known limitations
@@ -1632,7 +1850,9 @@ instead; see [Rate limiting](#rate-limiting).
   applying migrations. That keeps tests fast, and the drift check in
   [tests/integration/test_migrations.py](backend/tests/integration/test_migrations.py)
   is what stops the two from diverging.
-- The embedding provider is deliberately undecided until Phase X (ADR-008).
+- The embedding provider is a second vendor with its own three settings, because neither Anthropic
+  nor Groq publishes an embedding model (ADR-008, ADR-032). `text-embedding-3-small` is the default;
+  the `fake` is refused outside `ENVIRONMENT=test` as `AI_PROVIDER=fake` is.
 - Redis carries rate limiting, the Celery broker, real-time pub/sub, and the analytics read-through
   cache (ADR-022, ADR-025, ADR-026).
 - **A stale aggregate can outlive a Redis outage by up to one TTL.** A write during an outage
@@ -1661,17 +1881,23 @@ instead; see [Rate limiting](#rate-limiting).
   its own commit, so the analytics block is current as of the last analysis. `ai_service` called by
   something that staged a row and never committed would still leave it stale; no production path
   does, and the worker is what makes that true rather than the service.
-- **No embeddings and no `generate_embedding` method until Phase X.** ADR-008 puts embeddings behind
-  the same interface with a different vendor, so the method is absent rather than stubbed.
-  `EMBEDDING_MODEL` is declared in `.env.example` and read by nothing.
+- **Retrieval is one vector query, one threshold, one prompt.** No hybrid search, no re-ranking, no
+  query rewriting, and no answer cache — §22's flow and no more. `knowledge_chunks.embedding_model` is
+  written so a model change can be re-embedded later, but nothing reads it yet, so changing
+  `EMBEDDING_MODEL` leaves existing chunks unmatchable until a later phase adds the sweep.
+- **A scanned PDF extracts to nothing, and lands as a *failed* document.** There is no OCR. The reason
+  says the extraction produced no text, which is the honest outcome rather than an empty document that
+  answers nothing and looks fine.
+- **A document can be published, and not yet withdrawn.** `is_published` is set once by the worker and
+  no route clears it; the column is independent of `status` so a later phase's editorial switch can,
+  and this phase does not build it.
 - **The fake provider is test-only, and the configuration refuses it elsewhere.** `AI_PROVIDER=fake`
   with any `ENVIRONMENT` other than `test` fails at startup (§60), asserted by a test rather than
   trusted. That is also why the fake is not a fallback for a missing key.
-- **An AI call is not rate-limited, because there is no route to limit.** §45 names AI endpoints;
-  they arrive in Phases U–W, and the limit arrives with its consumer as every other one did.
-- **Nothing caches an AI result yet.** `ai_usage.was_cached` is written `False` on every row, and
-  §20’s "avoid regenerating" is Phase V’s — writing `True` for a call that reached the provider
-  would corrupt the measurement the column exists for.
+- **Only summaries are cached.** A suggested reply and a knowledge answer make a real call every time,
+  because a second request for a draft is a person asking for a *different* one and §23 asks a question
+  and gets an answer rather than a stored one. `ai_usage.was_cached` is `True` only on a summary served
+  from storage.
 - **The prompt-injection defence is fencing, and fencing is not a guarantee.** Customer text is
   delimited and told it is data, and the fence cannot be spelled by a customer, but prompt injection
   is unsolved. The containment that does not depend on it is that an answer must be a validated

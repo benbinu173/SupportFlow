@@ -92,6 +92,33 @@ def build_key(organization_id: uuid.UUID, ticket_id: uuid.UUID) -> str:
     return f"{organization_id}/{ticket_id}/{uuid.uuid4().hex}"
 
 
+def build_knowledge_key(
+    organization_id: uuid.UUID, document_id: uuid.UUID, *, extension: str
+) -> str:
+    """The object key for a knowledge document's uploaded source file.
+
+    `build_key` with a third component that names a different parent, and the same three
+    properties: no client input, one writer per caller, and a UUID that needs no uniqueness
+    check. **The tenant is the first component in both**, which is what makes a bucket a
+    browsable map of which tenant owns what — the property an orphaned object is diagnosed by.
+
+    **The extension is carried on the key, and it is the one caller-supplied character in it.**
+    An upload's text is extracted in a worker rather than in the request that received it, and
+    the document row has no content-type column — so without this the worker would have to
+    guess how to read the bytes it just fetched. The value is not the client's claim:
+    `app/core/file_validation.py` has already refused the upload unless the extension, the
+    declared type, and the leading bytes all agreed, so what arrives here is a suffix the
+    bytes were shown to own. `app/services/knowledge_service.py` reads it back through
+    `EXTENSIONS`, which is the same table that admitted it.
+
+    A separate function rather than a parameter on `build_key`, because the two are not the
+    same shape: an attachment belongs to a ticket and a knowledge document does not, and a
+    shared builder taking an optional `ticket_id` would be one function with two meanings. The
+    prefix is what tells a lifecycle rule, and a person, which kind an object is.
+    """
+    return f"{organization_id}/knowledge/{document_id}/{uuid.uuid4().hex}{extension}"
+
+
 def _is_missing(exc: ClientError) -> bool:
     """Whether an S3 error means "no such object" rather than "storage is broken"."""
     return exc.response.get("Error", {}).get("Code") in {"404", "NoSuchKey", "NotFound"}
@@ -125,6 +152,68 @@ async def put_object(key: str, fileobj: Any, *, content_type: str) -> None:
         # OSError as well as the botocore pair: a refused connection surfaces from the
         # socket layer, and "MinIO is not running" is exactly the case this is for.
         logger.error("storage_put_failed", key=key, error=str(exc))
+        raise StorageUnavailableError() from exc
+
+
+async def read_object(key: str) -> bytes:
+    """The whole object, for a caller that is going to process the bytes rather than forward them.
+
+    **`open_stream` is the right shape for a response and the wrong one for a worker.** A
+    download wants one 64 KiB piece at a time so a 25 MiB attachment never sits in memory; text
+    extraction wants the file whole, because a PDF's cross-reference table is at the end and
+    pypdf re-reads the buffer as it walks it. So this allocates the object once, on purpose, and
+    the caller that uses it is bounded by `MAX_KNOWLEDGE_DOCUMENT_BYTES` before it gets here.
+
+    The read happens in a worker thread, like every other call in this module: `get_object` and
+    `body.read()` are both blocking, and a Celery task's loop must not be. The translation is
+    `open_stream`'s, including the distinction between "the object is not there" and "storage is
+    broken" — the first is an inconsistency worth an error log, and both are 503s.
+    """
+    settings = get_settings()
+
+    def _read() -> bytes:
+        body = _shared_client().get_object(Bucket=settings.S3_BUCKET, Key=key)["Body"]
+        try:
+            data: bytes = body.read()
+            return data
+        finally:
+            body.close()
+
+    try:
+        return await anyio.to_thread.run_sync(_read)
+    except ClientError as exc:
+        if _is_missing(exc):
+            logger.error("storage_object_missing", key=key)
+        else:
+            logger.error("storage_get_failed", key=key, error=str(exc))
+        raise StorageUnavailableError() from exc
+    except (BotoCoreError, OSError) as exc:
+        logger.error("storage_get_failed", key=key, error=str(exc))
+        raise StorageUnavailableError() from exc
+
+
+async def delete_object(key: str) -> None:
+    """Remove the object under `key`.
+
+    **Idempotent, and that is S3's semantics rather than a decision made here**: deleting a key
+    that does not exist succeeds. It suits the one caller — deleting a knowledge document
+    removes its stored source as well as its row — because a retried deletion, or a document
+    whose object was never written, should not fail the request that is trying to clean up.
+
+    Called **before** the row is deleted, so the pair cannot come apart in the direction that
+    matters: an object whose row is gone is an orphan nothing points at and a lifecycle rule can
+    collect, and a row whose object is gone is a document an administrator can see and cannot
+    re-ingest. The first is a mess; the second is a bug report.
+    """
+    settings = get_settings()
+
+    def _delete() -> None:
+        _shared_client().delete_object(Bucket=settings.S3_BUCKET, Key=key)
+
+    try:
+        await anyio.to_thread.run_sync(_delete)
+    except (BotoCoreError, ClientError, OSError) as exc:
+        logger.error("storage_delete_failed", key=key, error=str(exc))
         raise StorageUnavailableError() from exc
 
 

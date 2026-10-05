@@ -260,3 +260,134 @@ def test_an_ai_setting_that_would_break_the_call_path_is_refused(
     """
     with pytest.raises(ValidationError):
         _settings(**override)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Embeddings and retrieval (Phase X)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_the_embedding_provider_defaults_to_the_real_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A default is what a deployment gets when nobody decides, and here it is no vendor fallback.
+
+    The mirror of `test_the_ai_provider_defaults_to_the_real_one`, and the reason it is worth a
+    line of its own: `openai` is the *only* implementation of §22's protocol, so a default of
+    `fake` would leave a deployment that never set the variable embedding its corpus with hashed
+    vectors — retrieval that returns results and ranks them meaninglessly.
+
+    The variable is unset rather than assumed absent: conftest pins it, and `_env_file=None`
+    suppresses dotenv without touching the process environment. Same pattern as the AI setting's
+    test above.
+    """
+    monkeypatch.delenv("EMBEDDING_PROVIDER", raising=False)
+
+    assert _settings().EMBEDDING_PROVIDER == "openai"
+
+
+@pytest.mark.unit
+def test_an_embedding_model_from_another_vendor_is_refused() -> None:
+    """The second pairing, and the reason it is a second pairing.
+
+    `claude-sonnet-5` is a priced model — the check above proves it — so it passes the "do we
+    know this rate?" test and then reaches an OpenAI endpoint holding an OpenAI key, which
+    rejects a model name it does not serve. `_the_model_is_served_by_the_provider` answers the
+    embedding side of the same question with the embedding vendor, and this is the assertion
+    that it is a genuinely separate pairing rather than one check reading the wrong fields.
+
+    Explicitly `EMBEDDING_PROVIDER="openai"` because conftest pins `fake`, and the fake's branch
+    is skipped by design — a scripted provider serves whatever it is told to.
+    """
+    with pytest.raises(
+        ValidationError, match="is served by 'anthropic', not by EMBEDDING_PROVIDER='openai'"
+    ):
+        _settings(EMBEDDING_PROVIDER="openai", EMBEDDING_MODEL="claude-sonnet-5")
+
+
+@pytest.mark.unit
+def test_an_unpriced_embedding_model_is_refused() -> None:
+    """The same rate check the generation model gets, on the field a deployment got wrong.
+
+    A name from the era before `text-embedding-ada-002` was retired is plausible enough to be
+    typed, and without this it would write `cost_usd = 0` for every ingestion — a corpus
+    embedded for what the dashboard renders as free.
+    """
+    with pytest.raises(ValidationError, match="has no published rate"):
+        _settings(EMBEDDING_PROVIDER="openai", EMBEDDING_MODEL="text-embedding-ada-002")
+
+
+@pytest.mark.unit
+def test_the_embedding_model_and_its_own_vendor_are_accepted() -> None:
+    """The same pair, one field over — so this is a pairing and not a ban on embeddings."""
+    settings = _settings(EMBEDDING_PROVIDER="openai", EMBEDDING_MODEL="text-embedding-3-small")
+
+    assert (settings.EMBEDDING_PROVIDER, settings.EMBEDDING_MODEL) == (
+        "openai",
+        "text-embedding-3-small",
+    )
+
+
+@pytest.mark.unit
+def test_the_fake_embedding_provider_is_refused_outside_tests() -> None:
+    """§60 applies to the embedding vendor too, which is why one validator covers both.
+
+    A knowledge base answered from hash-derived vectors would be indistinguishable from one
+    answered from embeddings — the API returns 200 either way — and the retrieval *ranking*
+    would be meaningless. That is exactly the shape of "fake AI results in the final
+    implementation" the spec forbids, so the guard is shared rather than repeated.
+
+    `ENVIRONMENT=test` is what the suite runs as, so it is overridden here; the message names
+    `EMBEDDING_PROVIDER` because that is the field that failed.
+    """
+    with pytest.raises(ValidationError, match="EMBEDDING_PROVIDER=fake"):
+        _settings(EMBEDDING_PROVIDER="fake", ENVIRONMENT="development")
+
+
+@pytest.mark.unit
+def test_a_blank_embedding_model_falls_back_to_the_default() -> None:
+    """`.env.example` ships the key with no value, and empty is "not set", not a model.
+
+    Without this the copied file fails startup with *"'' has no published rate"* — a message
+    about a model nobody chose. `_blank_model_is_the_default` is the fix, and this is the field
+    that motivated it (the generation model is covered by the same validator).
+
+    The provider is left at the suite's `fake` so this asserts the fallback and nothing else;
+    the default model is asserted directly, which is what a deployment copying the template
+    reaches once `EMBEDDING_PROVIDER` is its own default.
+    """
+    assert _settings(EMBEDDING_MODEL="").EMBEDDING_MODEL == "text-embedding-3-small"
+    assert _settings(EMBEDDING_MODEL="   ").EMBEDDING_MODEL == "text-embedding-3-small"
+
+
+@pytest.mark.unit
+def test_embeddings_are_optional_and_a_blank_key_is_absent() -> None:
+    """The `AI_API_KEY` argument, one field over: a blank key is not a credential.
+
+    Unlike AI, there is no non-fake provider a checkout can fall back to without a key — the
+    knowledge routes refuse at the point of use — so the `None` half is what lets the whole
+    suite run and a self-hosted installation start with no embeddings configured.
+    """
+    assert _settings().EMBEDDING_API_KEY is None
+    assert _settings(EMBEDDING_API_KEY="").EMBEDDING_API_KEY is None
+    assert _settings(EMBEDDING_API_KEY="   ").EMBEDDING_API_KEY is None
+    assert _settings(EMBEDDING_API_KEY="sk-proj-real").EMBEDDING_API_KEY == "sk-proj-real"
+
+
+@pytest.mark.unit
+def test_the_retrieval_threshold_is_a_probability() -> None:
+    """Cosine similarity is bounded to [-1, 1], and a threshold outside it answers nonsense.
+
+    Above 1, nothing ever clears it and the product refuses every question — silently, since
+    the refusal is a well-formed answer. Below 0, a passage that is *anti*-correlated with the
+    question is treated as relevant, and it is that passage the model is then asked to ground
+    an answer in. Both are configuration mistakes with no error of their own, so both are
+    refused where they are written.
+    """
+    assert _settings(RETRIEVAL_MIN_SIMILARITY="0.5").RETRIEVAL_MIN_SIMILARITY == 0.5
+
+    with pytest.raises(ValidationError):
+        _settings(RETRIEVAL_MIN_SIMILARITY="1.5")
+    with pytest.raises(ValidationError):
+        _settings(RETRIEVAL_MIN_SIMILARITY="-0.1")

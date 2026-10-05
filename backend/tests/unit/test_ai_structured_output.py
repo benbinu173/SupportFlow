@@ -26,17 +26,25 @@ from app.schemas.ai import (
     SentimentResult,
     SuggestedReply,
 )
+from app.schemas.knowledge import KnowledgeAnswer
 
 pytestmark = pytest.mark.unit
 
 # Every output schema the AI layer can produce. Parameterised over rather than listed
 # three times, so a fifth schema added later is covered by the shared properties below
 # without anybody remembering to add it.
+#
+# **Phase X is that fifth schema, and it arrived from the other protocol.** `KnowledgeAnswer`
+# is answered by the retrieval call rather than by one of `AIProvider`'s four, and it reaches
+# the provider through the same `validate_output` — so it belongs in this table for the same
+# reason the other four do, and the fact that it is governed by a second protocol is exactly
+# why the table is a tuple of schemas rather than a walk of one module's methods.
 ALL_SCHEMAS: tuple[type[BaseModel], ...] = (
     Classification,
     ConversationSummary,
     SentimentResult,
     SuggestedReply,
+    KnowledgeAnswer,
 )
 
 
@@ -237,6 +245,55 @@ def test_multiple_failures_are_summarised_not_dumped() -> None:
 
     # Counted as separators: the cap is five named failures, and the message stops there.
     assert str(caught.value).count(";") <= 4
+
+
+# ---------------------------------------------------------------------------
+# §23's answer schema
+# ---------------------------------------------------------------------------
+
+
+def test_a_grounded_answer_validates_and_keeps_its_indices() -> None:
+    """`used_sources` arrives as the model wrote it and is **not** checked here.
+
+    Resolving an index into a chunk is the caller's job, because only the caller holds the list
+    of passages that were numbered. So an index past the end of that list is a legal value at this
+    layer — `{"answer": ..., "used_sources": [7]}` is what a model that cited a passage it was
+    not given produces, and refusing it here would replace a usable answer with a 502. §24's
+    "do not fabricate citations" is served by the mapping in `knowledge_service`, not by this
+    validator, and the two are separate on purpose.
+    """
+    result = validate_output(
+        KnowledgeAnswer, {"answer": "Refunds take 5 working days.", "used_sources": [1, 3]}
+    )
+
+    assert isinstance(result, KnowledgeAnswer)
+    assert result.used_sources == [1, 3]
+
+
+def test_an_answer_with_no_sources_is_legal() -> None:
+    """An empty list is a real answer, not a malformed one — a model that used nothing says so.
+
+    §24's closing sentence lives in `KNOWLEDGE_INSTRUCTION`, so a model that read the passages
+    and found they did not settle the question answers in prose and cites nothing. Treating that
+    as a rejection would turn the specification's own refusal into an error.
+    """
+    result = validate_output(
+        KnowledgeAnswer, {"answer": "The knowledge base does not say.", "used_sources": []}
+    )
+
+    assert result.used_sources == []
+
+
+def test_an_answer_missing_its_citations_is_rejected() -> None:
+    """`used_sources` is required, and the contrast with an empty list is the point.
+
+    An answer that names no passages *and says so with an empty list* is the refusal §24 asks for.
+    An answer with the field absent is a model that did not follow the shape — and defaulting it
+    would let a truncated response pass as a deliberate "I used nothing", which is the one
+    outcome the caller cannot tell apart from a real refusal.
+    """
+    with pytest.raises(AIOutputError, match="used_sources: missing"):
+        validate_output(KnowledgeAnswer, {"answer": "Refunds take 5 working days."})
 
 
 # ---------------------------------------------------------------------------
