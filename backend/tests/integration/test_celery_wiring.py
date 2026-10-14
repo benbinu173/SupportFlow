@@ -28,6 +28,7 @@ from app.core.config import get_settings
 from app.workers.celery_app import (
     AI_QUEUE,
     KNOWLEDGE_QUEUE,
+    MAINTENANCE_QUEUE,
     NOTIFICATIONS_QUEUE,
     SLA_QUEUE,
     celery_app,
@@ -199,13 +200,18 @@ def test_one_worker_process_takes_one_task_at_a_time() -> None:
 def test_every_task_route_names_a_queue_that_exists() -> None:
     """§51's Phase P asks for task routing, and Phase Q adds the second queue.
 
-    Four queues now, each named for its purpose, and the route table's entries are what make
+    Five queues now, each named for its purpose, and the route table's entries are what make
     each destination explicit instead of relying on the default queue's name. The queue that
     will join them is `reports` (S) — not declared here, because declaring a queue nothing
     publishes to is a worker process waiting for work that does not exist. `ai` and
     `knowledge` were both on that list from Phase P until the phases that produced them
-    (U and X), which is the rule this docstring is really about: **a queue arrives the phase
-    its producer does.**
+    (U and X), and `maintenance` was on it until ADR-033's Finding 1 — the rule this
+    docstring is really about: **a queue arrives the phase its producer does.**
+
+    `maintenance` is the one that did not arrive with a *producer* in the business sense: it
+    is the abandonment sweep, which exists so that a claim welded shut by a hard time limit
+    has something that releases it. Its route entry is what keeps the sweep off the queues
+    that carry a customer's email, so a slow reaper cannot delay a notification.
 
     Asserted as an exact table rather than as "the expected entries are present", so a route
     added without a queue to serve it — or a queue added without a route publishing to it —
@@ -220,21 +226,23 @@ def test_every_task_route_names_a_queue_that_exists() -> None:
         "app.workers.sla_tasks.*": {"queue": SLA_QUEUE},
         "app.workers.ai_tasks.*": {"queue": AI_QUEUE},
         "app.workers.knowledge_tasks.*": {"queue": KNOWLEDGE_QUEUE},
+        "app.workers.maintenance_tasks.*": {"queue": MAINTENANCE_QUEUE},
     }
     assert {route["queue"] for route in routes.values()} == {
         NOTIFICATIONS_QUEUE,
         SLA_QUEUE,
         AI_QUEUE,
         KNOWLEDGE_QUEUE,
+        MAINTENANCE_QUEUE,
     }
 
 
 def test_the_worker_command_names_every_routed_queue() -> None:
-    """The four-queue trap, closed by reading the two files that start a worker.
+    """The five-queue trap, closed by reading the two files that start a worker.
 
     A Celery worker consumes the queues it is told to and nothing else. With one queue that
     is invisible — the default is the only queue that exists, so a missing `-Q` still
-    works. With four, a worker started without `-Q knowledge` **consumes nothing from it**
+    works. With five, a worker started without `-Q knowledge` **consumes nothing from it**
     while looking perfectly healthy: it connects, reports ready, and leaves every document
     sitting `pending` in Redis forever. There is no error, no metric, and no log line,
     because from Celery's point of view nothing is wrong.
@@ -321,7 +329,7 @@ def test_the_task_module_is_imported_so_the_worker_can_find_it() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_the_beat_schedule_is_exactly_the_sla_sweep() -> None:
+def test_the_beat_schedule_is_exactly_the_two_sweeps() -> None:
     """§48's "celery beat where needed", and Phase Q is where it is needed.
 
     Phase P had no schedule and this file asserted the emptiness; the comment on the old
@@ -331,25 +339,39 @@ def test_the_beat_schedule_is_exactly_the_sla_sweep() -> None:
     check, because an entry added without a beat container to run it is a feature that
     silently never fires.
 
+    **The second entry is ADR-033's remedy, and it is the reason this test is named for two
+    sweeps rather than one.** Finding 1 was that a claim is a latch: `run_analysis` flips a
+    row to `processing` and, if the process dies before it finishes, nothing in the
+    application ever moves it again — the strict claim that Finding 2's fix introduces makes
+    that worse, not better, because the old over-permissive filter was accidentally
+    recovering some of these on redelivery. `reap_abandoned_claims` is what releases them,
+    and beat is the only thing that runs it. Delete this schedule entry and every abandoned
+    analysis stays `processing` forever with no error anywhere.
+
     The task name is a string in the schedule and a string in the decorator, and nothing in
     the application relates the two: Celery resolves the name at fire time and fails on a
     typo by logging a `NotRegistered` error into beat's output, where nobody is looking. The
-    lookup below closes that.
+    lookups below close that, for both entries.
 
     **The import is what a worker's `include` does**, and it is here rather than at module
     scope for the reason this whole file gives — importing a task module builds an engine,
     and only the test that needs the registry should do it. `include` itself is asserted by
-    the test further down; this one is about the *name* in the schedule matching a task the
-    module actually registered.
+    the test further down; this one is about the *names* in the schedule matching tasks the
+    modules actually registered.
     """
-    from app.workers import sla_tasks  # noqa: F401  (registers the tasks, as `include` does)
+    from app.workers import maintenance_tasks, sla_tasks  # noqa: F401  (as `include` does)
 
     schedule = celery_app.conf.beat_schedule
 
-    assert list(schedule) == ["sla-deadline-sweep"]
-    entry = schedule["sla-deadline-sweep"]
-    assert entry["task"] == "app.workers.sla_tasks.check_sla_deadlines"
-    assert entry["task"] in celery_app.tasks, "beat would fire a task nobody registered"
+    assert list(schedule) == ["sla-deadline-sweep", "abandoned-claim-sweep"]
+
+    sla = schedule["sla-deadline-sweep"]
+    assert sla["task"] == "app.workers.sla_tasks.check_sla_deadlines"
+    assert sla["task"] in celery_app.tasks, "beat would fire a task nobody registered"
+
+    abandoned = schedule["abandoned-claim-sweep"]
+    assert abandoned["task"] == "app.workers.maintenance_tasks.reap_abandoned_claims"
+    assert abandoned["task"] in celery_app.tasks, "beat would fire a task nobody registered"
 
 
 def test_the_sweep_runs_on_the_configured_interval() -> None:
@@ -366,6 +388,24 @@ def test_the_sweep_runs_on_the_configured_interval() -> None:
 
     entry = celery_app.conf.beat_schedule["sla-deadline-sweep"]
     assert float(entry["schedule"]) == float(settings.SLA_SWEEP_INTERVAL_SECONDS)
+
+
+def test_the_abandoned_claim_sweep_runs_on_its_own_coarser_interval() -> None:
+    """The reaper's clock comes from settings, and it is deliberately not the SLA sweep's.
+
+    The two are different knobs because they answer different questions. The SLA sweep's
+    interval bounds how *late* a warning can be, so it is small and the cost of being wrong
+    is a late email. The reaper's interval bounds how long a user waits after a crash before
+    the operation they asked for can be asked for again — and nothing can be reaped until
+    `ABANDONED_CLAIM_AFTER_SECONDS` has already passed, so a second pass at a finer interval
+    finds the same rows and changes nothing. Asserted separately from the SLA entry rather
+    than as a loop over both, because the failure this catches is the two being wired to the
+    same setting, which a loop with one expected value would hide.
+    """
+    settings = get_settings()
+
+    entry = celery_app.conf.beat_schedule["abandoned-claim-sweep"]
+    assert float(entry["schedule"]) == float(settings.ABANDONED_CLAIM_SWEEP_INTERVAL_SECONDS)
 
 
 def test_the_sla_tasks_are_registered_under_their_routed_names() -> None:
@@ -457,6 +497,35 @@ def test_the_ingestion_task_is_registered_under_its_routed_name() -> None:
         if ingest_document.name.startswith(pattern.rstrip("*"))
     ]
     assert matched == ["app.workers.knowledge_tasks.*"]
+
+
+def test_the_reaper_is_registered_under_its_routed_name() -> None:
+    """ADR-033's remedy, checked the way every producer since Phase Q has been.
+
+    This task has no caller anywhere in the application — beat names it as a string and
+    nothing imports it — so the registered name and the route pattern are the only two
+    facts holding it together, and both are asserted here. If the name stops matching
+    `app.workers.maintenance_tasks.*`, beat still fires it (the schedule is resolved by
+    name, not by route) and it lands on the default queue, which is `notifications`: the
+    reaper would then occupy the same worker slots as every customer email.
+
+    Imported inside the test, for the reason the analysis task's test gives — the module
+    builds a `NullPool` engine at import scope.
+    """
+    from app.workers.maintenance_tasks import reap_abandoned_claims
+
+    assert "app.workers.maintenance_tasks" in celery_app.conf.include
+
+    registered = celery_app.tasks[reap_abandoned_claims.name]
+    assert registered == reap_abandoned_claims
+    assert registered.name == "app.workers.maintenance_tasks.reap_abandoned_claims"
+
+    matched = [
+        pattern
+        for pattern in celery_app.conf.task_routes
+        if reap_abandoned_claims.name.startswith(pattern.rstrip("*"))
+    ]
+    assert matched == ["app.workers.maintenance_tasks.*"]
 
 
 def test_the_worker_does_not_replace_the_root_logger() -> None:

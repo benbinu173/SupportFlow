@@ -165,10 +165,10 @@ services:
       CELERY_RESULT_BACKEND: redis://redis:6379/2
       S3_ENDPOINT: http://minio:9000
     # `-Q` names every queue. A worker started without it consumes the default queue only, so
-    # the other four fill up in Redis with no consumer and no error anywhere — the deployment
+    # the other five fill up in Redis with no consumer and no error anywhere — the deployment
     # trap `tests/integration/test_celery_wiring.py` exists to catch in the development file,
     # and which is repeated here because the two files are separate.
-    command: celery -A app.workers.celery_app worker --concurrency=${WORKER_CONCURRENCY:-4} --loglevel=info -Q notifications,sla,ai,knowledge
+    command: celery -A app.workers.celery_app worker --concurrency=${WORKER_CONCURRENCY:-4} --loglevel=info -Q notifications,sla,ai,knowledge,maintenance
     depends_on:
       postgres:
         condition: service_healthy

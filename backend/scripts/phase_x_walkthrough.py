@@ -36,7 +36,7 @@ Five steps, from `backend/`:
 
     # 3. the worker, in a third terminal — and `-Q` matters
     .venv/Scripts/python.exe -m celery -A app.workers.celery_app worker \\
-        --loglevel=info --pool=solo -Q notifications,sla,ai,knowledge
+        --loglevel=info --pool=solo -Q notifications,sla,ai,knowledge,maintenance
 
     # then
     .venv/Scripts/python.exe scripts/phase_x_walkthrough.py

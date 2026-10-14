@@ -453,3 +453,47 @@ def test_the_log_level_is_case_insensitive_and_constrained() -> None:
 
     with pytest.raises(ValidationError):
         _settings(LOG_LEVEL="verbose")
+
+
+# ---------------------------------------------------------------------------
+# The abandoned-claim window (ADR-033)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_the_abandoned_claim_window_is_far_past_the_hard_time_limit() -> None:
+    """The margin, not merely the direction.
+
+    The reaper in `app/workers/maintenance_tasks.py` fails every `processing` row older than
+    `ABANDONED_CLAIM_AFTER_SECONDS`. That threshold has one job: sit past the longest a claim
+    can legitimately be held, so a slow-but-alive run is never reaped out from under itself.
+    Celery's hard time limit is the longest a task can run at all — it kills the process at
+    that point — so a threshold above it is *necessary*, and the comparison is asserted here
+    because raising the time limit is a one-line edit that looks safe and silently makes this
+    wrong.
+
+    **A multiple rather than a bare `>`**, because the interesting failure is a threshold one
+    second past the limit. That passes a strict comparison while leaving a window in which the
+    reaper and the hard limit race: the killed process's transaction may not yet have rolled
+    back, so the reaper can read the row as abandoned and fail it a moment before the row
+    would have been released anyway — and the `_ABANDONED` message then names a worker crash
+    that did not quite happen. Five times the limit is a margin no plausible task duration
+    reaches.
+
+    The soft limit is not compared, deliberately: it is the catchable one and does not by
+    itself end a task.
+
+    **Read off the field defaults rather than from a `Settings` instance**, the way
+    `test_the_defaults_separate_the_cache_the_tests_and_the_broker` does it. Both windows are
+    tunable per deployment, and a test that built its settings from the ambient environment
+    would then be asserting whatever a developer or CI runner happened to export instead of
+    the relationship this repository ships — passing here and failing in an image, or the
+    reverse. What is being checked is the pair of numbers in `config.py`.
+    """
+    fields = Settings.model_fields
+
+    after = fields["ABANDONED_CLAIM_AFTER_SECONDS"].default
+    hard_limit = fields["CELERY_TASK_TIME_LIMIT_SECONDS"].default
+
+    assert after >= 5 * hard_limit
+    assert after > hard_limit

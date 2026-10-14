@@ -3855,13 +3855,18 @@ timestamps and its children's by a single per-ticket delta, through `update()` w
 
 **Decision 10 — the audit's findings.**
 
-Eleven, in the order they matter. Three are reported rather than patched, and the reason is given for each.
+Eleven, in the order they matter. Eight were patched as they were found, one is reported rather than
+patched, and **Findings 1 and 2 — the two this decision's own argument gave as reasons not to touch the
+code — were closed in the follow-up that came after it**, by the three changes recorded under Finding 1.
 The rest were found by running the thing rather than by reading it — by bringing the stack up, by running
 the whole suite instead of the files touched, and, in the last case, by running it somewhere it had never
 run before at all: a clean CI runner, where a locally cached image had been hiding a withdrawn dependency.
-That is this decision's argument for evidence over description.
+That is this decision's argument for evidence over description — and the follow-up is its second half:
+*"the correct fix is a transaction-shape change … or a reaper"* was written here as an owed remedy, and
+it stayed owed until somebody wrote it and ran it.
 
-**Finding 1 — an analysis can be welded shut, and the one-line fix is not sufficient.** *Reported.*
+**Finding 1 — an analysis can be welded shut, and the one-line fix is not sufficient.** *Fixed after Phase
+Z.*
 
 `run_analysis` (`app/services/ai_analysis_service.py:640-660`) marks rows `PROCESSING`, commits, and
 then calls `_execute` under `except AIServiceError`. Any other exception propagates out of the task;
@@ -3869,7 +3874,7 @@ then calls `_execute` under `except AIServiceError`. Any other exception propaga
 **acknowledged rather than redelivered**, so the row stays `PROCESSING` permanently. That matters
 because `ai_repository.in_flight_analyses` (line 130) counts `PENDING` **and** `PROCESSING` as in flight,
 so `request_analysis` refuses to queue that operation ever again — *"Nothing in flight is queued
-twice"* — and **no beat entry reaps a stale claim**: `beat_schedule` has exactly one entry, the SLA
+twice"* — and **no beat entry reaps a stale claim**: `beat_schedule` had exactly one entry, the SLA
 sweep. The ticket's analysis for that operation, and for a summary, becomes permanently unrequestable,
 silently. `knowledge_service.run_ingestion` (`:539`) has the identical shape around `_FAILURES`.
 
@@ -3879,18 +3884,62 @@ it as *"never escapes `ai_service` un-caught"*), so a malformed or refused model
 caught. What is left is a database error or a bug — which is exactly the class an unexpected exception
 belongs to, and exactly the class the handler cannot enumerate.
 
-**Why it is reported and not patched here.** Widening `except AIServiceError` to `except Exception` is
-a two-word change that would make this *worse* in the database-error case: SQLAlchemy's session is
-poisoned by a failed statement, so the next `session.commit()` (`:688`) raises `PendingRollbackError`,
-taking the whole batch's rows to `PROCESSING` — and any operation already completed in this run is
-still uncommitted at that point, so rolling back discards its outcome too. The correct fix is a
-transaction-shape change — commit each operation's outcome as it happens, so a later failure cannot
-discard an earlier result — or a reaper that returns a claim older than a threshold to `pending`. Both
-need the failure path exercised by a test that raises a non-`AIServiceError` through the task. Recorded
-here as the one open defect Phase Y found, with its reachability and its remedy, rather than closed with
-a change nobody has run.
+**Why widening the handler was still rejected.** `except Exception` is a two-word change that would make
+this *worse* in the database-error case: SQLAlchemy's session is poisoned by a failed statement, so the
+next `session.commit()` raises `PendingRollbackError` — and `Session.rollback()` expires every object in
+the session, so the "mark it failed" write that followed would have to touch no ORM instance it had
+already loaded. That is real complexity bought for **one of the four ways a claim gets abandoned**: an
+out-of-memory kill, a stopped container, and the hard time limit firing are all the process ceasing to
+exist, and no `except` clause in that process can run. Recorded then as the one open defect Phase Y found,
+with its reachability and its remedy, rather than closed with a change nobody had run — and closed
+afterwards, in the change described next.
 
-**Finding 2 — the analysis claim is read-then-write, and the comment overstates it.** *Reported.*
+**The remedy, as built.** Three changes, and each is load-bearing on its own.
+
+1. **A commit per operation** (`ai_analysis_service.run_analysis`). The claim commits; then each
+   operation's outcome — its row, the ticket columns it filled, and the ledger rows the call staged —
+   commits before the next operation starts. An unexpected exception can now only strand the operations
+   that had not run yet, and those genuinely did not happen. One commit for the whole run meant a
+   paid-for answer was discarded by a later failure, which is the loss this finding is named for. The
+   same shape is in `knowledge_service.run_ingestion`, which had no earlier result to lose and gained
+   the change for consistency rather than for safety.
+2. **An exclusive claim** — Finding 2's fix, and half of this one's remedy: a row can no longer be
+   claimed twice, so *"running"* is a state the database agrees with rather than one this function
+   believes.
+3. **A reaper** (`app/workers/maintenance_tasks.py`, on `beat_schedule["abandoned-claim-sweep"]`). The
+   sweep fails every row still `processing` whose `updated_at` is older than
+   `ABANDONED_CLAIM_AFTER_SECONDS` — fifteen minutes against a two-minute hard time limit — and does the
+   same for `knowledge_documents`. **This is the part that covers all four causes rather than one**, and
+   the reason a handler could never have been enough.
+
+**The third change is not optional now, and that is the coupling worth recording.** The over-permissive
+filter described in Finding 2 was, accidentally, the only crash recovery this system had: a `PROCESSING`
+row was claimable, so a redelivered message would pick the work back up. Making the claim exclusive
+removed that — correctly, because it was also a duplicate-spend hole — and left *nothing at all* to
+release a stranded row. So the strictest step in this fix is the one that makes the sweep a requirement
+rather than a nicety: ship the claim without the reaper and every abandoned analysis is welded shut
+silently, forever, which is the original defect made certain instead of merely possible.
+
+**What the rows look like afterwards**, and the choice not to heal them: a stranded row becomes `failed`
+with a sentence saying the worker stopped, not `pending`. Nothing re-queues a `pending` row, so
+"self-healing" would leave it wedged in a different column, and re-enqueueing would be a second scheduled
+action with a loop to worry about on a row that reliably kills whatever picks it up. `failed` restores
+the two things that matter — `request_analysis`'s in-flight guard stops refusing the operation, and an
+admin's document list shows that something did not work.
+
+**The test that was owed.** `tests/integration/test_ai_analysis.py`'s
+`test_an_unexpected_failure_keeps_the_work_already_paid_for` raises a bare `RuntimeError` out of the
+provider seam — not an `AIError`, which `ai_service` converts and `run_analysis` catches — and asserts
+that the first operation's row is `completed` and reached the ticket, that the second is still
+`processing`, that a redelivery takes nothing, and that exactly one ledger row was written. It also
+asserts the residue rather than hiding it: the run died before `_record_completion`, so the timeline has
+no entry even though one operation finished, and the reaper cannot fix that either — it can only move a
+stuck row to `failed`, and this row is not stuck. Per-operation announcements were the alternative and
+were rejected: §18's last two steps are singular, and one timeline entry per operation is a different
+design from the one the rest of this file describes.
+
+**Finding 2 — the analysis claim is read-then-write, and the comment overstates it.** *Fixed after Phase
+Z.*
 
 `run_analysis` claims rows by loading them, setting `status = PROCESSING` in Python, and committing —
 there is no `SELECT … FOR UPDATE` and no conditional `UPDATE … WHERE status = 'pending'`. Two
@@ -3901,14 +3950,60 @@ finds nothing to claim"*) describes the opposite of what the code does. The two 
 `PROCESSING` also disagree: `in_flight_analyses` treats it as in-flight, while this filter treats it as
 unclaimed.
 
-The re-claim is not simply a bug — it is the only crash-recovery mechanism there is, since a worker
-killed mid-run leaves a `PROCESSING` row and there is no reaper to return it. So the decision is to
-**correct the comment, not the code**, and to record the bound on the exposure: duplicate provider spend
-is possible when a hard-time-limited worker is killed and its message requeued, but genuine concurrency
-requires a message to outlive `broker_transport_options["visibility_timeout"]` (3600 s) while the task
-time limit is 120 s, so the window is closed by configuration rather than by the claim. Adding
-`FOR UPDATE` was rejected: it would hold a row lock across a network call to a provider for up to the
-time limit.
+The re-claim was not simply a bug — it was the only crash-recovery mechanism there was, since a worker
+killed mid-run leaves a `PROCESSING` row and there was no reaper to return it. So this decision originally
+chose to **correct the comment, not the code**, and to record the bound on the exposure: duplicate provider
+spend is possible when a hard-time-limited worker is killed and its message requeued, but genuine
+concurrency requires a message to outlive `broker_transport_options["visibility_timeout"]` (3600 s) while
+the task time limit is 120 s, so the window is closed by configuration rather than by the claim. Adding
+`FOR UPDATE` was rejected then and is still rejected: it would hold a row lock across a network call to a
+provider for up to the time limit.
+
+**The remedy, as built.** The claim is one conditional statement —
+`ai_repository.claim_pending_analyses`, and `knowledge_repository.claim_pending_document` for the document
+half, which had the identical read-decide-write shape:
+
+```python
+update(AIAnalysis)
+.where(AIAnalysis.id.in_(analysis_ids),
+       AIAnalysis.organization_id == organization_id,
+       AIAnalysis.status == ProcessingStatus.PENDING)
+.values(status=ProcessingStatus.PROCESSING)
+.returning(AIAnalysis.id)
+.execution_options(synchronize_session=False)
+```
+
+Both callers commit immediately and then **reload** the rows by the ids the statement returned, so nothing
+stale sits in the identity map and the slow work happens in later transactions. That is what makes the
+lock question moot: the row lock lives for microseconds rather than for the length of a provider call,
+which is the objection to `FOR UPDATE` answered rather than worked around.
+
+Three consequences, and the second is the one that ties this to Finding 1:
+
+* `_TERMINAL` is gone. It was `{COMPLETED, FAILED}` used as a `not in` filter, and the exclusive claim
+  replaces it with a positive predicate — `status = 'pending'` — which cannot be read the other way. The
+  comment that overstated the old behaviour is gone with it; the docstrings now describe what the
+  statement does.
+* **A `PROCESSING` row is no longer claimable, and that was the accidental recovery described above.** It
+  is also, now, the only thing standing between a stranded row and permanence — which is why
+  `app/workers/maintenance_tasks.py` shipped in the same change. The two findings resolve into one
+  mechanism: the claim is what makes a redelivery safe, and the reaper is what makes the claim safe.
+* The configuration bound above is still true and is no longer load-bearing. It was the argument for
+  tolerating the hole; with the hole closed it is simply one more reason the exposure was never as wide
+  as it looked.
+
+**The suite caught one thing the claim changed that it should not have.** Reporting
+`len(analysis_ids) - len(claimed_ids)` as `skipped` made that count a function of the ids the *broker*
+named rather than of the rows this tenant owns, and
+`tests/security/test_ai_isolation.py::test_the_worker_will_not_load_another_tenants_rows` — which hands a
+correct ticket and organization the row ids of a *different* tenant — reported `skipped: 2` where it had
+asserted `0`. The read-then-write claim this replaced could not have failed that way: `load_analyses`
+filtered by tenant, so a foreign id was invisible to the count as well as to the work. The fix is
+`ai_repository.owned_analysis_ids`, an id-column-only narrowing that runs first, and the reason it selects
+*ids* rather than rows is this section's own `synchronize_session=False`: loading entities there would put
+`pending` objects into the identity map the claim assumes is empty. The assertion had been passing for four
+phases and was not written for this change; it failed on the first full run after it, which is the same
+argument this decision makes everywhere else — run the whole suite, not the files you touched.
 
 **Finding 3 — `frontend/.dockerignore` did not exist.** *Fixed in this phase.*
 
@@ -4156,12 +4251,14 @@ The half usually omitted, and the half that says whether the audit was an audit.
   would multiply the two. The SLA sweep does not retry either, and does not need to: nothing about it is
   one-shot, and the next beat cycle picks up whatever a broker failure skipped.
 * **A poison message cannot loop.** `task_acks_on_failure_or_timeout` is left at its `True` default, so
-  a task that exhausts its retries is acknowledged instead of being redelivered forever. This is the
-  setting whose absence makes `acks_late` dangerous, and its default is what makes the claim in
-  Decision 10 Finding 1 a latent hole rather than a live one.
+  a task that exhausts its retries is acknowledged instead of being redelivered forever. It is also the
+  setting that makes a stranded claim possible in the first place — the message that would have picked
+  the work back up is acknowledged — which is why Decision 10 Finding 1's remedy is a beat entry rather
+  than anything inside the task.
 * **Time limits are inside the visibility window.** Soft 60 s and hard 120 s against a 3600 s
-  `visibility_timeout`, so a task's message cannot be redelivered while the task is still running — the
-  configuration that bounds Finding 2.
+  `visibility_timeout`, so a task's message cannot be redelivered while the task is still running. That
+  is both what bounds a duplicate provider call and what bounds how long a claim is held — which is the
+  number `ABANDONED_CLAIM_AFTER_SECONDS` is measured against.
 * **No secrets in logs.** The worker logs an exception's *type* and never its message, because a
   connection error's text embeds the broker URL and a recipient refusal's embeds an address. The email
   task's engine is built with `echo` off and not from `DEBUG`, since a statement log carries parameters
@@ -4211,20 +4308,26 @@ written for it.
    lands on the path the check exercises**, and a break that "did not fail" is evidence about the
    break at least as often as about the test.
 
-**The numbers.** `pytest` — 1602 passed, 0 failed, 0 skipped (516 s). `pytest -m security` — 168 passed.
-`ruff check`, `ruff format --check`, and `mypy app alembic scripts` — clean, 218 files formatted and 141
+**The numbers.** `pytest` — 1602 passed, 0 failed, 0 skipped (516 s), and **1611** passed, 0 failed, 0
+skipped (564 s) after the follow-up that closed Findings 1 and 2. `pytest -m security` — 168 passed.
+`ruff check`, `ruff format --check`, and `mypy app alembic scripts` — clean, 220 files formatted and 142
 source files checked. `vitest` — 3 files, 14 tests. `alembic check` — *No new upgrade operations
 detected*, the fourth consecutive phase to add features without a schema change. `scripts/deploy_smoke.py`
 — 23 passed, 0 failed, against the live stack through Caddy.
 
 The first full run of this phase reported **18 failures** (Finding 10); the run after that reported none,
-and the difference between the two is one field removed from one dict.
+and the difference between the two is one field removed from one dict. The follow-up repeated the shape at
+a smaller scale: its first full run reported **one failure**, the isolation test Finding 2 describes, and
+the run after that reported none.
 
 **Cost.** The deployment file is a second document to keep in step with the first, and the two already
 differ in ways only a reader comparing them will catch. Logging configuration is one more startup step
 that must happen before any module-level logger is used, which is an ordering constraint nothing at the
-type level enforces. The audit leaves one defect open deliberately, which means `PROCESSING` remains a
-state that can be terminal in fact and not in name — and Finding 1's remedy is a transaction-shape
-change owed to a later phase rather than a bug closed here.
+type level enforces. The audit leaves one defect open deliberately — Finding 4's two unindexed sort keys,
+which §53 declines to fix without a slow query — and the two it did not close here are now closed, which
+traded a defect for a **permanent** piece of infrastructure: `PROCESSING` is no longer a state that can be
+terminal in fact, and only because there is now a queue, a task, and a beat entry that exist solely to
+notice when it would have been. That is a cost paid every deployment, forever, to make a rare failure
+recoverable — recorded here as a deliberate trade rather than presented as a free fix.
 
 

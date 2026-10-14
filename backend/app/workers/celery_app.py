@@ -2,8 +2,8 @@
 
 Phase C added `celery` to `pyproject.toml` and Phase P is where a consumer arrived, the
 same way Redis sat unused until Phase O. This module is the app object; the tasks live
-in `app.workers.email_tasks` and `app.workers.sla_tasks`, both named in `include` below so
-that starting a worker with
+in `app.workers.email_tasks`, `sla_tasks`, `ai_tasks`, `knowledge_tasks`, and
+`maintenance_tasks`, all named in `include` below so that starting a worker with
 
     celery -A app.workers.celery_app worker
 
@@ -54,12 +54,13 @@ settings = get_settings()
 # is the other half of that: without it Celery replaces the root handlers this set up.
 configure_logging(settings)
 
-# Four queues now, each named for its purpose. §51's Phase P asks for "task routing", and
+# Five queues now, each named for its purpose. §51's Phase P asks for "task routing", and
 # the route table's entries are what makes each destination explicit instead of relying on
 # the default queue's name — and the line that changes when the next producer arrives. The
 # one queue still unbuilt is `reports` (S), and it is not declared here: declaring a queue
 # nothing publishes to is a worker process waiting for work that does not exist. `knowledge`
-# was on that list from Phase P until Phase X produced it, and `ai` was on it until Phase U.
+# was on that list from Phase P until Phase X produced it, `ai` was on it until Phase U, and
+# `maintenance` was on it until Phase Y-Z's follow-up needed a reaper.
 NOTIFICATIONS_QUEUE = "notifications"
 
 # Phase Q. Separate from `notifications` because the two have nothing in common: one holds
@@ -83,6 +84,14 @@ AI_QUEUE = "ai"
 # requests and embedding spend that has nothing to do with how fast tickets are answered.
 KNOWLEDGE_QUEUE = "knowledge"
 
+# Phase Y-Z's follow-up. Separate from the other four for the fifth version of the same
+# argument, and the argument is sharper here than anywhere else: this queue's one task
+# un-wedges work that the *other* queues failed to finish, so a deployment that pauses
+# analysis spend by draining `ai` must not be pausing the thing that returns its abandoned
+# claims to a state a user can act on. It is also the only task here that exists to serve
+# failures rather than requests.
+MAINTENANCE_QUEUE = "maintenance"
+
 celery_app = Celery(
     "supportflow",
     broker=str(settings.CELERY_BROKER_URL),
@@ -95,6 +104,7 @@ celery_app = Celery(
         "app.workers.sla_tasks",
         "app.workers.ai_tasks",
         "app.workers.knowledge_tasks",
+        "app.workers.maintenance_tasks",
     ],
 )
 
@@ -153,16 +163,14 @@ celery_app.conf.update(
         "app.workers.sla_tasks.*": {"queue": SLA_QUEUE},
         "app.workers.ai_tasks.*": {"queue": AI_QUEUE},
         "app.workers.knowledge_tasks.*": {"queue": KNOWLEDGE_QUEUE},
+        "app.workers.maintenance_tasks.*": {"queue": MAINTENANCE_QUEUE},
     },
     # --- Schedule -----------------------------------------------------------
-    # Beat's whole configuration, and the first entry this project has ever had: Phase P
-    # built the worker but nothing needed a clock, which is why the wiring test asserted
-    # this was empty until Phase Q filled it.
-    #
-    # The interval is a setting because it is the knob that decides how late an alert can
-    # be — see `app/core/config.py`. The task name is spelled out rather than referenced,
-    # matching the route table above: both are strings the worker and beat must agree on
-    # with the decorator, and `tests/integration/test_celery_wiring.py` checks that they do.
+    # Beat's configuration: the SLA sweep, and the sweep that recovers a claim no worker came
+    # back for. The two are here for the same reason and it is worth naming, because it is the
+    # only reason this project has a clock at all — *nothing a request causes needs one.* A
+    # breach is noticed because time passed, and an abandoned claim is noticed because time
+    # passed without a result; neither has a caller who could have asked.
     #
     # **Exactly one beat process.** Beat is a singleton by construction — two of them each
     # fire every entry on their own schedule, so the sweep runs twice per interval and
@@ -172,7 +180,11 @@ celery_app.conf.update(
         "sla-deadline-sweep": {
             "task": "app.workers.sla_tasks.check_sla_deadlines",
             "schedule": float(settings.SLA_SWEEP_INTERVAL_SECONDS),
-        }
+        },
+        "abandoned-claim-sweep": {
+            "task": "app.workers.maintenance_tasks.reap_abandoned_claims",
+            "schedule": float(settings.ABANDONED_CLAIM_SWEEP_INTERVAL_SECONDS),
+        },
     },
     # --- Worker lifecycle ---------------------------------------------------
     # Do not let Celery replace the root logger's handlers. The application logs through

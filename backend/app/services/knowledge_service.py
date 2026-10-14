@@ -133,6 +133,11 @@ _FAILURES = (
     AIServiceError,
 )
 
+#: Why a delivery found nothing to do, for the log line. Phrased as the condition the claim
+#: tested rather than as a status read — the read would be stale, since the row is loaded
+#: before the claim, and "another worker took it in between" is the case that makes it so.
+_NOT_CLAIMABLE = "not-pending"
+
 
 # ---------------------------------------------------------------------------
 # The request path — registering a document
@@ -487,12 +492,19 @@ async def run_ingestion(
     embedding bill, and the task is declared with `acks_late` so at-least-once delivery is the
     contract.
 
-    **A row that is not `pending` is skipped, and that is stricter than `run_analysis`.** There,
-    `pending` and `processing` are both claimable; here one delivery owns the document, because
-    the alternative is two workers appending the same chunks and colliding on
-    `uq_knowledge_chunks_document_id_chunk_index`. A crash mid-ingestion therefore leaves a
-    document in `processing` that nothing will pick up, and the recovery is the delete route and
-    a fresh upload — which is honest, visible in the list, and not a silent half-ingestion.
+    **The claim is one conditional statement, and it is what makes "one delivery owns the
+    document" true.** One delivery and not two, because the alternative is two workers appending
+    the same chunks and colliding on `uq_knowledge_chunks_document_id_chunk_index`. Reading the
+    status, deciding in Python, and then committing only says that as long as nothing else runs
+    between the read and the write — `knowledge_repository.claim_pending_document` states the
+    property in the `WHERE` clause instead, where the database enforces it.
+
+    **A claim nobody finishes is recovered by the sweep, not by this function.** Phase Y's
+    Finding 1: a worker killed mid-ingestion leaves the row `processing`, and nothing in this
+    process can act on that, because there is no longer a process. `fail_abandoned_documents`
+    returns such a row to `failed` with a reason once it is older than
+    `ABANDONED_CLAIM_AFTER_SECONDS`, which is what puts it back on the admin's list instead of
+    leaving a document that answers nothing and says nothing.
 
     **The ledger rows from a failure are committed.** `ai_service` never commits its own rows,
     and a failed embedding is still spend; `_fail` below commits them with the row, which is
@@ -514,16 +526,19 @@ async def run_ingestion(
         )
         return {"status": "missing", "chunks": 0}
 
-    if document.status is not ProcessingStatus.PENDING:
+    if not await knowledge_repository.claim_pending_document(
+        session, context.organization_id, document.id
+    ):
+        # Not claimable: an earlier run finished or failed it, or another delivery holds it.
+        # The claim only matches `pending`, so the reason is the same in every case and the
+        # status this function read a moment ago is the one thing that could be stale.
         logger.info(
             "knowledge_ingestion_skipped",
             document_id=str(document.id),
             organization_id=str(context.organization_id),
-            status=str(document.status),
+            reason=_NOT_CLAIMABLE,
         )
         return {"status": "skipped", "chunks": 0}
-
-    document.status = ProcessingStatus.PROCESSING
     await session.commit()
 
     try:

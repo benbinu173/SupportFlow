@@ -36,16 +36,22 @@ whose tenant arm will one day be omitted.
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
-from sqlalchemy import ColumnElement, delete, select
+from sqlalchemy import ColumnElement, delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.enums import ProcessingStatus
+from app.models.enums import DocumentSourceType, ProcessingStatus
 from app.models.knowledge_chunk import KnowledgeChunk
 from app.models.knowledge_document import KnowledgeDocument
 from app.repositories.base import TenantScopedRepository
 from app.repositories.search import like_pattern
+
+#: What a document reaped by `fail_abandoned_documents` carries as its explanation. Written by
+#: the sweep and read by an admin in the list view, so it is a sentence about what happened
+#: rather than a diagnosis; the cause is on the reaper's own log line.
+_ABANDONED = "The worker ingesting this document stopped before it finished."
 
 
 class KnowledgeDocumentRepository(TenantScopedRepository[KnowledgeDocument]):
@@ -178,6 +184,100 @@ async def load_document(
         )
     )
     return result.scalar_one_or_none()
+
+
+async def claim_pending_document(
+    session: AsyncSession, organization_id: uuid.UUID, document_id: uuid.UUID
+) -> bool:
+    """Move this document to `processing` if it is still `pending`. Says whether this caller won.
+
+    **The same conditional statement `ai_repository.claim_pending_analyses` makes, and for the
+    same reason.** `run_ingestion` used to read the status, decide in Python, and commit — a
+    read followed by a write, which two deliveries of one message can both pass. Here the
+    database decides: `WHERE status = 'pending'` matches nothing for the second statement, and
+    a `False` return is what tells the caller it has nothing to do. Without it two workers can
+    both walk a document through extraction, chunking, and an embedding call, and the second
+    one's chunks are a duplicate set that retrieval will return twice.
+
+    No `FOR UPDATE`, for the reason the analysis claim gives: the lock this takes lives only
+    until the caller's immediate commit, whereas a row lock held across the fetch, the
+    parse, and the embedding call would block the document for the whole task.
+
+    `synchronize_session=False` because the caller claims before it reloads; see the analysis
+    function. A caller that had already loaded the row and then read its status would be
+    reading the value this statement replaced.
+    """
+    result = await session.execute(
+        update(KnowledgeDocument)
+        .where(
+            KnowledgeDocument.id == document_id,
+            KnowledgeDocument.organization_id == organization_id,
+            KnowledgeDocument.status == ProcessingStatus.PENDING,
+        )
+        .values(status=ProcessingStatus.PROCESSING)
+        .returning(KnowledgeDocument.id)
+        .execution_options(synchronize_session=False)
+    )
+    return result.scalar_one_or_none() is not None
+
+
+@dataclass(frozen=True, slots=True)
+class AbandonedDocumentClaim:
+    """One document a sweep returned to `failed`, reduced to what the log line needs."""
+
+    document_id: uuid.UUID
+    organization_id: uuid.UUID
+    source_type: DocumentSourceType
+
+
+async def fail_abandoned_documents(
+    session: AsyncSession, *, claimed_before: datetime
+) -> Sequence[AbandonedDocumentClaim]:
+    """Every document claimed before `claimed_before` and still `processing`, marked failed.
+
+    The document-shaped half of `ai_repository.fail_abandoned_claims`, and the argument for it
+    is the same one stated there at length. What differs is what a stranded row costs here: an
+    analysis in `processing` blocks that operation from ever being requested again, while a
+    document in `processing` is invisible to retrieval — `has_published_chunks` and
+    `search_chunks` both require `status = 'completed'` — and there is no route that re-queues
+    one, so the document is simply gone from the knowledge base with nothing on any screen
+    saying so. `failed` with a reason is what puts it back on a screen an admin reads.
+
+    `is_published` is forced false alongside the status, following `knowledge_service._fail`.
+    It cannot be true on a `processing` row — nothing sets it before a successful ingestion —
+    and writing it makes the invariant read off the row rather than depend on the order of two
+    statements somewhere else.
+
+    `updated_at` is the claim's timestamp; see the analysis function for why that column is
+    the claim's clock and not a second one.
+    """
+    result = await session.execute(
+        update(KnowledgeDocument)
+        .where(
+            KnowledgeDocument.status == ProcessingStatus.PROCESSING,
+            KnowledgeDocument.updated_at < claimed_before,
+        )
+        .values(
+            status=ProcessingStatus.FAILED,
+            error_message=_ABANDONED,
+            chunk_count=0,
+            is_published=False,
+        )
+        .returning(
+            KnowledgeDocument.id,
+            KnowledgeDocument.organization_id,
+            KnowledgeDocument.source_type,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return [
+        AbandonedDocumentClaim(
+            document_id=row.id,
+            organization_id=row.organization_id,
+            source_type=row.source_type,
+        )
+        for row in result.all()
+    ]
 
 
 async def has_published_chunks(session: AsyncSession, organization_id: uuid.UUID) -> bool:

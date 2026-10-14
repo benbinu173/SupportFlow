@@ -159,14 +159,6 @@ _DRAFT_LABEL = (
 #: Stored on a row whose operation this build has no implementation for. See `_execute`.
 _NO_IMPLEMENTATION = "This analysis operation is not implemented in this version."
 
-#: The status pair that means "queued or running". `AIAnalysis.status` has four members and
-#: this names the two that are not an outcome, which is the distinction every guard below
-#: actually needs — a row in `PROCESSING` has been claimed, and a row in `COMPLETED` or
-#: `FAILED` is finished and must not be run again.
-_TERMINAL: frozenset[ProcessingStatus] = frozenset(
-    {ProcessingStatus.COMPLETED, ProcessingStatus.FAILED}
-)
-
 
 @dataclass(frozen=True)
 class _Outcome:
@@ -585,13 +577,31 @@ async def run_analysis(
     `sla_tasks._sweep` has, and for the same reason: the logic is testable against a real
     database without a broker, which is how `tests/integration/test_ai_analysis.py` runs it.
 
-    **Two commits, and they are not interchangeable.** The first flips the rows to
-    `PROCESSING` before any provider call, so "running" is a state another process can see
+    **A commit per operation, with the claim before them and the announcement after.** The
+    claim commits before any provider call, so "running" is a state another process can see
     rather than one that exists only inside this task — that is what makes a second delivery
     of the same task a no-op instead of a second provider call, which matters because the
-    task is declared with `acks_late` and at-least-once delivery is the contract. The second
-    commits the results, the ticket's new fields, the timeline entry, the notification, and
-    every ledger row the calls staged.
+    task is declared with `acks_late` and at-least-once delivery is the contract. Each
+    operation's outcome then commits on its own, before the next operation starts, and the
+    closing commit carries the timeline entry, the notification, and every ledger row the
+    calls staged.
+
+    **The per-operation commit is Phase Y's Finding 1, and the failure it removes is
+    specific.** One commit for the whole run means an unexpected exception rolls back
+    everything uncommitted — so a run whose first operation had already been paid for and
+    answered would discard that result and leave the row looking like work nobody had done,
+    to be reaped as failed. Committing as each operation finishes means a later failure can
+    only ever strand the operations that had not run yet, and those are the ones that
+    genuinely did not happen.
+
+    **A claim this run never finishes is recovered by a sweep, not by a handler.** An
+    out-of-memory kill, a stopped container, or the hard time limit leaves the row
+    `processing` with nothing left to finish it, and no `except` clause here can help,
+    because by then there is no process to raise it. `app/workers/maintenance_tasks.py`
+    returns such rows to `failed` once they are older than `ABANDONED_CLAIM_AFTER_SECONDS`,
+    which is what stops `request_analysis`'s in-flight guard from refusing that operation
+    forever. See the finding: a handler for the one catchable cause would have left the
+    three uncatchable ones.
 
     **The ledger rows are committed even when every operation failed.** `ai_service`'s
     docstring is explicit that a caller which lets its own rollback discard them *"loses
@@ -625,21 +635,43 @@ async def run_analysis(
         )
         return counts
 
-    analyses = await ai_repository.load_analyses(
+    # The ids are narrowed to the ones this tenant actually has rows for, and that narrowing
+    # is a tenant boundary rather than bookkeeping: `analysis_ids` arrives over a broker, so a
+    # misrouted message names rows that are not this organization's, and the counts this run
+    # reports must not be a function of foreign input. `owned_analysis_ids` selects the id
+    # column alone, so no ORM instance enters the identity map and the claim below can still
+    # use `synchronize_session=False`.
+    owned_ids = await ai_repository.owned_analysis_ids(
         session, context.organization_id, analysis_ids=analysis_ids
     )
 
-    # Anything already finished is work that has been done. This is §16's "avoid duplicate
-    # processing" and it is what makes a redelivered task safe: a row only ever leaves
-    # `pending` once, and a second delivery finds nothing to claim.
-    pending = [analysis for analysis in analyses if analysis.status not in _TERMINAL]
-    counts["skipped"] = len(analyses) - len(pending)
-    if not pending:
+    # **Claimed in one statement, and before the rows are loaded.** The rows this run owns
+    # are the ones a conditional `UPDATE` moved out of `pending`; a row another delivery
+    # already claimed, or one an earlier run finished, is simply not in the answer. §16's
+    # "avoid duplicate processing" is therefore a property of the database rather than of
+    # this function having read a status carefully — which is the thing the read-then-write
+    # claim this replaced could not say, since two deliveries could both pass the read.
+    #
+    # The commit is immediate and the slow work happens in later transactions, so the row
+    # lock is held for microseconds instead of for the length of a provider call. That is
+    # what made `SELECT … FOR UPDATE` the wrong tool here; see the repository function.
+    claimed_ids = await ai_repository.claim_pending_analyses(
+        session, context.organization_id, analysis_ids=owned_ids
+    )
+    await session.commit()
+
+    # What this tenant owns, minus what this run took. A redelivery is therefore all
+    # `skipped`, and a run of two operations claims two, which is the arithmetic the tests
+    # read. Subtracting from `analysis_ids` instead would count a foreign id as skipped work.
+    counts["skipped"] = len(owned_ids) - len(claimed_ids)
+    if not claimed_ids:
         return counts
 
-    for analysis in pending:
-        analysis.status = ProcessingStatus.PROCESSING
-    await session.commit()
+    # Loaded *after* the claim, so these are the rows as they now are — `processing` and
+    # owned — rather than a snapshot taken before another worker could have taken them.
+    pending = await ai_repository.load_analyses(
+        session, context.organization_id, analysis_ids=claimed_ids
+    )
 
     completed_this_run: list[AIAnalysis] = []
     for analysis in pending:
@@ -647,8 +679,7 @@ async def run_analysis(
         try:
             outcome = await _execute(session, context, analysis, ticket)
         except AIServiceError as exc:
-            latency_ms = _elapsed_ms(started)
-            _fail(analysis, message=exc.message, latency_ms=latency_ms)
+            _fail(analysis, message=exc.message, latency_ms=_elapsed_ms(started))
             counts["failed"] += 1
             logger.error(
                 "ai_analysis_failed",
@@ -657,17 +688,25 @@ async def run_analysis(
                 analysis_id=str(analysis.id),
                 operation=str(analysis.operation),
             )
-            continue
+        else:
+            if outcome is None:
+                _fail(analysis, message=_NO_IMPLEMENTATION, latency_ms=_elapsed_ms(started))
+                counts["failed"] += 1
+            else:
+                _complete(analysis, outcome, latency_ms=_elapsed_ms(started))
+                completed_this_run.append(analysis)
+                counts["completed"] += 1
 
-        latency_ms = _elapsed_ms(started)
-        if outcome is None:
-            _fail(analysis, message=_NO_IMPLEMENTATION, latency_ms=latency_ms)
-            counts["failed"] += 1
-            continue
-
-        _complete(analysis, outcome, latency_ms=latency_ms)
-        completed_this_run.append(analysis)
-        counts["completed"] += 1
+        # **One commit per operation, and this line is the whole of Finding 1's remedy.**
+        # Everything the operation wrote — its row, the ticket columns it filled, the ledger
+        # rows the call staged — is durable before the next operation is started. An
+        # unexpected exception in a later operation rolls back only what is uncommitted, so
+        # an answer that was already paid for survives it. An exception raised *here* (a
+        # provider call that is somehow not an `AIServiceError`, a bug in this module, the
+        # database refusing the write) is deliberately not caught: the rows it stranded stay
+        # `processing` and `app/workers/maintenance_tasks.py` returns them to `failed`,
+        # which is the one mechanism that also covers being killed outright.
+        await session.commit()
 
     event: TicketEvent | None = None
     notifications: list[Notification] = []

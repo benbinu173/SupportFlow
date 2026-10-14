@@ -107,6 +107,8 @@ rather than falling back to something insecure.
 | `SMTP_*` | Mail server. Defaults to Mailpit on `localhost:1025`; `SMTP_USERNAME`/`SMTP_PASSWORD`/`SMTP_STARTTLS` for a real provider |
 | `SLA_SWEEP_INTERVAL_SECONDS` | How often beat runs the deadline sweep (default 300). It is the knob that decides how late a warning can be: at URGENT's 24-minute warning band it bounds the delay at 5 minutes |
 | `SLA_SWEEP_BATCH_SIZE` | Tickets per priority per sweep (default 500) |
+| `ABANDONED_CLAIM_AFTER_SECONDS` | How long a `processing` row may go untouched before the reaper fails it (default 900). Measured against the two-minute hard task limit — see [the abandoned-claim sweep](#the-abandoned-claim-sweep) |
+| `ABANDONED_CLAIM_SWEEP_INTERVAL_SECONDS` | How often beat runs that reaper (default 600). Coarser than the SLA sweep on purpose: nothing can be reaped before `ABANDONED_CLAIM_AFTER_SECONDS` has passed, so a finer interval only finds the same rows again |
 | `RATE_LIMIT_*` | Per-address login/registration limits and the per-user upload limit |
 | `JWT_SECRET` | Access-token signing; minimum 32 characters (required) |
 | `CORS_ORIGINS` | Comma-separated allowlist. No wildcard — the refresh cookie needs credentials |
@@ -132,7 +134,7 @@ mypy app alembic scripts
 # ticket's AI analysis to run, and for a knowledge document to be ingested. `-Q` must name
 # *every* queue in `task_routes` — see the SLA section for why a worker that misses one looks
 # perfectly healthy and silently consumes nothing.
-celery -A app.workers.celery_app worker --loglevel=info --pool=solo -Q notifications,sla,ai,knowledge
+celery -A app.workers.celery_app worker --loglevel=info --pool=solo -Q notifications,sla,ai,knowledge,maintenance
 
 # Beat, which is the clock the SLA sweep runs on. Exactly one process: two would
 # double every sweep. The explicit schedule path is not optional — the default writes
@@ -745,7 +747,7 @@ python -m uvicorn app.main:app --loop app.core.event_loop:loop_factory --port 80
 # 2. the worker, from backend/ — --pool=solo because fork is not available on Windows
 #    The -Q list is not optional: a worker that does not name every routed queue consumes
 #    nothing from the ones it omits, silently. See the SLA section.
-celery -A app.workers.celery_app worker --loglevel=info --pool=solo -Q notifications,sla,ai,knowledge
+celery -A app.workers.celery_app worker --loglevel=info --pool=solo -Q notifications,sla,ai,knowledge,maintenance
 
 # 3. beat, from backend/ — exactly one process, and it needs no API and no worker
 celery -A app.workers.celery_app beat --loglevel=info -s /tmp/celerybeat-schedule
@@ -875,7 +877,7 @@ minutes" arriving after the deadline would be worse than the miss it describes.
 
 ```bash
 # both, from backend/ — the API is not needed for beat
-celery -A app.workers.celery_app worker --loglevel=info --pool=solo -Q notifications,sla,ai,knowledge
+celery -A app.workers.celery_app worker --loglevel=info --pool=solo -Q notifications,sla,ai,knowledge,maintenance
 celery -A app.workers.celery_app beat   --loglevel=info -s /tmp/celerybeat-schedule
 ```
 
@@ -906,7 +908,10 @@ ticket sits with two `pending` rows that nothing will ever fill. `-Q notificatio
 the command above for that reason — the same three words, in both files the wiring test reads.
 
 **Exactly one beat process.** Two would double every sweep; the guard would stop the second
-one from double-alerting, but the waste would be silent.
+one from double-alerting, but the waste would be silent. Since the abandoned-claim sweep below
+joined the schedule, "exactly one beat" is a correctness requirement rather than an efficiency
+one: two beats would each fire both entries, and while the reaper is idempotent, the second
+pass is pure duplicate work on a table nothing else is contending for.
 
 ### What the portal sees
 
@@ -915,6 +920,51 @@ a portal caller's `"sla"` is `null` and its timeline hides the SLA entries. That
 deliberately indistinguishable from "this priority has no active policy" — the second is a
 fact about the tenant's configuration, and telling a customer which priorities their
 provider has targets for is the disclosure the null exists to prevent.
+
+### The abandoned-claim sweep
+
+The last thing that runs on the clock, and the one piece of this system that exists only to
+clean up after a failure. It is filed here because `beat` is where it lives, not because it is
+about SLAs — it releases claims held by the AI and knowledge workers, described under
+[AI](#ai) and [Knowledge base](#knowledge-base).
+
+**A claim outlives the process that took it, and this is what releases it.** `run_analysis`
+and `run_ingestion` both move a row to `processing` and commit *before* the slow part — a
+provider call, a page fetch — because that is what makes a redelivered message a no-op instead
+of a second bill. The price is that a worker killed by the OOM killer, a container stopped
+mid-task, or the hard time limit firing leaves the row `processing`, and Celery's default
+`task_acks_on_failure_or_timeout=True` means the message was acknowledged rather than
+redelivered. Nothing else in the system looks at a `processing` row.
+
+The consequences are not symmetrical. `request_analysis` reads `processing` as **in flight**,
+so that ticket's analysis for that operation can never be requested again — refused forever,
+with nothing on any screen to explain it. A document is quieter and just as final: retrieval
+requires `status = 'completed'`, no route re-queues an ingestion, and a `processing` document
+therefore answers nothing while looking like it is on its way.
+
+`beat` fires `reap_abandoned_claims` every `ABANDONED_CLAIM_SWEEP_INTERVAL_SECONDS` (600), and
+the task fails every row still `processing` whose `updated_at` is older than
+`ABANDONED_CLAIM_AFTER_SECONDS` (900) — in `ai_analyses` and in `knowledge_documents`, one
+pass, one commit. The row becomes `failed` with a sentence saying the worker stopped, not
+`pending`: nothing re-queues a `pending` row, so putting it back would leave it wedged in a
+different column, whereas `failed` restores the two things that matter — the operation can be
+asked for again, and the document appears on the admin's own list as something that did not
+work.
+
+**The threshold is a margin, not a comparison.** Fifteen minutes against a two-minute hard time
+limit, and `tests/unit/test_config.py` asserts the ratio rather than trusting it: a sweep whose
+threshold sat just past the time limit would race the killed process's rollback and could fail
+a claim a moment before it was released anyway. The same reasoning is why the window is
+asserted from both sides in `tests/integration/test_maintenance_sweep.py` — a claim one minute
+younger than the threshold is left alone, one a minute older is released — since a reaper that
+went by status alone would fail every analysis currently being worked on, every ten minutes,
+and look correct in any test that only ever produced abandoned rows.
+
+**It runs on its own `maintenance` queue.** The queues it could have joined carry work that is
+not database-only — a provider call, an SMTP conversation — and the reaper finishes in
+milliseconds. A deployment that wants to pause AI spend without un-wedging the tool that
+releases AI spend is the case the separation buys. It is the fifth queue, so it is also the
+fifth name in every `-Q` list, and the wiring test reads both files that start a worker.
 
 ## Real-time updates
 
@@ -1421,7 +1471,7 @@ double-click gets everywhere else in this module.
     # the worker, in a second terminal — `ai` and `knowledge` must be in the -Q list, or the
     # queue is never consumed and a document sits pending forever
     .venv/Scripts/python.exe -m celery -A app.workers.celery_app worker \
-        --pool=solo --loglevel=info -Q notifications,sla,ai,knowledge
+        --pool=solo --loglevel=info -Q notifications,sla,ai,knowledge,maintenance
 
     # then, from backend/, with a token in $TOKEN and a customer id in $CUSTOMER
     curl -s -X POST localhost:8000/api/v1/tickets -H "Authorization: Bearer $TOKEN" \
@@ -1605,7 +1655,7 @@ The worker must name the `knowledge` queue, or ingestion is never consumed and t
         --loop app.core.event_loop:loop_factory --port 8000
     # the worker, in a second terminal — `knowledge` must be in the -Q list
     .venv/Scripts/python.exe -m celery -A app.workers.celery_app worker \
-        --pool=solo --loglevel=info -Q notifications,sla,ai,knowledge
+        --pool=solo --loglevel=info -Q notifications,sla,ai,knowledge,maintenance
 
     # then, from backend/, with a token in $TOKEN
     # 1. a policy from text the client already has
@@ -1843,8 +1893,8 @@ The full topology — what routes where, what terminates TLS, what is stateful �
 | `minio` | `bitnamilegacy/minio` | S3-compatible object storage for attachments. Swap for any S3 service by changing `S3_*`. **MinIO withdrew its community images in 2025, so this is a pinned mirror** — see [Upgrading an existing deployment](#upgrading-an-existing-deployment). |
 | `migrate` | backend image | One-shot `alembic upgrade head`. Every other service waits on `service_completed_successfully`. |
 | `backend` | backend image | The API. Stateless — `--scale backend=3` behind Caddy is supported. |
-| `worker` | backend image | Celery, `-Q notifications,sla,ai,knowledge`. Healthchecked with `celery inspect ping`. |
-| `beat` | backend image | The SLA clock. **Singleton** — two would double every sweep. `replicas: 1`. |
+| `worker` | backend image | Celery, `-Q notifications,sla,ai,knowledge,maintenance`. Healthchecked with `celery inspect ping`. |
+| `beat` | backend image | The clock: the SLA sweep and the abandoned-claim reaper. **Singleton** — two would double every sweep. `replicas: 1`. |
 | `frontend` | frontend image | nginx serving the built SPA. Same-origin, so no API hostname is baked in. |
 
 ### Running it locally
@@ -1973,7 +2023,7 @@ are the point: a checklist where everything is ticked says nothing.
 | secrets configured | `.env.production` is gitignored; `.env.production.example` names every variable. `Settings._production_is_not_a_development_checkout` refuses a published `JWT_SECRET` or `DEBUG=true` beside `ENVIRONMENT=production` **at startup**. |
 | migrations applied | The one-shot `migrate` service; backend, worker, and beat gate on `service_completed_successfully`. |
 | backend deployed | `production` target image, `restart: unless-stopped`, scale-out supported (stateless; state is in Postgres and Redis). |
-| worker deployed | Same image, `-Q notifications,sla,ai,knowledge`, healthchecked with `celery inspect ping`. |
+| worker deployed | Same image, `-Q notifications,sla,ai,knowledge,maintenance`, healthchecked with `celery inspect ping`. |
 | frontend deployed | Multi-stage Node 22 → nginx, SPA fallback, `index.html` never cached (ADR-033). |
 | HTTPS configured | Caddy with automatic issuance and renewal. HSTS is production-only (ADR-033 D3), and the smoke test asserts it is present. |
 | CORS configured | Explicit origin allowlist from settings; `allow_credentials` for the refresh cookie. |
@@ -2020,27 +2070,13 @@ than an application one — and it is the one grep-shaped gap in the row above.
 
 ## Known limitations
 
-- **An analysis can be left permanently claimed, and Phase Y found it rather than fixed it.**
-  `run_analysis` marks its rows `PROCESSING` and catches only `AIServiceError`; any other exception —
-  a database error, a bug — escapes the task, which `task_acks_late` plus Celery's default
-  `task_acks_on_failure_or_timeout=True` then acknowledges without redelivery. The row stays
-  `PROCESSING`, and because `in_flight_analyses` counts `PROCESSING` as in flight, that operation can
-  never be requested for that ticket again — and no beat entry reaps a stale claim. The trigger
-  surface is narrow (`ai_service` converts every provider failure into `AIServiceError`, so model
-  misbehaviour cannot cause it), and the reason it is reported rather than patched is in
-  [ADR-033](docs/architecture-decisions.md): widening the `except` would leave a poisoned session to
-  fail the whole batch's commit, so the fix is a transaction-shape change that has to be tested. The
-  same shape exists in `knowledge_service.run_ingestion`.
-- **The analysis claim is a read-then-write, not a compare-and-set**, and a redelivered task will
-  re-claim a row that is already `PROCESSING` — which is the only crash-recovery mechanism there is,
-  since nothing reaps a stale claim. Genuine concurrency is bounded by configuration: a task's
-  message cannot outlive `visibility_timeout` (3600 s) while the time limit is 120 s, so the exposure
-  is duplicate provider spend after a hard-time-limit kill rather than corrupt state. The inline
-  comment in `run_analysis` that claims otherwise is wrong, and ADR-033 records the correction
-  rather than a lock, which would hold a row for the length of a provider call.
 - **`sort=updated_at` and `sort=priority` on `GET /tickets` have no supporting index**, so they sort
   over the tenant's whole ticket set. Deliberately not migrated: §53 says not to optimize a query
-  nobody has run slowly, and adding one is a write cost on every insert (ADR-033).
+  nobody has run slowly, and adding one is a write cost on every insert (ADR-033). This is the only
+  finding of Phase Y's audit that is still open; the other two — an analysis row that a dead worker
+  left `PROCESSING` permanently, and a claim that was a read-then-write rather than a compare-and-set
+  — were closed afterwards by the exclusive claim, the per-operation commit, and the abandoned-claim
+  sweep described under [The abandoned-claim sweep](#the-abandoned-claim-sweep).
 - Four migrations exist: the baseline, Phase N's message full-text index, Phase P's
   `notifications.emailed_at`, and Phase Q's `notification_type` enum value. The baseline is
   still the first revision, so there is no upgrade path from an older schema.

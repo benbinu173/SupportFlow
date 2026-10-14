@@ -62,6 +62,33 @@ class Settings(BaseSettings):
     CELERY_TASK_SOFT_TIME_LIMIT_SECONDS: int = 60
     CELERY_TASK_TIME_LIMIT_SECONDS: int = 120
 
+    # --- Abandoned claims ---------------------------------------------------
+    # A row that a worker claimed and never finished. `run_analysis` and
+    # `run_ingestion` both set `processing` and commit before the slow part — a
+    # provider call, a page fetch — which is exactly what lets a second delivery
+    # of the same message find the row already claimed. The price is that a
+    # process that dies between that commit and the next one leaves the row
+    # claimed with nothing left to finish it: no beat entry ran, the message was
+    # acknowledged rather than redelivered (`task_acks_on_failure_or_timeout`),
+    # and `request_analysis` reads `processing` as in flight, so the operation
+    # could never be asked for again. `app/workers/maintenance_tasks.py` is the
+    # sweep that returns those rows to a terminal state.
+    #
+    # **Fifteen minutes against a two-minute hard task limit.** The threshold has
+    # to sit far enough past the longest a claim can legitimately be held that a
+    # slow run is never reaped while it is still working; ten times the hard limit
+    # is that margin with nothing riding on the exact number. The comparison is
+    # asserted rather than trusted — `tests/unit/test_config.py` fails if the time
+    # limit is ever raised past it, which is the edit that would otherwise make
+    # this quietly wrong.
+    ABANDONED_CLAIM_AFTER_SECONDS: int = 900
+
+    # How often beat looks. Coarser than the SLA sweep on purpose: a claim cannot
+    # be abandoned until the hard time limit has passed, so looking more often
+    # than this would only find the same rows again. The worst case a user sees is
+    # `ABANDONED_CLAIM_AFTER_SECONDS + this`.
+    ABANDONED_CLAIM_SWEEP_INTERVAL_SECONDS: int = 600
+
     # --- SLA ---------------------------------------------------------------
     # How often beat runs the deadline sweep, and how many tickets one priority's pass
     # looks at. Both arrived with their consumer in Phase Q, per the rule above.

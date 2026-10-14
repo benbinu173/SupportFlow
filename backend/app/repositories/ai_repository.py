@@ -36,13 +36,18 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import ColumnElement, func, select
+from sqlalchemy import ColumnElement, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ai_analysis import AIAnalysis
 from app.models.enums import AIOperation, ProcessingStatus, SenderType
 from app.models.message import Message
 from app.models.ticket import Ticket
+
+#: What a row reaped by `fail_abandoned_claims` carries as its explanation. A sentence for
+#: staff rather than a diagnosis — the cause is in the reaper's own log line — and it is a
+#: constant because the sweep and its test have to agree on it.
+_ABANDONED = "The worker running this analysis stopped before it finished."
 
 
 async def load_ticket(
@@ -105,6 +110,170 @@ async def load_analyses(
         .order_by(AIAnalysis.operation)
     )
     return result.scalars().all()
+
+
+async def owned_analysis_ids(
+    session: AsyncSession,
+    organization_id: uuid.UUID,
+    *,
+    analysis_ids: Sequence[uuid.UUID],
+) -> Sequence[uuid.UUID]:
+    """Which of these ids this tenant actually has rows for.
+
+    It exists for the *count* a run reports, and the tenant predicate is the entire point.
+    `analysis_ids` arrives over a broker, so a misrouted message names rows that are not this
+    organization's; without the narrowing, a task handed another tenant's ids would return
+    `skipped: 2` for work it was never entitled to see, and the numbers it logs would be a
+    function of foreign input. `run_analysis` subtracts its claim from this rather than from
+    the ids it was handed.
+
+    **It selects the id column alone, and that is not an optimisation.** SQLAlchemy builds no
+    ORM instance for a single-column select, so nothing enters the identity map and the
+    conditional `claim_pending_analyses` that follows can still use
+    `synchronize_session=False` — which is only safe while no stale `pending` instance is
+    sitting in the session. Loading whole rows here would populate the map with `pending`
+    objects that the claim's own UPDATE does not correct.
+
+    The result is a subset of `analysis_ids` and unordered, because nothing reads the order:
+    it is a count, and the rows the run works on are loaded afterwards, by the *claimed* ids.
+    """
+    if not analysis_ids:
+        return []
+
+    result = await session.execute(
+        select(AIAnalysis.id).where(
+            AIAnalysis.id.in_(analysis_ids),
+            AIAnalysis.organization_id == organization_id,
+        )
+    )
+    return result.scalars().all()
+
+
+async def claim_pending_analyses(
+    session: AsyncSession,
+    organization_id: uuid.UUID,
+    *,
+    analysis_ids: Sequence[uuid.UUID],
+) -> Sequence[uuid.UUID]:
+    """Move this batch to `processing` and return the ids **this caller actually took**.
+
+    **One conditional statement, and that is the whole reason the function exists.** The
+    obvious implementation — load the rows, set the status in Python, commit — is a read
+    followed by a write, and two deliveries of one message can both pass the read before
+    either writes. `WHERE status = 'pending'` makes the database the arbiter instead: the
+    second statement matches nothing, because the first already moved those rows. So what
+    comes back is not "the ids I asked about" but "the ids I own", and that is the only
+    thing a runner may work on. It is also what makes the claim mean something — a row in
+    `processing` is a row somebody holds, which is the reading `in_flight_analyses` already
+    took and the old read-then-write claim contradicted.
+
+    **`SELECT … FOR UPDATE` is the obvious alternative and the wrong one here.** It holds a
+    row lock across the provider call — as long as the task's hard time limit, with a
+    second worker blocked behind it the entire way. This statement's lock lives only until
+    the commit that immediately follows it, because the slow work happens in a *later*
+    transaction; exclusivity is bought for microseconds rather than minutes.
+
+    `synchronize_session=False` because the caller claims before it loads: nothing for these
+    ids is in the session's identity map yet, so there is no stale `pending` to correct. A
+    caller that had already loaded the rows would need one of the other strategies — which
+    is why `run_analysis` is ordered the way it is, and why the narrowing it does first
+    (`owned_analysis_ids`) selects ids rather than rows.
+
+    The `organization_id` predicate is not decoration. `analysis_ids` arrives over a broker,
+    and without it a message naming another tenant's row would claim it; every other query
+    in this module carries the same clause for the same reason.
+
+    Empty `analysis_ids` short-circuits, as in `load_analyses` — `IN ()` is not valid SQL.
+    """
+    if not analysis_ids:
+        return []
+
+    result = await session.execute(
+        update(AIAnalysis)
+        .where(
+            AIAnalysis.id.in_(analysis_ids),
+            AIAnalysis.organization_id == organization_id,
+            AIAnalysis.status == ProcessingStatus.PENDING,
+        )
+        .values(status=ProcessingStatus.PROCESSING)
+        .returning(AIAnalysis.id)
+        .execution_options(synchronize_session=False)
+    )
+    return result.scalars().all()
+
+
+@dataclass(frozen=True, slots=True)
+class AbandonedClaim:
+    """One analysis row a sweep returned to `failed`, reduced to what the log line needs.
+
+    An id and three things to name it by, rather than the row: the sweep has already
+    committed by the time anything reads this, and carrying an ORM instance out of that
+    transaction would invite a caller to touch attributes that are no longer guaranteed.
+    """
+
+    analysis_id: uuid.UUID
+    organization_id: uuid.UUID
+    ticket_id: uuid.UUID
+    operation: AIOperation
+
+
+async def fail_abandoned_claims(
+    session: AsyncSession, *, claimed_before: datetime
+) -> Sequence[AbandonedClaim]:
+    """Every analysis claimed before `claimed_before` and still `processing`, marked failed.
+
+    **The backstop for a worker that died, and it is deliberately the only one.** A claim
+    that is never finished has four causes — an out-of-memory kill, a container stop, the
+    hard time limit, and a database error mid-run — and only the last of them is even in
+    principle catchable in the process that holds the claim. Handling that one in place
+    would leave the other three, and the three are the ones that leave a row `processing`
+    forever: `request_analysis` reads `processing` as in flight, so the operation could
+    never be asked for again, and nothing else in this system would ever notice. One sweep
+    that covers all four is smaller than a handler that covers one.
+
+    **`failed`, not `pending`.** Returning the row to `pending` would need something to pick
+    it up — a re-enqueue, which is a second scheduled action and, on a row that reliably
+    kills its worker, a loop that spends the tenant's money every time round. `failed` with
+    a sentence on it is the truthful record of what happened: the work was not done, and
+    the operation can be asked for again, which is the state `request_analysis`'s in-flight
+    guard was blocking.
+
+    `updated_at` is the claim's own timestamp rather than a column of its own. It is set by
+    the claim's `UPDATE` and touched by nothing else while the row is `processing` — the
+    next write to the row is the outcome — so "unchanged for longer than any run can last"
+    and "claimed longer ago than any run can last" are the same question.
+
+    The `terminal_status_has_payload` constraint is satisfied on this statement rather than
+    worked around: `failed` requires an `error_message`, and one is set here.
+    """
+    result = await session.execute(
+        update(AIAnalysis)
+        .where(
+            AIAnalysis.status == ProcessingStatus.PROCESSING,
+            AIAnalysis.updated_at < claimed_before,
+        )
+        .values(
+            status=ProcessingStatus.FAILED,
+            error_message=_ABANDONED,
+            completed_at=func.now(),
+        )
+        .returning(
+            AIAnalysis.id,
+            AIAnalysis.organization_id,
+            AIAnalysis.ticket_id,
+            AIAnalysis.operation,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return [
+        AbandonedClaim(
+            analysis_id=row.id,
+            organization_id=row.organization_id,
+            ticket_id=row.ticket_id,
+            operation=row.operation,
+        )
+        for row in result.all()
+    ]
 
 
 async def in_flight_analyses(session: AsyncSession, *, ticket: Ticket) -> Sequence[AIAnalysis]:

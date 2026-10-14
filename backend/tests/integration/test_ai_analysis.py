@@ -42,7 +42,9 @@ from sqlalchemy.engine import Engine
 
 from app.ai.errors import AIPermanentError
 from app.ai.fake import FakeProvider
+from app.ai.provider import AIRequest, AIResult
 from app.core.config import get_settings
+from app.schemas.ai import Classification, SentimentResult
 from app.services import ai_service
 from app.workers import ai_tasks
 from tests.conftest import TICKETS, OrgSession
@@ -106,6 +108,44 @@ def agent(org: OrgSession) -> OrgSession:
 def use_provider(monkeypatch: pytest.MonkeyPatch, *outcomes: object) -> FakeProvider:
     """Point the service at a scripted provider. This is the seam `_provider` exists for."""
     provider = FakeProvider(*outcomes)
+    monkeypatch.setattr(ai_service, "_provider", lambda: provider)
+    return provider
+
+
+class CrashingProvider:
+    """Answers the first operation, then raises something `ai_service` is not built to expect.
+
+    **The bare `RuntimeError` is the whole point of this double.** Everything the codebase
+    anticipates arrives as an `AIError`, which `ai_service._run` converts into an
+    `AIServiceError` and `run_analysis` catches per operation — that path is covered by
+    `test_a_permanent_failure_leaves_the_other_operation_completed` and needs no help. What
+    ADR-033's Finding 1 is about is the failure nobody wrote a branch for: an SDK raising
+    `AttributeError` from inside its own response handling, a driver error, a bug in
+    `_reduced`, the database refusing a write. Those are not `AIError`, so `_run` lets them
+    through and `run_analysis` deliberately does not catch them either.
+
+    Wrapping rather than subclassing `FakeProvider`: the first call has to be a *real*
+    validated answer and a real ledger row, and only the second call is interesting. A
+    subclass reaching into the parent's private script would make the double's behaviour
+    depend on `FakeProvider`'s internals, which is the coupling that makes a fake stop being
+    a stand-in for the thing.
+    """
+
+    name = "fake"
+
+    def __init__(self, first: object) -> None:
+        self._fake = FakeProvider(first)
+
+    async def classify_ticket(self, request: AIRequest) -> AIResult[Classification]:
+        return await self._fake.classify_ticket(request)
+
+    async def analyze_sentiment(self, request: AIRequest) -> AIResult[SentimentResult]:
+        raise RuntimeError("the provider's own client raised something of its own")
+
+
+def use_crashing_provider(monkeypatch: pytest.MonkeyPatch, *outcomes: object) -> CrashingProvider:
+    """Point the service at `CrashingProvider`. The first scripted outcome is its one answer."""
+    provider = CrashingProvider(*outcomes)
     monkeypatch.setattr(ai_service, "_provider", lambda: provider)
     return provider
 
@@ -403,12 +443,23 @@ def test_an_analysis_of_an_unassigned_ticket_tells_nobody(
 def test_a_redelivered_task_does_nothing(
     org: OrgSession, customer: str, queued_analyses: Queued, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The second delivery finds every row terminal and makes no call at all.
+    """The second delivery finds nothing to claim and makes no call at all.
 
     This is what makes `task_acks_late` safe. The task runs under at-least-once delivery, so a
     worker killed after committing its results is handed the same message again — and the guard
-    is the row status, not a lock: a row only ever leaves `pending` once, and `run_analysis`
-    skips anything already terminal.
+    is the status change itself rather than a lock or a read: `claim_pending_analyses` moves a
+    row out of `pending` in one conditional `UPDATE`, so a row only ever leaves `pending` once
+    and the answer to "what did this delivery own" comes back from the database. A row another
+    delivery already took, or one an earlier run finished, is not in it.
+
+    **That is ADR-033's Finding 2.** The read-then-write this replaced read each row's status
+    and then wrote `processing`, and two deliveries could both pass the read before either
+    wrote — so "the status is the guard" was true of a single delivery and not of the pair the
+    setting exists for. Nothing here changes what this test asserts; what changed is that the
+    claim now means it under concurrency as well, which a test that runs one delivery at a time
+    cannot demonstrate either way. `test_an_unexpected_failure_keeps_the_work_already_paid_for`
+    is the one that reaches the same guard from a different direction: a row left `processing`
+    by a crash is equally unrunnable by a redelivery, which is the cost of the guarantee.
 
     **Asserted on the provider's call count**, because the return value alone cannot tell the
     two behaviours apart: a second run that re-asked the model and a second run that did nothing
@@ -505,6 +556,77 @@ def test_a_permanent_failure_leaves_the_other_operation_completed(
     read = ticket(org, created["id"])
     assert read["category"] == "Billing"
     assert read["sentiment"] is None
+
+
+def test_an_unexpected_failure_keeps_the_work_already_paid_for(
+    org: OrgSession,
+    customer: str,
+    queued_analyses: Queued,
+    sync_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR-033's Finding 1, stated as the rows: the first answer outlives the second's crash.
+
+    The provider answers the classification and then raises a bare `RuntimeError` — see
+    `CrashingProvider` for why that and not an `AIError`. `run_analysis` does not catch it, so
+    it leaves through the task, which is the behaviour under test rather than a gap in the
+    test.
+
+    **`completed` on the first row is the per-operation commit.** With one commit at the end
+    of the run, this exception would roll the classification back — a call that was made, was
+    paid for, and was answered would be discarded, and the row would be left looking like work
+    nobody had done and would be reaped as a failure. That is the specific loss Finding 1
+    named: the answer exists and the code throws it away.
+
+    **`processing` on the second row is why the reaper is not optional.** The row was claimed
+    by a committed statement, so the crash leaves it claimed with nothing left to finish it —
+    `task_acks_on_failure_or_timeout` means the message is acknowledged rather than
+    redelivered, and the second `run` below proves the redelivery would not pick it up even if
+    it came: `claim_pending_analyses` matches `pending` only, so a row another delivery has
+    taken is simply not in the answer. Nothing in this process can release it, which is the
+    whole argument for `app/workers/maintenance_tasks.py` being a sweep rather than an
+    `except` clause here.
+
+    **One ledger row, not nought and not two.** The classification's staging was committed
+    with the operation, and the crash produced no ledger row because `ai_service._run` stages
+    one per *attempt* and only for a call it actually completed — an exception it does not
+    recognize banked no attempt. This is the ledger backing its own claim that a failed call
+    is still spend, for the failures it can name.
+
+    **No timeline entry, and that residue is real rather than overlooked.** `_record_completion`
+    runs after the loop, so a run that died mid-way announces nothing even though one of its
+    operations finished — the row says `completed` and the timeline says nothing happened. The
+    reaper cannot fix that either: it can only move a stuck row to `failed`, and this one is
+    not stuck. Doing better would need the announcement to be per operation, which is a
+    different design from §18's "one timeline entry, one notification, one announcement" and
+    is not what this fix is for. Asserted so the trade-off is visible rather than discovered.
+    """
+    created = org.add_ticket(customer)
+    use_crashing_provider(monkeypatch, CLASSIFICATION)
+
+    with pytest.raises(RuntimeError):
+        run(queued_analyses)
+
+    rows = analyses(org, created["id"])
+    assert rows["classify"]["status"] == "completed"
+    assert rows["classify"]["result"] is not None
+    assert rows["sentiment"]["status"] == "processing"
+    assert rows["sentiment"]["result"] is None
+
+    # The paid-for half reached the ticket as well as the row, which is the point: the user's
+    # analysis is half-answered and usable rather than vanished.
+    read = ticket(org, created["id"])
+    assert read["category"] == "Billing"
+    assert read["sentiment"] is None
+
+    assert len(ledger_rows(sync_engine, created["id"])) == 1
+    assert timeline(org, created["id"]) == []
+
+    # The redelivery that `task_acks_late` allows, and it takes nothing: both rows have left
+    # `pending`, so both are skipped and the provider is never asked again. The stuck row is
+    # still stuck, which is the state the sweep exists to clean up.
+    assert run(queued_analyses) == {"completed": 0, "failed": 0, "skipped": 2}
+    assert analyses(org, created["id"])["sentiment"]["status"] == "processing"
 
 
 def test_a_total_failure_announces_nothing(

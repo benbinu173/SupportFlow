@@ -420,17 +420,26 @@ a terminal state rather than burning retries. Tasks are written to tolerate
 re-delivery: a duplicate analysis updates the existing row instead of creating a
 second one.
 
-**Four queues, one per kind of work**, so a slow job cannot delay a fast one: `ai` (the ticket
-operations), `knowledge` (document ingestion), `sla`, and `notifications`. Priorities within a queue come
-from the broker rather than from the task. The two terminal states a task can find are both stated on
-the row rather than in the task: an analysis that finished is `completed` and re-running it does
-nothing, and an ingestion that is not `pending` is skipped — stricter than the analysis path, because
-two workers appending the same document's chunks would collide on a unique index, and a crash
-mid-ingestion is recovered by deleting the document and uploading it again rather than by a second
-half-indexed run (ADR-032 Decision 5).
+**Five queues, one per kind of work**, so a slow job cannot delay a fast one: `ai` (the ticket
+operations), `knowledge` (document ingestion), `sla`, `notifications`, and `maintenance` (the
+abandoned-claim reaper). Priorities within a queue come from the broker rather than from the
+task. The two terminal states a task can find are both stated on the row rather than in the
+task, and since the exclusive claim (ADR-033 Findings 1–2) they are the *same* rule on both
+paths: a row that is not `pending` is not claimable, so a redelivery finds nothing and a finished
+analysis is not re-run. The document path reached that rule first, because two workers appending
+the same document's chunks would collide on a unique index — the analysis path was permissive
+enough to re-claim a `processing` row, which was accidental crash recovery and a duplicate-spend
+hole at once.
 
-Beat owns periodic work — chiefly the SLA sweep that finds tickets nearing a
-first-response or resolution deadline and notifies the relevant staff.
+A claim that outlives its worker is therefore no longer recovered by a redelivery on either
+path, and **`maintenance` is what covers it**: a beat entry fails every row still `processing`
+past `ABANDONED_CLAIM_AFTER_SECONDS`, so a killed worker leaves a `failed` analysis that can be
+requested again rather than a row welded into "in flight" forever.
+
+Beat owns periodic work: the SLA sweep that finds tickets nearing a first-response or resolution
+deadline and notifies the relevant staff, and the reaper above. Both are idempotent, which is what
+lets beat be a single process with no coordination — the second pass of either finds nothing to
+do.
 
 ## 10. Caching
 
