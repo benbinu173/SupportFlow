@@ -52,17 +52,33 @@ services:
 
   minio:
     # S3-compatible storage for attachments and knowledge-base source documents.
-    image: minio/minio:latest
-    command: server /data --console-address ":9001"
+    #
+    # **`minio/minio` no longer exists.** MinIO withdrew its community images from Docker Hub
+    # and Quay in 2025 — the repository 404s, and even a pinned release tag fails to resolve —
+    # so this is Bitnami's mirror of the same server, frozen in their `bitnamilegacy` namespace
+    # when they retired the free catalogue (ADR-033). The tag is pinned because that namespace
+    # will never receive another release, which is the trade-off the swap accepts.
+    #
+    # Three things follow from it, and none of them are visible in the image name:
+    #   * The data directory is `/bitnami/minio/data`, not `/data`.
+    #   * The image runs as UID 1001. A volume this project created before the swap was written
+    #     by the old image running as root, and 1001 cannot write to it — see the migration note
+    #     in the README before bringing an existing deployment up on this.
+    #   * `MINIO_BROWSER=on` is what enables the console. Without it the server logs no WebUI
+    #     line and binds nothing on 9001, so the console URL in the README would go nowhere.
+    image: bitnamilegacy/minio:2025.7.23-debian-12-r5
     environment:
       MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
       MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
+      MINIO_BROWSER: "on"
     ports:
       - "9000:9000"   # S3 API
       - "9001:9001"   # web console
     volumes:
-      - minio_data:/data
+      - minio_data:/bitnami/minio/data
     healthcheck:
+      # Unchanged from the old image: `mc` is on this image's PATH and the `local` alias is
+      # preconfigured against the root credentials above.
       test: ["CMD", "mc", "ready", "local"]
       interval: 10s
       timeout: 5s

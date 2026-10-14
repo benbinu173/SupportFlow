@@ -1840,7 +1840,7 @@ The full topology — what routes where, what terminates TLS, what is stateful �
 | `caddy` | `caddy:2-alpine` | **The only published port** (80/443). TLS, and the path split: `/api/*`, `/ws`, `/health*` → backend; everything else → frontend. |
 | `postgres` | `pgvector/pgvector:pg17` | Data. `pgvector` for the knowledge base (ADR-032). Not published. |
 | `redis` | `redis:8-alpine` | Cache, rate limits, broker, pub/sub. `appendonly yes`, so a restart does not discard queued email. |
-| `minio` | `minio/minio` | S3-compatible object storage for attachments. Swap for any S3 service by changing `S3_*`. |
+| `minio` | `bitnamilegacy/minio` | S3-compatible object storage for attachments. Swap for any S3 service by changing `S3_*`. **MinIO withdrew its community images in 2025, so this is a pinned mirror** — see [Upgrading an existing deployment](#upgrading-an-existing-deployment). |
 | `migrate` | backend image | One-shot `alembic upgrade head`. Every other service waits on `service_completed_successfully`. |
 | `backend` | backend image | The API. Stateless — `--scale backend=3` behind Caddy is supported. |
 | `worker` | backend image | Celery, `-Q notifications,sla,ai,knowledge`. Healthchecked with `celery inspect ping`. |
@@ -1874,6 +1874,32 @@ make smoke            # backend/scripts/deploy_smoke.py, against https://localho
 certificate. **TLS verification is off by default** in the smoke script for that reason;
 `--verify-tls` is the mode that actually protects anything, and it is what you would run against a
 real hostname.
+
+### Upgrading an existing deployment
+
+The object-storage image changed, and two things about it are not drop-in.
+
+**MinIO withdrew `minio/minio`.** The repository 404s on Docker Hub, and the Quay one refuses an
+anonymous pull, so a machine that already has the image cached — every machine that has run this
+project before — keeps working while a fresh one cannot start at all. The replacement is
+`bitnamilegacy/minio:2025.7.23-debian-12-r5`: the same MinIO server, republished by Bitnami, frozen
+in the namespace they moved their free catalogue to in 2025. The tag is pinned because no further
+releases will come. A real deployment should treat this as a stopgap and point `S3_*` at a managed
+bucket, which is the swap [ADR-018](docs/architecture-decisions.md) was written for.
+
+**The data volume needs one command.** The old image ran as root and kept its data at `/data`; the
+new one runs as UID 1001 and reads `/bitnami/minio/data`. A volume Docker creates *fresh* inherits
+the right ownership from the image, so a new deployment needs nothing. A volume written by the old
+image is owned by root, and the new image cannot write to it — MinIO will not start. Fix it once,
+before bringing the stack up:
+
+```bash
+docker run --rm -v supportflow_minio_data:/d alpine chown -R 1001:1001 /d
+# production: supportflow-prod_minio_data, unless COMPOSE_PROJECT_NAME says otherwise
+```
+
+This changes ownership only, so the objects already stored are untouched and the old image would
+still read them.
 
 ### The seed (§56)
 
@@ -1943,7 +1969,7 @@ are the point: a checklist where everything is ticked says nothing.
 | production environment created | **Not on a host.** `docker-compose.prod.yml` starts the whole stack and was brought up and smoke-tested here; no cloud account was provisioned, so there is no live URL to point at. |
 | database configured | `postgres` service, `pgvector/pgvector:pg17`, healthchecked, not published. ADR-033. |
 | Redis configured | `redis:8-alpine`, `appendonly yes`. Celery uses db 2 so a `FLUSHDB` on the cache db cannot discard queued work (ADR-022). |
-| object storage configured | `minio` service; any S3-compatible service is a `S3_*` change and nothing else (ADR-018). |
+| object storage configured | `minio` service; any S3-compatible service is a `S3_*` change and nothing else (ADR-018). The image it runs on was swapped in Phase Y-Z's follow-up — MinIO withdrew `minio/minio` from Docker Hub and Quay, so the deployment now pins a frozen mirror. |
 | secrets configured | `.env.production` is gitignored; `.env.production.example` names every variable. `Settings._production_is_not_a_development_checkout` refuses a published `JWT_SECRET` or `DEBUG=true` beside `ENVIRONMENT=production` **at startup**. |
 | migrations applied | The one-shot `migrate` service; backend, worker, and beat gate on `service_completed_successfully`. |
 | backend deployed | `production` target image, `restart: unless-stopped`, scale-out supported (stateless; state is in Postgres and Redis). |

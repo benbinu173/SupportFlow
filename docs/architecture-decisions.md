@@ -3855,10 +3855,11 @@ timestamps and its children's by a single per-ticket delta, through `update()` w
 
 **Decision 10 — the audit's findings.**
 
-Ten, in the order they matter. Three are reported rather than patched, and the reason is given for each.
-Four were found by bringing the stack up rather than by reading it, and the last was found by the test
-suite refusing a change — which is the half of this decision that is an argument for running a
-deployment instead of describing one, and for running the whole suite instead of the files you touched.
+Eleven, in the order they matter. Three are reported rather than patched, and the reason is given for each.
+The rest were found by running the thing rather than by reading it — by bringing the stack up, by running
+the whole suite instead of the files touched, and, in the last case, by running it somewhere it had never
+run before at all: a clean CI runner, where a locally cached image had been hiding a withdrawn dependency.
+That is this decision's argument for evidence over description.
 
 **Finding 1 — an analysis can be welded shut, and the one-line fix is not sufficient.** *Reported.*
 
@@ -4091,6 +4092,40 @@ by default rather than by vigilance.
 The smoke script gained the check that would have caught this from outside the process: a cross-tenant
 refusal and a refusal for an id that never existed are compared **byte for byte**, not just on status
 code. That is §37's actual requirement, and it is now asserted against the deployed stack.
+
+**Finding 11 — the object-storage image had been withdrawn, and only a fresh machine could notice.**
+*Fixed in this phase's follow-up.*
+
+CI had never passed. Every run of the workflow since it was written was red, including the commit that
+closed Phase Y-Z, and the frontend job passed throughout — which is what let a red pipeline read as a
+working one. The backend job failed at exactly one step: `pytest`, after ruff, format, and mypy had all
+passed, so the code was clean and it was the tests that broke. Job logs need authentication to read, so
+the only evidence available from outside was the annotation `Docker pull failed with exit code 1`.
+
+The tests were not the problem. **`minio/minio` no longer exists.** Docker Hub's API answers `404 object
+not found` for the repository, Quay refuses an anonymous pull with `401`, and even a pinned release tag
+fails to resolve — MinIO withdrew its community images in 2025. Every machine that had already pulled it,
+including the one this project was developed on, kept working from the cached copy, so both compose files
+looked correct and the deployment runbook was true only on a laptop that had run it before.
+`tests/api/test_attachments.py` is not the only file that uploads for real: the tenancy, row-scope, and
+log-hygiene suites each raise an attachment as setup. Pointed at a closed port the API answers all of them
+`503`, which is why this surfaced at `pytest` and nowhere earlier.
+
+Two things separate this from Findings 6 to 9, which were also invisible until something ran. The first is
+that the break was in a *dependency's availability* rather than in anything this repository controls, so
+no amount of reading the compose file could have found it — and the first attempt to fix it failed for the
+same reason, dying in `Initialize containers` before a single test ran. The second is that the fix is a
+migration, and the migration runs the opposite way from the usual one: the replacement image runs as UID
+1001 where the old one ran as root, so a volume the old image wrote is unwritable by the new one and MinIO
+declines to start. A volume Docker creates fresh inherits the right ownership from the image and needs
+nothing. A new deployment therefore works and an **existing** one breaks, which is why the README carries a
+`chown` line rather than the upgrade being a version bump.
+
+The replacement is `bitnamilegacy/minio:2025.7.23-debian-12-r5` — the same MinIO server, republished by
+Bitnami, and pinned because their legacy namespace is frozen and will never receive another release. That
+is a stopgap, and the honest reading is that a self-hosted object store is the one part of this stack with
+no upstream path forward. Moving `S3_*` to a managed bucket is the swap ADR-018 was written for, and it is
+what a real deployment should do.
 
 **Decision 11 — the audit's negative results.**
 
