@@ -145,7 +145,15 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: Install dependencies
-        run: npm ci
+        # `--include=optional` is not redundant. npm 11 has a live bug
+        # (npm/cli#4828) where `npm ci` silently prunes platform-specific
+        # optional dependencies even though the lockfile records them fully and
+        # correctly. The casualties are the native binaries three of the four
+        # checks below depend on: `@oxlint/binding-*` for lint,
+        # `@tailwindcss/oxide-*` for the build, and `@rolldown/binding-*` for
+        # both. Without the flag the job fails with "Cannot find native
+        # binding", which reads like a broken lockfile and is not one.
+        run: npm ci --include=optional
 
       - name: Lint
         run: npm run lint
