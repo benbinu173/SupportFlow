@@ -10,15 +10,21 @@
     "lint": "oxlint",
     "typecheck": "tsc -b --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "types:api": "openapi-typescript http://localhost:8000/openapi.json -o src/types/api.d.ts"
   },
   "dependencies": {
+    "@fontsource-variable/geist": "^5.3.0",
+    "@fontsource-variable/geist-mono": "^5.3.0",
+    "@phosphor-icons/react": "^2.1.10",
     "@tanstack/react-query": "^5.102.8",
     "axios": "^1.20.0",
+    "motion": "^14.2.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "react-router-dom": "^7.18.3",
     "recharts": "^3.10.1",
+    "tailwind-merge": "^3.7.0",
     "zustand": "^5.0.15"
   },
   "devDependencies": {
@@ -32,10 +38,17 @@
     "@vitejs/plugin-react": "^6.1.0",
     "@vitest/coverage-v8": "^5.0.0",
     "jsdom": "^29.1.1",
+    "openapi-typescript": "^7.13.0",
     "oxlint": "^1.79.0",
     "tailwindcss": "^4.3.3",
     "typescript": "~6.0.2",
     "vite": "^8.2.2",
     "vitest": "^5.0.0"
+  },
+  "//overrides": "openapi-typescript@7.13.0 declares `peer typescript@^5.x`, and no release accepts TypeScript 6. TypeScript is not in its `dependencies` at all — it is metadata inherited from @redocly/openapi-core, and the CLI never imports tsc at runtime. Pinning the peer to this project's own TypeScript is how npm is told the range is stale. If `npm run types:api` ever emits a broken file, this override is the first thing to suspect.",
+  "overrides": {
+    "openapi-typescript": {
+      "typescript": "$typescript"
+    }
   }
 }

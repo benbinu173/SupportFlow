@@ -1,37 +1,643 @@
 @import 'tailwindcss';
 
-/* Design tokens. Kept as CSS variables so both light and dark surfaces read from
-   one source, and so charts can consume the same palette as the UI. */
+/* ===========================================================================
+   SupportFlow design tokens
+
+   ADR-010's premium language, expressed as two complete sets. Every colour,
+   radius, shadow and easing a component uses resolves through a variable
+   declared here, for three reasons:
+
+     - a component never names a raw value, so "make the muted ink slightly
+       darker" is one edit rather than forty;
+     - the dark theme is one block of overrides instead of a `dark:` variant
+       stapled to every class that touches colour;
+     - Recharts reads the same variables, so a chart series cannot drift from
+       the palette the rest of the UI uses.
+
+   The dark set is a `:root[data-theme='dark']` override rather than a
+   `prefers-color-scheme` media query. The theme is user-selectable, and
+   "system" is resolved to a concrete `light` or `dark` in index.html before
+   first paint, so this file only ever sees one of the two. A media query would
+   additionally produce a flash of the wrong theme whenever the stored choice
+   disagreed with the OS.
+
+   Density calibration (ADR-010). The radius and shadow scales run from xs to
+   4xl on purpose: dense product screens use the lower half, marketing and auth
+   surfaces use the upper half. The same applies to motion — see the note above
+   `@media (prefers-reduced-motion)`.
+   =========================================================================== */
+
+/* `dark:` utilities still work for the handful of places where a utility has no
+   token equivalent (a shadow that should vanish in dark mode, say). The
+   attribute is the source of truth, never the media query — see above. */
+@custom-variant dark (&:where([data-theme='dark'], [data-theme='dark'] *));
+
 @theme {
+  /* -- Typography ---------------------------------------------------------
+     Geist, per ADR-010. It is a wide-range variable face with a tall x-height,
+     which is what lets a dense ticket table stay legible at 13px. Inter is
+     banned by ADR-010; the system stack below it is a fallback for the moment
+     before the webfont resolves, not an alternative. */
+  --font-sans:
+    'Geist Variable', 'Geist', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'Geist Mono Variable', 'Geist Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  /* Extra-small end of the scale for eyebrow labels and table metadata. */
+  --text-2xs: 0.6875rem;
+  --text-2xs--line-height: 1rem;
+  --text-2xs--letter-spacing: 0.04em;
+
+  --tracking-eyebrow: 0.18em;
+
+  /* -- Surfaces (light) ---------------------------------------------------
+     Near-white rather than white for the canvas: a pure #fff page behind a
+     pure #fff card leaves the card's edge to the border alone, and the
+     double-bezel architecture needs the inner surface to sit *above* the
+     outer one, not level with it. */
+  --color-canvas: oklch(98.4% 0.003 265);
   --color-surface: oklch(100% 0 0);
-  --color-surface-subtle: oklch(98% 0.002 250);
-  --color-border-subtle: oklch(92% 0.004 250);
+  --color-surface-sunken: oklch(96.6% 0.004 265);
+  --color-surface-hover: oklch(97.2% 0.004 265);
+  --color-surface-active: oklch(94.8% 0.005 265);
+  --color-surface-inverse: oklch(22% 0.014 265);
+  --color-scrim: oklch(22% 0.014 265 / 0.32);
 
-  --color-ink: oklch(24% 0.012 260);
-  --color-ink-muted: oklch(52% 0.012 260);
+  /* -- Ink (light) --------------------------------------------------------
+     Three weights, and the third is not decoration: `ink-subtle` is for
+     metadata that must recede without becoming unreadable, and it still
+     clears 4.5:1 on `surface`. */
+  --color-ink: oklch(23% 0.014 265);
+  --color-ink-muted: oklch(48% 0.014 265);
+  --color-ink-subtle: oklch(62% 0.012 265);
+  --color-ink-inverse: oklch(99% 0 0);
 
-  --color-brand: oklch(58% 0.16 258);
-  --color-brand-hover: oklch(52% 0.17 258);
+  /* -- Borders ------------------------------------------------------------
+     Three weights with three different jobs, which is why they are not one
+     ramp:
+       border-subtle  decorative dividers, no contrast requirement
+       border         card and container edges
+       border-strong  control edges, which WCAG 1.4.11 requires at 3:1
+     Collapsing these into one value is the usual mistake, and it produces
+     either invisible inputs or a grid of heavy outlines. */
+  --color-border-subtle: oklch(93.5% 0.004 265);
+  --color-border: oklch(88% 0.006 265);
+  --color-border-strong: oklch(60% 0.014 265);
 
-  /* Ticket priority and status accents. */
-  --color-priority-low: oklch(64% 0.11 200);
-  --color-priority-medium: oklch(70% 0.13 90);
-  --color-priority-high: oklch(66% 0.17 45);
-  --color-priority-urgent: oklch(58% 0.19 22);
+  /* -- Brand (light) ------------------------------------------------------
+     `brand` is a fill that carries white text, so it is dark enough for
+     4.8:1 rather than the decorative 58% one might reach for. In dark mode
+     the same role inverts to a bright fill with near-black text. */
+  --color-brand: oklch(50% 0.17 258);
+  --color-brand-hover: oklch(45% 0.17 258);
+  --color-brand-active: oklch(40% 0.16 258);
+  --color-brand-fg: oklch(99% 0 0);
+  --color-brand-text: oklch(47% 0.17 258);
+  --color-brand-subtle: oklch(96% 0.022 258);
+  --color-brand-subtle-hover: oklch(93% 0.032 258);
+  --color-brand-border: oklch(88% 0.05 258);
+
+  /* -- Ticket status ------------------------------------------------------
+     Six states, per TicketStatus. Each is the readable *text* weight; the
+     badge component derives its own tint from the same value so a status
+     cannot be one colour in the table and another in the detail header. */
+  --color-status-open: oklch(52% 0.1 250);
+  --color-status-assigned: oklch(50% 0.15 275);
+  --color-status-in-progress: oklch(50% 0.14 240);
+  --color-status-waiting: oklch(56% 0.13 75);
+  --color-status-resolved: oklch(48% 0.13 155);
+  --color-status-closed: oklch(52% 0.02 265);
+
+  /* -- Ticket priority ----------------------------------------------------
+     Separated from status because §6 keeps AI-recommended and business
+     priority distinct; a reader must never confuse an urgency signal with a
+     lifecycle state. */
+  --color-priority-low: oklch(52% 0.11 200);
+  --color-priority-medium: oklch(56% 0.13 75);
+  --color-priority-high: oklch(56% 0.16 45);
+  --color-priority-urgent: oklch(52% 0.19 22);
+
+  /* -- Sentiment ---------------------------------------------------------- */
+  --color-sentiment-positive: oklch(48% 0.13 155);
+  --color-sentiment-neutral: oklch(52% 0.02 265);
+  --color-sentiment-negative: oklch(52% 0.19 22);
+
+  /* -- Semantic UI states -------------------------------------------------
+     Their own roles rather than borrowings from the palettes above. A
+     destructive button and an urgent ticket happen to both be red, and wiring
+     one to the other means re-tuning ticket urgency silently restyles every
+     danger button in the product. Each role carries a fill, a fill that
+     carries text, a subtle background for banners, and a border. */
+  --color-danger: oklch(52% 0.19 22);
+  --color-danger-hover: oklch(47% 0.19 22);
+  --color-danger-active: oklch(42% 0.18 22);
+  --color-danger-fg: oklch(99% 0 0);
+  --color-danger-text: oklch(48% 0.19 22);
+  --color-danger-subtle: oklch(96% 0.03 22);
+  --color-danger-border: oklch(88% 0.07 22);
+
+  --color-success: oklch(48% 0.13 155);
+  --color-success-hover: oklch(43% 0.13 155);
+  --color-success-fg: oklch(99% 0 0);
+  --color-success-text: oklch(44% 0.13 155);
+  --color-success-subtle: oklch(96% 0.03 155);
+  --color-success-border: oklch(88% 0.06 155);
+
+  --color-warning: oklch(56% 0.13 75);
+  --color-warning-fg: oklch(99% 0 0);
+  --color-warning-text: oklch(50% 0.13 70);
+  --color-warning-subtle: oklch(96.5% 0.04 80);
+  --color-warning-border: oklch(88% 0.07 80);
+
+  --color-info: oklch(50% 0.14 240);
+  --color-info-fg: oklch(99% 0 0);
+  --color-info-text: oklch(46% 0.14 240);
+  --color-info-subtle: oklch(96% 0.03 240);
+  --color-info-border: oklch(88% 0.06 240);
+
+  /* -- SLA ----------------------------------------------------------------
+     Four states, and `none` is a real one: a customer never has an SLA and a
+     tenant without a policy has none either. Rendering that as a green "ok"
+     would be a fabricated claim, so it gets a colour of its own. */
+  --color-sla-ok: oklch(48% 0.13 155);
+  --color-sla-warning: oklch(56% 0.13 75);
+  --color-sla-breached: oklch(52% 0.19 22);
+  --color-sla-none: oklch(62% 0.012 265);
+
+  /* -- AI -----------------------------------------------------------------
+     A violet reserved for AI output and used for nothing else, so §41's
+     "visually distinguish AI-generated content" is a colour rule the eye
+     learns rather than a caption that has to be read. */
+  --color-ai: oklch(52% 0.19 295);
+  --color-ai-subtle: oklch(96.5% 0.025 295);
+  --color-ai-border: oklch(89% 0.055 295);
+
+  /* -- Chart series -------------------------------------------------------
+     Six hues with deliberately uneven spacing so two adjacent series stay
+     distinguishable at 8px band heights, and all six clear 3:1 on both
+     canvases so a legend swatch is always findable. */
+  --color-series-1: oklch(50% 0.17 258);
+  --color-series-2: oklch(52% 0.12 190);
+  --color-series-3: oklch(56% 0.13 75);
+  --color-series-4: oklch(52% 0.19 295);
+  --color-series-5: oklch(54% 0.17 15);
+  --color-series-6: oklch(48% 0.13 155);
+
+  /* -- Radii --------------------------------------------------------------
+     A single geometric scale rather than per-component values, so the
+     double-bezel's concentric inner radius is arithmetic
+     (`calc(var(--radius-2xl) - var(--bezel-pad))`) instead of eyeballing. */
+  --radius-xs: 0.25rem;
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.625rem;
+  --radius-xl: 0.875rem;
+  --radius-2xl: 1.25rem;
+  --radius-3xl: 1.75rem;
+  --radius-4xl: 2.5rem;
+
+  /* -- Elevation ----------------------------------------------------------
+     Diffused ambient light, never a hard drop shadow. Each step is two
+     layers: a wide soft one that reads as ambient occlusion and a tight one
+     that keeps the edge in contact with the surface. ADR-010 bans the
+     single-layer `shadow-md` look, and this is what replaces it. */
+  --shadow-xs: 0 1px 2px -1px oklch(0% 0 0 / 0.05), 0 1px 1px -0.5px oklch(0% 0 0 / 0.03);
+  --shadow-sm: 0 2px 4px -2px oklch(0% 0 0 / 0.06), 0 1px 2px -1px oklch(0% 0 0 / 0.04);
+  --shadow-md: 0 6px 16px -6px oklch(0% 0 0 / 0.08), 0 2px 6px -3px oklch(0% 0 0 / 0.05);
+  --shadow-lg: 0 16px 40px -12px oklch(0% 0 0 / 0.1), 0 4px 12px -6px oklch(0% 0 0 / 0.06);
+  --shadow-xl: 0 32px 72px -24px oklch(0% 0 0 / 0.14), 0 8px 24px -12px oklch(0% 0 0 / 0.08);
+
+  /* The inner top highlight that makes a dark card read as a raised pane of
+     glass. In light mode the ambient shadow does this job; in dark mode a
+     shadow is nearly invisible against a dark canvas, so the edge has to be
+     lit instead of shaded. */
+  --shadow-highlight: inset 0 1px 0 0 oklch(100% 0 0 / 0.06);
+  --shadow-bezel: inset 0 1px 0 0 oklch(100% 0 0 / 0.9);
+
+  /* -- Motion -------------------------------------------------------------
+     ADR-010 bans `linear` and `ease-in-out`. Out-expo is the workhorse: fast
+     departure, long settle, which is what makes a panel feel like it has
+     mass. Spring is reserved for things that should overshoot slightly —
+     toggles, the notification badge, a button press. */
+  --ease-out-expo: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+  --ease-in-out-quint: cubic-bezier(0.83, 0, 0.17, 1);
+  --ease-spring: cubic-bezier(0.34, 1.4, 0.64, 1);
+
+  /* The skeleton sweep. A gradient translated across the element rather than a
+     background-position animation — background-position is not composited, so
+     a table of twenty shimmering rows would repaint the whole table every
+     frame. */
+  --animate-shimmer: shimmer 1.8s cubic-bezier(0.32, 0.72, 0, 1) infinite;
+
+  /* Entry-only fades for overlays that are removed rather than hidden — a
+     tooltip, a popover. Opacity alone, because these elements position
+     themselves with a centring translate and a keyframe that also touched
+     `transform` would fight it. */
+  --animate-fade-in: fade-in 140ms cubic-bezier(0.32, 0.72, 0, 1);
+
+  /* -- Z-index tiers ------------------------------------------------------
+     Named layers, because the alternative is an arms race of `z-50` and
+     `z-[9999]` that nobody can reason about. Ordered by what must sit above
+     what, never by when the component was written. */
+  --z-base: 0;
+  --z-raised: 10;
+  --z-sticky: 20;
+  --z-dropdown: 30;
+  --z-overlay: 40;
+  --z-modal: 50;
+  --z-toast: 60;
+  --z-tooltip: 70;
+  --z-noise: 80;
 }
 
+/* ===========================================================================
+   Dark theme — a complete second set, not a filter over the first.
+
+   Note what moves and what does not. Surfaces invert, ink inverts, and the
+   brand *lightens* rather than darkening: a 50%-lightness indigo on a 15%
+   canvas is a hole, whereas a 72% one is a light source — and it carries
+   near-black text at 6.4:1 instead of white text at a marginal 3.4:1.
+   =========================================================================== */
+:root[data-theme='dark'] {
+  --color-canvas: oklch(15.5% 0.008 275);
+  --color-surface: oklch(18.5% 0.009 275);
+  --color-surface-sunken: oklch(13% 0.008 275);
+  --color-surface-hover: oklch(22.5% 0.01 275);
+  --color-surface-active: oklch(26% 0.011 275);
+  --color-surface-inverse: oklch(96% 0.004 265);
+  --color-scrim: oklch(10% 0.01 275 / 0.62);
+
+  --color-ink: oklch(96% 0.004 265);
+  --color-ink-muted: oklch(72% 0.012 265);
+  --color-ink-subtle: oklch(56% 0.012 265);
+  --color-ink-inverse: oklch(17% 0.008 275);
+
+  --color-border-subtle: oklch(24% 0.01 275);
+  --color-border: oklch(28% 0.011 275);
+  --color-border-strong: oklch(50% 0.014 265);
+
+  --color-brand: oklch(72% 0.15 258);
+  --color-brand-hover: oklch(78% 0.13 258);
+  --color-brand-active: oklch(84% 0.11 258);
+  --color-brand-fg: oklch(17% 0.01 275);
+  --color-brand-text: oklch(76% 0.14 258);
+  --color-brand-subtle: oklch(26% 0.055 258);
+  --color-brand-subtle-hover: oklch(30% 0.065 258);
+  --color-brand-border: oklch(36% 0.08 258);
+
+  --color-status-open: oklch(72% 0.09 250);
+  --color-status-assigned: oklch(74% 0.12 275);
+  --color-status-in-progress: oklch(74% 0.12 240);
+  --color-status-waiting: oklch(80% 0.13 80);
+  --color-status-resolved: oklch(75% 0.14 158);
+  --color-status-closed: oklch(62% 0.02 265);
+
+  --color-priority-low: oklch(74% 0.11 200);
+  --color-priority-medium: oklch(80% 0.13 80);
+  --color-priority-high: oklch(75% 0.15 45);
+  --color-priority-urgent: oklch(70% 0.18 22);
+
+  --color-sentiment-positive: oklch(75% 0.14 158);
+  --color-sentiment-neutral: oklch(62% 0.02 265);
+  --color-sentiment-negative: oklch(70% 0.18 22);
+
+  --color-danger: oklch(70% 0.18 22);
+  --color-danger-hover: oklch(76% 0.16 22);
+  --color-danger-active: oklch(82% 0.14 22);
+  --color-danger-fg: oklch(17% 0.01 275);
+  --color-danger-text: oklch(74% 0.17 22);
+  --color-danger-subtle: oklch(26% 0.07 22);
+  --color-danger-border: oklch(36% 0.1 22);
+
+  --color-success: oklch(75% 0.14 158);
+  --color-success-hover: oklch(81% 0.12 158);
+  --color-success-fg: oklch(17% 0.01 275);
+  --color-success-text: oklch(78% 0.13 158);
+  --color-success-subtle: oklch(24% 0.05 158);
+  --color-success-border: oklch(34% 0.08 158);
+
+  --color-warning: oklch(80% 0.13 80);
+  --color-warning-fg: oklch(17% 0.01 275);
+  --color-warning-text: oklch(82% 0.12 80);
+  --color-warning-subtle: oklch(26% 0.05 80);
+  --color-warning-border: oklch(36% 0.08 80);
+
+  --color-info: oklch(74% 0.12 240);
+  --color-info-fg: oklch(17% 0.01 275);
+  --color-info-text: oklch(78% 0.11 240);
+  --color-info-subtle: oklch(24% 0.05 240);
+  --color-info-border: oklch(34% 0.08 240);
+
+  --color-sla-ok: oklch(75% 0.14 158);
+  --color-sla-warning: oklch(80% 0.13 80);
+  --color-sla-breached: oklch(70% 0.18 22);
+  --color-sla-none: oklch(56% 0.012 265);
+
+  --color-ai: oklch(75% 0.15 295);
+  --color-ai-subtle: oklch(24% 0.06 295);
+  --color-ai-border: oklch(34% 0.09 295);
+
+  --color-series-1: oklch(72% 0.15 258);
+  --color-series-2: oklch(74% 0.12 190);
+  --color-series-3: oklch(80% 0.13 80);
+  --color-series-4: oklch(75% 0.15 295);
+  --color-series-5: oklch(72% 0.16 15);
+  --color-series-6: oklch(75% 0.14 158);
+
+  /* Dark-mode elevation leans on the highlight rather than the shadow, but the
+     shadows still deepen: on a dark canvas a soft ambient layer is what stops
+     a modal from looking pasted on. */
+  --shadow-xs: 0 1px 2px -1px oklch(0% 0 0 / 0.4);
+  --shadow-sm: 0 2px 4px -2px oklch(0% 0 0 / 0.45), 0 1px 2px -1px oklch(0% 0 0 / 0.3);
+  --shadow-md: 0 6px 16px -6px oklch(0% 0 0 / 0.5), 0 2px 6px -3px oklch(0% 0 0 / 0.35);
+  --shadow-lg: 0 16px 40px -12px oklch(0% 0 0 / 0.6), 0 4px 12px -6px oklch(0% 0 0 / 0.4);
+  --shadow-xl: 0 32px 72px -24px oklch(0% 0 0 / 0.7), 0 8px 24px -12px oklch(0% 0 0 / 0.5);
+
+  color-scheme: dark;
+}
+
+/* ===========================================================================
+   Base layer
+   =========================================================================== */
 @layer base {
+  :root {
+    color-scheme: light;
+  }
+
   html {
     -webkit-text-size-adjust: 100%;
+    /* Height of the topbar. Sticky offsets and scroll-margin read it, so the
+       two can never disagree about where content starts. */
+    --topbar-h: 3.5rem;
   }
 
   body {
-    @apply bg-surface-subtle text-ink antialiased;
-    font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+    background-color: var(--color-canvas);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    /* Geist's contextual alternates tighten `fi`/`fl` and, more usefully here,
+       keep long ticket subjects from looking gappy. */
+    font-feature-settings: 'calt' 1;
   }
 
-  /* Visible focus for keyboard users without adding a ring on mouse clicks. */
+  /* Visible focus for keyboard users without adding a ring on mouse clicks.
+     Uses the brand colour at full strength — a focus ring that is merely a
+     lighter border is a focus ring nobody sees.
+
+     No `border-radius` here. Outline follows the element's own corners in every
+     browser that supports `outline-offset` this century, and setting the radius
+     would instead *impose* one — snapping a rounded-full button to a 4px
+     rectangle at the exact moment the user focuses it. */
   :focus-visible {
-    @apply outline-brand outline-2 outline-offset-2;
+    outline: 2px solid var(--color-brand);
+    outline-offset: 2px;
   }
+
+  /* Numerals in tables and timers must not jitter as they tick. Dialogs and
+     the sheet get the same treatment because the whole product reads as a
+     data surface. */
+  table,
+  time,
+  [data-numeric] {
+    font-variant-numeric: tabular-nums;
+  }
+
+  ::selection {
+    background-color: var(--color-brand-subtle);
+    color: var(--color-brand-text);
+  }
+
+  /* Headings inherit the UI font deliberately — no separate display face. A
+     support tool gains nothing from a serif and loses vertical rhythm. */
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-weight: 600;
+    letter-spacing: -0.015em;
+    text-wrap: balance;
+  }
+
+  p {
+    text-wrap: pretty;
+  }
+
+  /* Scrollbars, matched to the surfaces. Firefox reads the two properties;
+     WebKit needs the pseudo-elements. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-border-strong) transparent;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background-color: var(--color-border);
+    border: 3px solid transparent;
+    background-clip: content-box;
+    border-radius: 9999px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: var(--color-border-strong);
+  }
+
+  /* Disabled controls must not look merely faded — pointer-events off stops
+     the hover states that would otherwise still fire. */
+  :disabled,
+  [aria-disabled='true'] {
+    cursor: not-allowed;
+  }
+}
+
+/* ===========================================================================
+   Reduced motion
+
+   ADR-010 requires every animation to respect this, and the bluntest correct
+   implementation is here rather than in forty components: collapsing the
+   durations globally means a component cannot forget. `motion` (the library)
+   additionally reads `useReducedMotion` for the choreography it drives in JS
+   — this rule covers everything CSS drives.
+   =========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Defined outside `@theme` so it is emitted unconditionally — it is a handful
+   of bytes, and a keyframe that a theme variable has to keep alive is one more
+   thing that can silently disappear from a production build. */
+@keyframes shimmer {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+/* ===========================================================================
+   Native <dialog> motion
+
+   Kept as CSS rather than Tailwind utilities because the interesting part is
+   `allow-discrete`, which `transition-behavior` needs in order to animate
+   `display` and `overlay` at all. That is what separates a modal that animates
+   from one that appears — and a modal that appears is the single most common
+   reason a built product still feels like a prototype.
+
+   A browser without `allow-discrete` ignores the transition and opens
+   instantly, which is the correct degradation and needs no fallback.
+
+   Note this sits outside `@layer`, so it outranks anything Tailwind emits. The
+   UA stylesheet's `dialog` rules have to be beaten, and an unlayered author
+   rule is the simplest way to be sure of it.
+   =========================================================================== */
+
+dialog {
+  opacity: 0;
+  transform: scale(0.96) translateY(0.5rem);
+  transition:
+    opacity 180ms var(--ease-out-expo),
+    transform 180ms var(--ease-out-expo),
+    overlay 180ms allow-discrete,
+    display 180ms allow-discrete;
+}
+
+dialog[open] {
+  opacity: 1;
+  transform: scale(1) translateY(0);
+}
+
+/* The state to animate *from* on open. Without this the element has no
+   previous computed style to interpolate out of and simply snaps. */
+@starting-style {
+  dialog[open] {
+    opacity: 0;
+    transform: scale(0.96) translateY(0.5rem);
+  }
+}
+
+dialog::backdrop {
+  opacity: 0;
+  background-color: var(--color-scrim);
+  /* Blur is allowed here: the backdrop is a fixed overlay, which is exactly
+     the case ADR-010's guardrail reserves it for. */
+  backdrop-filter: blur(2px);
+  transition:
+    opacity 180ms var(--ease-out-expo),
+    overlay 180ms allow-discrete,
+    display 180ms allow-discrete;
+}
+
+dialog[open]::backdrop {
+  opacity: 1;
+}
+
+@starting-style {
+  dialog[open]::backdrop {
+    opacity: 0;
+  }
+}
+
+/* ===========================================================================
+   Utilities
+
+   The double-bezel from ADR-010, expressed once. A premium container is not a
+   card with a border and a radius — it is a machined tray holding a pane: an
+   outer shell with its own hairline and a generous radius, and an inner core
+   whose radius is the outer radius minus the shell's padding, so the two
+   curves are concentric. Getting that arithmetic wrong is what makes a nested
+   container look subtly cheap, so it is calculated rather than eyeballed.
+   =========================================================================== */
+
+/* Outer shell. `--bezel-pad` is read by the inner core below. */
+@utility bezel {
+  --bezel-pad: 0.375rem;
+  padding: var(--bezel-pad);
+  border-radius: var(--radius-3xl);
+  background-color: var(--color-surface-sunken);
+  border: 1px solid var(--color-border-subtle);
+}
+
+/* Inner core. Concentric by construction. */
+@utility bezel-core {
+  border-radius: calc(var(--radius-3xl) - var(--bezel-pad));
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-border-subtle);
+  overflow: hidden;
+}
+
+/* A fixed, pointer-events-none grain layer. ADR-010 allows noise only on a
+   layer like this — attached to a scrolling container it forces a repaint on
+   every frame. */
+@utility noise-layer {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-noise);
+  pointer-events: none;
+  opacity: 0.025;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* Text that must be clipped for the eye but present for a screen reader.
+   Tailwind's `sr-only` exists; this alias keeps the intent obvious at call
+   sites that only ever use it for a heading label. */
+@utility eyebrow {
+  font-size: var(--text-2xs);
+  line-height: 1rem;
+  letter-spacing: var(--tracking-eyebrow);
+  text-transform: uppercase;
+  font-weight: 500;
+}
+
+/* The z-index tiers, exposed as utilities.
+
+   Tailwind v4 has no theme namespace for z-index, so `--z-*` on its own would
+   only be readable through `z-[var(--z-modal)]` at every call site. These wrap
+   the tokens so the tier is named where it is used, which is the whole point of
+   having tiers: a reader should be able to see that a tooltip outranks a toast
+   without looking anything up. */
+@utility z-sticky {
+  z-index: var(--z-sticky);
+}
+
+@utility z-dropdown {
+  z-index: var(--z-dropdown);
+}
+
+@utility z-overlay {
+  z-index: var(--z-overlay);
+}
+
+@utility z-modal {
+  z-index: var(--z-modal);
+}
+
+@utility z-toast {
+  z-index: var(--z-toast);
+}
+
+@utility z-tooltip {
+  z-index: var(--z-tooltip);
 }

@@ -8,7 +8,47 @@
       name="description"
       content="SupportFlow — AI-assisted customer support, built for modern support teams."
     />
+    <!-- The browser chrome, before any script runs. Keyed to the *system*
+         preference, because at this point there is no way to know whether the
+         user has overridden it — the override lives in localStorage and this is
+         the no-JS fallback. A user who picks Light on a dark OS therefore gets a
+         dark address bar until F10 revisits it; the alternative is duplicating
+         the theme-to-colour mapping in a third place to save one hairline of
+         chrome, which is not a trade worth making. -->
+    <meta name="theme-color" content="#fbfbfc" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#16171d" media="(prefers-color-scheme: dark)" />
     <title>SupportFlow</title>
+    <script>
+      // Resolve the theme before the first paint.
+      //
+      // This is inline, blocking, and must stay that way. React effects run
+      // after commit, so doing this work in ThemeProvider would paint one light
+      // frame for every dark-mode user on every load — the exact flash the
+      // attribute exists to prevent.
+      //
+      // The storage key and the resolution rule are duplicated from
+      // src/store/theme.ts, which this cannot import. Keep the two in step.
+      ;(function () {
+        var theme = 'light'
+
+        try {
+          var stored = localStorage.getItem('supportflow.theme')
+
+          theme =
+            stored === 'light' || stored === 'dark'
+              ? stored
+              : window.matchMedia('(prefers-color-scheme: dark)').matches
+                ? 'dark'
+                : 'light'
+        } catch (error) {
+          // Storage can throw rather than return null — Safari in private mode
+          // denies it, as can an embedded webview. Light is the default either
+          // way; failing here would leave the page unstyled instead.
+        }
+
+        document.documentElement.dataset.theme = theme
+      })()
+    </script>
   </head>
   <body>
     <div id="root"></div>

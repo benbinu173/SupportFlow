@@ -42,10 +42,28 @@ describe('route table', () => {
     expect(await screen.findByText('Ready')).toBeVisible()
   })
 
-  it('has nothing else mounted yet', () => {
-    // One route is the current truth, not an oversight: role-scoped sections arrive with the
-    // screens behind them. This fails the moment a route is added without a test, which is the
-    // point — a growing route table with a one-line test file is how a guard gets skipped.
-    expect(router.routes).toHaveLength(1)
+  it('serves the component kit on the development route', async () => {
+    renderAt('/dev/kit')
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Component kit' })).toBeVisible()
+  })
+
+  it('renders the not-found page for an unmatched path', async () => {
+    renderAt('/no/such/place')
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Page not found' })).toBeVisible()
+  })
+
+  it('mounts every route the tests above cover, and no others', () => {
+    // The inventory is the guard. A route added without a case here fails this test, which is
+    // the point: a growing route table beside a one-line test file is how a guard gets skipped.
+    // The paths are asserted rather than the count, so the failure names what was added.
+    //
+    // `/dev/kit` is present because `import.meta.env.DEV` is true under Vitest; the production
+    // build drops it, along with the page behind it.
+    const rootRoute = router.routes[0]
+    const childPaths = (rootRoute?.children ?? []).map((route) => route.path)
+
+    expect(childPaths).toEqual(['/', '/dev/kit', '*'])
   })
 })
