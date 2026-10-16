@@ -117,6 +117,34 @@ describe('signing in', () => {
     expect(useSessionStore.getState().status).toBe('authenticated')
   })
 
+  it('has the token in the store before it asks who the token belongs to', async () => {
+    // The request interceptor authorises `/auth/me` out of the session store
+    // rather than from an argument, so recording the token and fetching the
+    // profile in the wrong order sends the request with no `Authorization`
+    // header — and the real server answers that 401, which the interceptor
+    // treats as an expired session.
+    //
+    // Every other case in this file mocks `fetchCurrentUser` with a bare
+    // `mockResolvedValue`, and a mock answers no matter who calls it or with
+    // what headers. That is why none of them could see this: the ordering is
+    // only observable from *inside* the call, which is where this reads it.
+    let tokenAtFetch: string | null | 'never called' = 'never called'
+
+    api.fetchCurrentUser.mockImplementation(() => {
+      tokenAtFetch = useSessionStore.getState().accessToken
+
+      return Promise.resolve(AGENT)
+    })
+
+    renderLogin()
+
+    await signIn()
+
+    await screen.findByRole('heading', { level: 1, name: 'Signed in as Avery Chen' })
+
+    expect(tokenAtFetch).toBe('issued-access-token')
+  })
+
   it('puts no long-lived credential in web storage', async () => {
     renderLogin()
 
