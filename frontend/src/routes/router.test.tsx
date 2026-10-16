@@ -128,8 +128,25 @@ describe('route table', () => {
     // role. Matching the label by pattern rather than by exact string is what
     // the asterisk forces: `aria-hidden` keeps it out of the accessible name,
     // but it is still a text node inside the `<label>` element, which is what
-    // this query reads.
-    expect(await screen.findByLabelText(/Password/)).toBeInTheDocument()
+    // this query reads. The pattern is anchored because the field also has a
+    // reveal button whose `aria-label` ("Show password") would match `/Password/`.
+    expect(await screen.findByLabelText(/^Password\*?$/)).toBeInTheDocument()
+
+    // The panel beside the form, and the copy that belongs to *this* route.
+    // Asserted here rather than in a test of the panel alone, because the thing
+    // that can go wrong is the wiring: `AuthLayout` picks the variant from the
+    // path, and a sign-in screen that argues for creating a workspace is a
+    // mistake no test of the panel in isolation could see.
+    //
+    // The heading is the observable, so this does move whenever the marketing
+    // copy does. That is the trade, and it is worth it: the alternative is not
+    // asserting it at all.
+    expect(
+      await screen.findByRole('heading', {
+        level: 2,
+        name: 'Pick up where your queue left off.',
+      })
+    ).toBeInTheDocument()
   })
 
   it('serves the registration form', async () => {
@@ -142,6 +159,15 @@ describe('route table', () => {
     // By name, because this form has three text boxes and the name is the only
     // thing separating them.
     expect(await screen.findByRole('textbox', { name: 'Organization' })).toBeInTheDocument()
+
+    // The other half of the same wiring claim above: registration must not be
+    // handed the sign-in panel.
+    expect(
+      await screen.findByRole('heading', {
+        level: 2,
+        name: 'You are about to become its administrator.',
+      })
+    ).toBeInTheDocument()
   })
 
   it('renders the not-found page for an unmatched path', async () => {

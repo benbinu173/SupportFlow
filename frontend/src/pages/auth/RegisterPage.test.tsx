@@ -82,7 +82,12 @@ async function fillAndSubmit(overrides: Partial<Record<keyof typeof FORM, string
   await user.type(await screen.findByRole('textbox', { name: 'Organization' }), values.organization)
   await user.type(screen.getByRole('textbox', { name: 'Your name' }), values.name)
   await user.type(screen.getByRole('textbox', { name: 'Work email' }), values.email)
-  await user.type(screen.getByLabelText(/Password/), values.password)
+  // The whole label, asterisk and all. `/Password/` would address three
+  // controls on this screen: the field, its reveal button ("Show password"),
+  // and the requirements list ("Password requirements"), because
+  // `getByLabelText` matches an `aria-label` as readily as it matches a
+  // `<label>`.
+  await user.type(screen.getByLabelText(/^Password\*?$/), values.password)
 
   await user.click(screen.getByRole('button', { name: 'Create workspace' }))
 }
@@ -192,7 +197,7 @@ describe('creating a workspace', () => {
     // 129 characters is a value this input cannot produce by hand. It is still a
     // value autofill can deposit, and the ceiling is all that stands between
     // that and handing a megabyte to the password hasher.
-    fireEvent.change(await screen.findByLabelText(/Password/), {
+    fireEvent.change(await screen.findByLabelText(/^Password\*?$/), {
       target: { value: 'a'.repeat(129) },
     })
 
@@ -219,7 +224,7 @@ describe('creating a workspace', () => {
     expect(await screen.findByText('Use at least 12 characters.')).toBeInTheDocument()
 
     const user = userEvent.setup()
-    const passwordField = screen.getByLabelText(/Password/)
+    const passwordField = screen.getByLabelText(/^Password\*?$/)
 
     await user.clear(passwordField)
     await user.type(passwordField, FORM.password)
@@ -227,10 +232,35 @@ describe('creating a workspace', () => {
 
     // The server is doing the talking now, and its message has replaced the one
     // this form made. The assertion is on the exact string rather than
-    // `/at least 12 characters/i`, because the field's *hint* says almost the
-    // same thing and comes back the moment the error clears — a loose match
-    // would pass on the hint and report a release that had not happened.
+    // `/at least 12 characters/i`, because the checklist below the field says
+    // almost the same thing in a state the user can see — and unlike the old
+    // hint, it does not come and go with the error, so a loose match would read
+    // it forever and report a release that had not happened.
     expect(await screen.findByText('This email is already registered.')).toBeInTheDocument()
     expect(screen.queryByText('Use at least 12 characters.')).not.toBeInTheDocument()
+  })
+
+  /**
+   * The checklist and the submit-time refusal read the same two constants, and
+   * this is what holds them together: if the floor in `password-policy.ts` ever
+   * moves, the tick marks move with it, and the message that follows them still
+   * names the same number.
+   */
+  it('marks the policy satisfied as the password reaches it', async () => {
+    renderRegister()
+
+    const requirements = () =>
+      screen.getByRole('list', { name: 'Password requirements' })
+
+    expect(requirements()).toHaveTextContent('At least 12 characters, not yet met')
+
+    await userEvent.setup().type(await screen.findByLabelText(/^Password\*?$/), 'twelve-chars')
+
+    expect(requirements()).toHaveTextContent('At least 12 characters, met')
+    expect(requirements()).not.toHaveTextContent('At least 12 characters, not yet met')
+
+    // Both rules are stated, not only the one that can fail — a checklist that
+    // grows and shrinks as you type is harder to read than one that holds still.
+    expect(requirements()).toHaveTextContent('No more than 128 characters, met')
   })
 })

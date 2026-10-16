@@ -67,7 +67,14 @@ async function signIn(email = AGENT.email, password = 'correct-horse-battery') {
   const user = userEvent.setup()
 
   await user.type(await screen.findByRole('textbox', { name: 'Email' }), email)
-  await user.type(screen.getByLabelText(/Password/), password)
+  // The whole label, asterisk and all, rather than `/Password/` anywhere. The
+  // field carries a reveal button labelled "Show password", and
+  // `getByLabelText` matches an `aria-label` as readily as it matches a
+  // `<label>` — so the loose pattern addresses two controls and throws. The
+  // asterisk is present because `Field` renders one inside the label for a
+  // required control even though `aria-hidden` keeps it out of the computed
+  // accessible name.
+  await user.type(screen.getByLabelText(/^Password\*?$/), password)
   await user.click(screen.getByRole('button', { name: 'Sign in' }))
 }
 

@@ -235,6 +235,30 @@
      `transform` would fight it. */
   --animate-fade-in: fade-in 140ms cubic-bezier(0.32, 0.72, 0, 1);
 
+  /* Ambient drift for the light pools on the auth panel, over a period long
+     enough to be noticed rather than watched. Transition duration, never
+     `ease-in-out`: this curve is symmetric, which is the thing ADR-010
+     otherwise bans, and the reason it is right here is that a loop has no
+     start to ease out of and no end to arrive at — an out-expo curve would
+     rush, stop, and jerk into its next pass every twenty-six seconds for as
+     long as the tab is open. `ease-in-out` itself is still not used; this is a
+     shallower symmetric bezier chosen specifically for perpetual motion. */
+  --animate-drift: drift 26s cubic-bezier(0.37, 0, 0.63, 1) infinite;
+
+  /* Entry for a block arriving on mount — the auth screens' whole choreography.
+
+     `backwards` is load-bearing. Without it an element with a delay paints at
+     its final state until the delay elapses and then jumps to transparent to
+     begin, so every staggered item flashes before it animates.
+
+     The offset, the starting rotation and the delay arrive as custom
+     properties, which is what lets one keyframe serve every element on the
+     screen. `--enter-delay` rather than an `animation-delay` utility is
+     deliberate: the shorthand below already owns the delay slot, and a longhand
+     utility racing a shorthand for the same property is settled by stylesheet
+     order rather than by the order of the class list. */
+  --animate-enter: enter 0.5s cubic-bezier(0.32, 0.72, 0, 1) var(--enter-delay, 0ms) backwards;
+
   /* -- Z-index tiers ------------------------------------------------------
      Named layers, because the alternative is an arms race of `z-50` and
      `z-[9999]` that nobody can reason about. Ordered by what must sit above
@@ -474,6 +498,14 @@
   *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
+    /* The delay has to go with the duration, and this is not a formality. The
+       staggered entries carry a delay of up to 680ms, and with
+       `animation-fill-mode: backwards` an element waiting out its delay is
+       held at the animation's *first* frame — which for `enter` is fully
+       transparent. Collapsing the duration alone would therefore leave anyone
+       who asked for less motion staring at an empty panel for most of a
+       second, which is a worse outcome than the animation ever was. */
+    animation-delay: 0ms !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
   }
@@ -494,6 +526,37 @@
 @keyframes fade-in {
   from {
     opacity: 0;
+  }
+}
+
+/* A closed loop: the last frame is the first. That matters for the
+   reduced-motion rule above, which clamps `animation-iteration-count` to 1 —
+   an open-ended keyframe would leave these elements stranded at whatever
+   offset the single pass ended on, so asking for less motion would move them
+   once and leave them there. */
+@keyframes drift {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  33% {
+    transform: translate3d(2.5rem, -1.75rem, 0) scale(1.06);
+  }
+  66% {
+    transform: translate3d(-1.5rem, 1.25rem, 0) scale(0.97);
+  }
+}
+
+/* `from` only, so the destination is whatever the element already is. That is
+   what lets one keyframe serve a card that settles into a four-degree tilt and
+   a form field that settles flat, without either of them passing a transform
+   in. The function list is written to match a two-function `transform` so the
+   browser interpolates the list rather than falling back to matrix
+   decomposition — which would take the long way round on a rotation. */
+@keyframes enter {
+  from {
+    opacity: 0;
+    transform: translate3d(0, var(--enter-y, 0.75rem), 0) rotate(var(--enter-rotate, 0deg));
   }
 }
 
