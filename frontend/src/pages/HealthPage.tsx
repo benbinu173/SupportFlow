@@ -8,8 +8,17 @@ interface ReadinessResponse {
 }
 
 /**
- * Phase C placeholder. Exists to prove the full local loop end to end:
- * Vite dev server → proxy → FastAPI → readiness probe.
+ * The readiness probe, at `/dev/health` in development only.
+ *
+ * It began as the Phase C scaffold's only page, at `/`, whose job was to prove
+ * the full local loop end to end: Vite dev server → proxy → FastAPI → readiness
+ * probe. The landing page took the root in F2 and this moved under the
+ * development routes rather than being deleted, because that job is not
+ * finished — it is still the one screen that shows whether the API, the database
+ * and the object store are actually up, with nothing between it and the server.
+ *
+ * F8 moves this panel into the admin screen, which is where a status readout
+ * belongs once there is a product around it, and deletes this page.
  */
 export function HealthPage() {
   const { data, isPending, isError } = useQuery({

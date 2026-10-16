@@ -45,6 +45,8 @@ const FIXTURE_USER: SessionUser = {
   role: 'admin',
   is_active: true,
   customer_id: null,
+  created_at: '2026-01-01T00:00:00Z',
+  last_login_at: null,
 }
 
 const SURFACE_TOKENS = [

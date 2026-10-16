@@ -33,3 +33,49 @@ if (!window.matchMedia) {
     } as unknown as MediaQueryList
   })
 }
+
+/**
+ * `IntersectionObserver` and `ResizeObserver`, neither of which jsdom
+ * implements.
+ *
+ * The marketing surface enters with `whileInView`, and the `motion` library's
+ * in-view feature constructs an observer the moment such a component mounts.
+ * Without these, every test that renders the landing page throws rather than
+ * failing an assertion.
+ *
+ * The intersection stub **never fires**. That is the honest behaviour for a
+ * headless DOM with no layout: nothing is ever genuinely in the viewport, so a
+ * reveal waiting on the callback keeps its initial state forever. Tests that
+ * render the landing page therefore assert on what the page *says* rather than
+ * on whether an element has finished animating into place, which is a claim
+ * only a browser can settle.
+ *
+ * Both are assigned unconditionally rather than behind an `in` check. The check
+ * would not compile: `lib.dom` declares both as always present on `window`, so
+ * the body of `if (!('IntersectionObserver' in window))` is narrowed to `never`
+ * and every assignment inside it is an error. The unconditional form is also
+ * the truthful one — these files run only under Vitest, where jsdom is the
+ * environment.
+ */
+class IntersectionObserverStub implements IntersectionObserver {
+  readonly root: Element | Document | null = null
+  readonly rootMargin: string = ''
+  readonly thresholds: ReadonlyArray<number> = []
+  readonly scrollMargin: string = ''
+
+  observe(): void {}
+  unobserve(): void {}
+  disconnect(): void {}
+  takeRecords(): IntersectionObserverEntry[] {
+    return []
+  }
+}
+
+class ResizeObserverStub implements ResizeObserver {
+  observe(): void {}
+  unobserve(): void {}
+  disconnect(): void {}
+}
+
+globalThis.IntersectionObserver = IntersectionObserverStub
+globalThis.ResizeObserver = ResizeObserverStub
