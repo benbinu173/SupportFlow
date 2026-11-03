@@ -10,8 +10,8 @@ import { useSessionStore } from '@/store/auth'
 /**
  * Where every role lands after signing in.
  *
- * **This is a placeholder, and it says so.** The ticket queue arrives in F4 and
- * the dashboards in F7; what F2 is responsible for is proving the session works
+ * **This is the dashboard placeholder, and it says so.** The ticket queue is
+ * implemented separately; the dashboard arrives in F7. What F2 is responsible for is proving the session works
  * end to end — that a real login returns a real token, that `/auth/me` reports
  * the real role, and that the shell renders the navigation that role is
  * entitled to. A page claiming to be a dashboard while showing nothing would be
@@ -56,10 +56,10 @@ export function HomePage() {
             <div className="flex flex-col gap-1">
               <h2 className="text-sm font-semibold text-ink">What this page is</h2>
               <p className="text-[0.8125rem] leading-relaxed text-ink-muted">
-                A checkpoint for the sign-in flow. The navigation beside it is real — it is
-                filtered by your role&apos;s permissions, so a customer cannot see the admin
-                section and an agent is not offered the audit log. The screens those links point
-                at arrive over the next phases.
+                A checkpoint for the sign-in flow. Your ticket queue is live; the dashboard
+                and customer portal are being built screen by screen. Navigation is filtered
+                by your role&apos;s permissions, so a customer cannot see the admin section and
+                an agent is not offered the audit log.
               </p>
             </div>
 

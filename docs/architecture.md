@@ -372,6 +372,21 @@ A committed change
    → the client is told what changed and re-reads the ticket over HTTP
 ```
 
+The frontend transport lives in `frontend/src/services/realtime/`: it sends the access token
+in the first frame, waits for `authenticated`, validates known envelope shapes, and invalidates
+TanStack Query data rather than trying to patch partial ticket objects into caches. `4401`
+refreshes the session once and retries; `4403` stops without retrying. Transient closes use
+capped exponential backoff. After a reconnect, all cached queries are marked stale because
+Redis Pub/Sub is intentionally best-effort and events may have been missed while offline.
+
+Feature query keys live beside their data owners (`features/tickets/keys.ts` and
+`features/notifications/keys.ts`). `services/realtime/invalidate.ts` is the client counterpart
+to `REALTIME_FOR_EVENT`: each wire event has an explicit set of query-key families to refresh.
+CI runs `npm run check:realtime-contract` to compare the client event set with the backend map.
+The client invalidation table is a projection of the backend event contract, not a second
+authorization boundary; the server has already filtered every envelope for tenant, role, and
+internal-content visibility before delivery.
+
 **Where each piece lives.** `app/websocket/events.py` is the vocabulary and the boundary: the
 envelope models, `channel_for`, the `REALTIME_FOR_EVENT` mapping from the timeline's event types
 onto the wire's, and one pure predicate. `app/websocket/manager.py` is the transport: the

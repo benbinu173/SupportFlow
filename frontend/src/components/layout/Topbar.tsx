@@ -2,8 +2,9 @@ import { Bell, CaretDown, Check, List, MagnifyingGlass, SignOut, UserCircle, X }
 import { useState, type FormEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 
+import { useRealtimeStatus } from '@/app/realtime-status'
 import { Avatar } from '@/components/ui/Avatar'
-import { CountBadge } from '@/components/ui/Badge'
+import { Badge, CountBadge } from '@/components/ui/Badge'
 import { DropdownMenu, type DropdownMenuItem } from '@/components/ui/DropdownMenu'
 import { IconButton } from '@/components/ui/IconButton'
 import { Input } from '@/components/ui/Input'
@@ -45,6 +46,7 @@ export function Topbar({
   const [query, setQuery] = useState('')
   const themePreference = useThemeStore((state) => state.preference)
   const setThemePreference = useThemeStore((state) => state.setPreference)
+  const realtimeStatus = useRealtimeStatus()
 
   const isPortal = isPortalRole(user.role)
   const ticketsPath = isPortal ? '/portal' : '/tickets'
@@ -137,6 +139,31 @@ export function Topbar({
       )}
 
       <div className="ml-auto flex items-center gap-1">
+        {realtimeStatus !== 'inactive' && (
+          <Badge
+            variant={
+              realtimeStatus === 'connected'
+                ? 'success'
+                : realtimeStatus === 'reconnecting'
+                  ? 'warning'
+                  : 'neutral'
+            }
+            size="sm"
+            dot
+            role="status"
+            aria-live="polite"
+            className="mr-1 hidden sm:inline-flex"
+          >
+            {realtimeStatus === 'connected'
+              ? 'Live'
+              : realtimeStatus === 'reconnecting'
+                ? 'Reconnecting'
+                : realtimeStatus === 'connecting'
+                  ? 'Connecting'
+                  : 'Updates paused'}
+          </Badge>
+        )}
+
         {(can(user.role, PERMISSIONS.NOTIFICATION_LIST) || isPortal) && (
           <Tooltip content="Notifications">
             <IconButton

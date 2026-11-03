@@ -158,6 +158,9 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      - name: Realtime contract
+        run: npm run check:realtime-contract
+
       - name: Typecheck
         run: npx tsc -b
 

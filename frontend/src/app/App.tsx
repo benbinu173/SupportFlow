@@ -3,6 +3,7 @@ import { MotionConfig } from 'motion/react'
 import { RouterProvider } from 'react-router-dom'
 
 import { IconProvider } from '@/app/IconProvider'
+import { RealtimeProvider } from '@/app/RealtimeProvider'
 import { SessionProvider } from '@/app/SessionProvider'
 import { ThemeProvider } from '@/app/ThemeProvider'
 import { Toaster } from '@/components/ui/Toaster'
@@ -40,7 +41,9 @@ export function App() {
         <IconProvider>
           <QueryClientProvider client={queryClient}>
             <SessionProvider>
-              <RouterProvider router={router} />
+              <RealtimeProvider>
+                <RouterProvider router={router} />
+              </RealtimeProvider>
             </SessionProvider>
             <Toaster />
           </QueryClientProvider>

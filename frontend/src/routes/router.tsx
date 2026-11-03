@@ -5,14 +5,15 @@ import { MarketingLayout } from '@/layouts/MarketingLayout'
 import { HealthPage } from '@/pages/HealthPage'
 import { HomePage } from '@/pages/HomePage'
 import { NotFoundPage } from '@/pages/NotFoundPage'
+import { TicketQueuePage } from '@/pages/tickets/TicketQueuePage'
 import { LoginPage } from '@/pages/auth/LoginPage'
 import { RegisterPage } from '@/pages/auth/RegisterPage'
 import { KitPage } from '@/pages/dev/KitPage'
 import { LandingPage } from '@/pages/marketing/LandingPage'
 import { RouteError } from '@/routes/RouteError'
-import { RedirectIfAuthenticated, RequireAuth } from '@/routes/guards'
+import { RedirectIfAuthenticated, RequireAuth, RequirePermission } from '@/routes/guards'
 import { HOME_BY_ROLE } from '@/routes/navigation'
-import type { UserRole } from '@/features/auth/permissions'
+import { PERMISSIONS, type UserRole } from '@/features/auth/permissions'
 
 /**
  * Development-only routes.
@@ -77,6 +78,10 @@ export const router = createBrowserRouter([
         element: <RequireAuth />,
         children: [
           { path: '/dashboard', element: <HomePage /> },
+          {
+            element: <RequirePermission permission={PERMISSIONS.TICKET_LIST} />,
+            children: [{ path: '/tickets', element: <TicketQueuePage /> }],
+          },
           { path: '/portal', element: <HomePage /> },
         ],
       },
