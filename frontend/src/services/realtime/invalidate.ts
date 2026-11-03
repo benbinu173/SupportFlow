@@ -1,6 +1,7 @@
 import type { QueryClient } from '@tanstack/react-query'
 
 import { notificationKeys } from '@/features/notifications/keys'
+import { analyticsKeys } from '@/features/analytics/keys'
 import { ticketKeys } from '@/features/tickets/keys'
 
 import type { RealtimeEnvelope, RealtimeEventType } from './protocol'
@@ -25,6 +26,12 @@ export const REALTIME_INVALIDATIONS: Record<RealtimeEventType, readonly ('ticket
 
 export function invalidateForEnvelope(queryClient: QueryClient, envelope: RealtimeEnvelope): void {
   const targets = REALTIME_INVALIDATIONS[envelope.type]
+
+  // Ticket changes alter the aggregates shown on both the dashboard and the
+  // analytics workspace. Keep those views current across browser sessions.
+  if (envelope.type.startsWith('ticket.')) {
+    void queryClient.invalidateQueries({ queryKey: analyticsKeys.all })
+  }
 
   for (const target of targets) {
     if (target === 'ticket-list') {

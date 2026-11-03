@@ -59,7 +59,7 @@ const STAFF_SECTIONS: NavSection[] = [
         to: '/analytics',
         label: 'Analytics',
         icon: icon(<ChartLine />),
-        permission: PERMISSIONS.ANALYTICS_ORG,
+        permission: PERMISSIONS.ANALYTICS_OWN,
       },
       { to: '/sla', label: 'SLA', icon: icon(<Timer />), permission: PERMISSIONS.SLA_VIEW },
     ],

@@ -13,6 +13,7 @@ import { CustomersPage } from '@/features/customers/CustomersPage'
 import { CustomerDetailPage } from '@/features/customers/CustomerDetailPage'
 import { TeamPage } from '@/features/team/TeamPage'
 import { NotificationsPage } from '@/features/notifications/NotificationsPage'
+import { AnalyticsPage } from '@/features/analytics/AnalyticsPage'
 import { LoginPage } from '@/pages/auth/LoginPage'
 import { RegisterPage } from '@/pages/auth/RegisterPage'
 import { KitPage } from '@/pages/dev/KitPage'
@@ -88,6 +89,10 @@ export const router = createBrowserRouter([
             element: <RequireStaffRole />,
             children: [
               { path: '/dashboard', element: <HomePage /> },
+              {
+                element: <RequirePermission permission={PERMISSIONS.ANALYTICS_OWN} />,
+                children: [{ path: '/analytics', element: <AnalyticsPage /> }],
+              },
               {
                 element: <RequirePermission permission={PERMISSIONS.TICKET_LIST} />,
                 children: [{ path: '/tickets', element: <TicketQueuePage /> }],
