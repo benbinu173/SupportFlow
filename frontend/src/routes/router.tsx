@@ -17,6 +17,7 @@ import { AnalyticsPage } from '@/features/analytics/AnalyticsPage'
 import { SlaPage } from '@/features/sla/SlaPage'
 import { KnowledgePage } from '@/features/knowledge/KnowledgePage'
 import { AuditPage } from '@/features/audit/AuditPage'
+import { PreferencesPage } from '@/features/profile/PreferencesPage'
 import { LoginPage } from '@/pages/auth/LoginPage'
 import { RegisterPage } from '@/pages/auth/RegisterPage'
 import { KitPage } from '@/pages/dev/KitPage'
@@ -141,6 +142,10 @@ export const router = createBrowserRouter([
                 children: [{ path: '/portal/new', element: <NewRequestPage /> }],
               },
             ],
+          },
+          {
+            element: <RequirePermission permission={PERMISSIONS.PROFILE_VIEW} />,
+            children: [{ path: '/preferences', element: <PreferencesPage /> }],
           },
           {
             element: <RequirePermission permission={PERMISSIONS.NOTIFICATION_LIST} />,

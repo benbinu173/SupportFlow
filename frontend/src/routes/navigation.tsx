@@ -88,10 +88,10 @@ const STAFF_SECTIONS: NavSection[] = [
         permission: PERMISSIONS.AUDIT_VIEW,
       },
       {
-        to: '/settings',
-        label: 'Settings',
+        to: '/preferences',
+        label: 'Preferences',
         icon: icon(<GearSix />),
-        permission: PERMISSIONS.ORG_VIEW,
+        permission: PERMISSIONS.PROFILE_VIEW,
       },
     ],
   },
@@ -104,6 +104,10 @@ const PORTAL_SECTIONS: NavSection[] = [
       { to: '/portal', label: 'My requests', icon: icon(<Ticket />), end: true },
       { to: '/portal/new', label: 'New request', icon: icon(<Plus />) },
     ],
+  },
+  {
+    id: 'account',
+    items: [{ to: '/preferences', label: 'Preferences', icon: icon(<GearSix />) }],
   },
 ]
 
