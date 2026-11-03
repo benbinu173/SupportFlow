@@ -28,6 +28,7 @@ import { Skeleton } from '@/components/ui/Skeleton'
 import { Textarea } from '@/components/ui/Textarea'
 import { can, PERMISSIONS } from '@/features/auth/permissions'
 import { knowledgeKeys } from '@/features/knowledge/keys'
+import { auditHistoryUrl } from '@/features/audit/keys'
 import { AppShell } from '@/layouts/AppShell'
 import { logout } from '@/services/api/auth'
 import { apiClient } from '@/services/api/client'
@@ -140,6 +141,7 @@ export function KnowledgePage() {
   const queryClient = useQueryClient()
   const canUpload = can(user?.role, PERMISSIONS.KB_UPLOAD)
   const canDelete = can(user?.role, PERMISSIONS.KB_DELETE)
+  const canViewAudit = can(user?.role, PERMISSIONS.AUDIT_VIEW)
   const canAsk = can(user?.role, PERMISSIONS.AI_QUERY_KNOWLEDGE)
   const [searchInput, setSearchInput] = useState('')
   const [searchTerm, setSearchTerm] = useState('')
@@ -265,6 +267,7 @@ export function KnowledgePage() {
                         {document.status === 'failed' && document.error_message && <p className="mt-2 flex items-start gap-1.5 text-xs text-danger-text"><WarningCircle aria-hidden="true" className="mt-0.5 size-3.5 shrink-0" /><span>{document.error_message}</span></p>}
                         {document.status === 'completed' && document.is_published && <p className="mt-2 flex items-center gap-1.5 text-[0.6875rem] text-success-text"><CheckCircle aria-hidden="true" className="size-3.5" />Included in grounded answers</p>}
                       </div>
+                      {canViewAudit && <Link to={auditHistoryUrl('knowledge_document', document.id)} className="shrink-0 rounded-md px-2 py-1 text-xs font-medium text-ink-subtle hover:bg-surface-sunken hover:text-brand-text">History</Link>}
                       {canDelete && <Button variant="ghost" size="sm" aria-label={`Delete ${document.title}`} onClick={() => setDeleteTarget(document)} className="shrink-0 text-ink-subtle hover:text-danger-text"><Trash aria-hidden="true" className="size-4" /></Button>}
                     </div>
                   </article>

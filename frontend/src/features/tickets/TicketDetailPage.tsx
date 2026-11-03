@@ -25,6 +25,7 @@ import { customerKeys } from '@/features/customers/keys'
 import { can, isPortalRole, PERMISSIONS } from '@/features/auth/permissions'
 import { teamKeys } from '@/features/team/keys'
 import { ticketKeys } from '@/features/tickets/keys'
+import { auditHistoryUrl } from '@/features/audit/keys'
 import {
   TICKET_PRIORITY_VARIANTS,
   TICKET_STATUS_LABELS,
@@ -351,6 +352,7 @@ export function TicketDetailPage() {
   const canAnalyze = can(role, PERMISSIONS.AI_REQUEST_ANALYSIS)
   const canSuggest = can(role, PERMISSIONS.AI_REQUEST_SUGGESTION) && can(role, PERMISSIONS.MESSAGE_POST_REPLY)
   const canUpload = can(role, PERMISSIONS.ATTACHMENT_UPLOAD)
+  const canViewAudit = can(role, PERMISSIONS.AUDIT_VIEW)
 
   const customerQuery = useQuery({
     queryKey: customerKeys.detail(ticket?.customer_id ?? ''),
@@ -535,6 +537,7 @@ export function TicketDetailPage() {
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
+              {canViewAudit && <Link to={auditHistoryUrl('ticket', ticket.id)} className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-border-subtle bg-surface px-3 text-xs font-medium text-ink-muted transition-colors hover:bg-surface-sunken hover:text-ink">Audit history <ArrowRight aria-hidden="true" className="size-3.5" /></Link>}
               {can(role, PERMISSIONS.TICKET_CHANGE_PRIORITY) && (
                 <label className="sr-only" htmlFor="ticket-detail-priority">Change priority</label>
               )}

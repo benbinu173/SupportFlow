@@ -12,6 +12,7 @@ import { Input } from '@/components/ui/Input'
 import { Skeleton } from '@/components/ui/Skeleton'
 import { analyticsKeys } from '@/features/analytics/keys'
 import { can, PERMISSIONS } from '@/features/auth/permissions'
+import { auditHistoryUrl } from '@/features/audit/keys'
 import { slaKeys } from '@/features/sla/keys'
 import { ticketKeys } from '@/features/tickets/keys'
 import { TICKET_STATUS_LABELS } from '@/features/tickets/presentation'
@@ -119,6 +120,7 @@ export function SlaPage() {
   const user = useSessionStore((state) => state.user)
   const queryClient = useQueryClient()
   const canConfigure = can(user?.role, PERMISSIONS.SLA_CONFIGURE)
+  const canViewAudit = can(user?.role, PERMISSIONS.AUDIT_VIEW)
   const [selectedPolicy, setSelectedPolicy] = useState<Policy | null>(null)
   const [draft, setDraft] = useState<Draft | null>(null)
   const [formError, setFormError] = useState<string>()
@@ -218,7 +220,7 @@ export function SlaPage() {
                       <div className="p-4">
                         <div className="flex items-center justify-between gap-2"><Badge variant={style.variant} dot>{style.label}</Badge><Badge variant={policy.is_active ? 'success' : 'neutral'}>{policy.is_active ? 'Active' : 'Paused'}</Badge></div>
                         <dl className="mt-5 space-y-3"><div className="flex justify-between gap-2"><dt className="text-xs text-ink-muted">First response</dt><dd className="text-xs font-semibold tabular-nums text-ink">{target(policy.response_time_minutes)}</dd></div><div className="flex justify-between gap-2"><dt className="text-xs text-ink-muted">Resolution</dt><dd className="text-xs font-semibold tabular-nums text-ink">{target(policy.resolution_time_minutes)}</dd></div><div className="flex justify-between gap-2"><dt className="text-xs text-ink-muted">Warning at</dt><dd className="text-xs font-semibold tabular-nums text-ink">{policy.warning_threshold_percent}%</dd></div></dl>
-                        {canConfigure && <Button variant="secondary" size="sm" className="mt-5 w-full" onClick={() => openEditor(policy)}>Edit policy</Button>}
+                        <div className="mt-5 flex items-center gap-2">{canConfigure && <Button variant="secondary" size="sm" className="min-w-0 flex-1" onClick={() => openEditor(policy)}>Edit policy</Button>}{canViewAudit && <Link to={auditHistoryUrl('sla_policy', policy.id)} className="rounded-lg px-3 py-2 text-xs font-medium text-ink-subtle hover:bg-surface-sunken hover:text-brand-text">History</Link>}</div>
                       </div>
                     </Card>
                   })}

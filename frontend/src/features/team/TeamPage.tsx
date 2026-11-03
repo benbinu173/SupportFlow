@@ -1,6 +1,7 @@
 import { Check, Copy, UserPlus, UsersThree } from '@phosphor-icons/react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useState, type FormEvent } from 'react'
+import { Link } from 'react-router-dom'
 
 import { Avatar } from '@/components/ui/Avatar'
 import { Badge } from '@/components/ui/Badge'
@@ -14,6 +15,7 @@ import { Input } from '@/components/ui/Input'
 import { Select } from '@/components/ui/Select'
 import { Skeleton } from '@/components/ui/Skeleton'
 import { can, PERMISSIONS } from '@/features/auth/permissions'
+import { auditHistoryUrl } from '@/features/audit/keys'
 import { customerKeys } from '@/features/customers/keys'
 import { teamKeys } from '@/features/team/keys'
 import { AppShell } from '@/layouts/AppShell'
@@ -110,6 +112,7 @@ function MemberRow({
   currentUserId,
   canChangeRole,
   canDeactivate,
+  canViewAudit,
   saving,
   onChangeRole,
   onDeactivate,
@@ -118,6 +121,7 @@ function MemberRow({
   currentUserId: string
   canChangeRole: boolean
   canDeactivate: boolean
+  canViewAudit: boolean
   saving: boolean
   onChangeRole: (role: UserRole) => void
   onDeactivate: () => void
@@ -149,6 +153,7 @@ function MemberRow({
       </div>
       <div className="flex items-center justify-between gap-3 pl-11 sm:justify-end sm:pl-0">
         <Badge variant={member.is_active ? 'success' : 'neutral'} size="sm" dot>{member.is_active ? 'Active' : 'Inactive'}</Badge>
+        {canViewAudit && <Link to={auditHistoryUrl('user', member.id)} className="rounded-md px-2 py-1 text-xs font-medium text-ink-subtle hover:bg-surface-sunken hover:text-brand-text">History</Link>}
         {canDeactivate && member.is_active && member.id !== currentUserId && (
           <Button variant="ghost" size="sm" className="text-danger-text hover:text-danger-text" disabled={saving} onClick={onDeactivate}>Deactivate</Button>
         )}
@@ -168,6 +173,7 @@ export function TeamPage() {
   const canCreate = can(user?.role, PERMISSIONS.USER_CREATE)
   const canChangeRole = can(user?.role, PERMISSIONS.USER_UPDATE_ROLE)
   const canDeactivate = can(user?.role, PERMISSIONS.USER_DEACTIVATE)
+  const canViewAudit = can(user?.role, PERMISSIONS.AUDIT_VIEW)
 
   const membersQuery = useQuery({
     queryKey: teamKeys.list({ limit: PAGE_SIZE, offset }),
@@ -257,6 +263,7 @@ export function TeamPage() {
                   currentUserId={user.id}
                   canChangeRole={canChangeRole}
                   canDeactivate={canDeactivate}
+                  canViewAudit={canViewAudit}
                   saving={roleMutation.isPending || deactivateMutation.isPending}
                   onChangeRole={(role) => roleMutation.mutate({ id: member.id, role })}
                   onDeactivate={() => setDeactivating(member)}
