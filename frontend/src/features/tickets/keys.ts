@@ -24,4 +24,6 @@ export const ticketKeys = {
   detail: (ticketId: string) => [...ticketKeys.details(), ticketId] as const,
   events: (ticketId: string) => [...ticketKeys.detail(ticketId), 'events'] as const,
   messages: (ticketId: string) => [...ticketKeys.detail(ticketId), 'messages'] as const,
+  attachments: (ticketId: string) => [...ticketKeys.detail(ticketId), 'attachments'] as const,
+  aiAnalyses: (ticketId: string) => [...ticketKeys.detail(ticketId), 'ai-analyses'] as const,
 }

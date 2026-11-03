@@ -6,6 +6,7 @@ import { HealthPage } from '@/pages/HealthPage'
 import { HomePage } from '@/pages/HomePage'
 import { NotFoundPage } from '@/pages/NotFoundPage'
 import { TicketQueuePage } from '@/pages/tickets/TicketQueuePage'
+import { TicketDetailPage } from '@/features/tickets/TicketDetailPage'
 import { LoginPage } from '@/pages/auth/LoginPage'
 import { RegisterPage } from '@/pages/auth/RegisterPage'
 import { KitPage } from '@/pages/dev/KitPage'
@@ -81,6 +82,10 @@ export const router = createBrowserRouter([
           {
             element: <RequirePermission permission={PERMISSIONS.TICKET_LIST} />,
             children: [{ path: '/tickets', element: <TicketQueuePage /> }],
+          },
+          {
+            element: <RequirePermission permission={PERMISSIONS.TICKET_VIEW} />,
+            children: [{ path: '/tickets/:ticketId', element: <TicketDetailPage /> }],
           },
           { path: '/portal', element: <HomePage /> },
         ],

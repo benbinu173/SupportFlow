@@ -9,6 +9,7 @@ import {
 import { useQuery } from '@tanstack/react-query'
 import { useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
+import { Link } from 'react-router-dom'
 
 import { AppShell } from '@/layouts/AppShell'
 import { logout } from '@/services/api/auth'
@@ -21,6 +22,12 @@ import { EmptyState, ErrorState } from '@/components/ui/States'
 import { Input } from '@/components/ui/Input'
 import { Select } from '@/components/ui/Select'
 import { ticketKeys, type TicketListFilters } from '@/features/tickets/keys'
+import {
+  TICKET_PRIORITY_VARIANTS,
+  TICKET_STATUS_LABELS,
+  TICKET_STATUS_VARIANTS,
+  ticketPriorityLabel,
+} from '@/features/tickets/presentation'
 import type { components } from '@/types/api'
 import { cn } from '@/utils/cn'
 
@@ -32,39 +39,10 @@ type SortOrder = components['schemas']['SortOrder']
 
 const PAGE_SIZE = 50
 
-const STATUSES: Array<{ value: TicketStatus; label: string }> = [
-  { value: 'open', label: 'Open' },
-  { value: 'assigned', label: 'Assigned' },
-  { value: 'in_progress', label: 'In progress' },
-  { value: 'waiting_for_customer', label: 'Waiting for customer' },
-  { value: 'resolved', label: 'Resolved' },
-  { value: 'closed', label: 'Closed' },
-]
-
-const STATUS_LABELS: Record<TicketStatus, string> = {
-  open: 'Open',
-  assigned: 'Assigned',
-  in_progress: 'In progress',
-  waiting_for_customer: 'Waiting for customer',
-  resolved: 'Resolved',
-  closed: 'Closed',
-}
-
-const STATUS_VARIANTS: Record<TicketStatus, 'brand' | 'info' | 'warning' | 'neutral' | 'success'> = {
-  open: 'brand',
-  assigned: 'info',
-  in_progress: 'warning',
-  waiting_for_customer: 'neutral',
-  resolved: 'success',
-  closed: 'neutral',
-}
-
-const PRIORITY_VARIANTS: Record<TicketPriority, 'neutral' | 'info' | 'warning' | 'danger'> = {
-  low: 'neutral',
-  medium: 'info',
-  high: 'warning',
-  urgent: 'danger',
-}
+const STATUSES = Object.entries(TICKET_STATUS_LABELS).map(([value, label]) => ({
+  value: value as TicketStatus,
+  label,
+}))
 
 function localStartOfDay(value: string): string | undefined {
   if (!value) return undefined
@@ -125,19 +103,19 @@ function TicketRow({ ticket }: { ticket: Ticket }) {
     <tr className="border-t border-border-subtle">
       <td className="py-3.5 pr-5 pl-5 align-middle">
         <div className="flex min-w-0 flex-col gap-1">
-          <span className="text-xs font-medium tracking-wide text-ink-subtle">#{ticket.number}</span>
-          <span className="line-clamp-1 max-w-[34rem] text-sm font-semibold text-ink">{ticket.subject}</span>
+          <Link to={`/tickets/${ticket.id}`} className="text-xs font-medium tracking-wide text-ink-subtle hover:text-brand">#{ticket.number}</Link>
+          <Link to={`/tickets/${ticket.id}`} className="line-clamp-1 max-w-[34rem] text-sm font-semibold text-ink hover:text-brand">{ticket.subject}</Link>
           <span className="line-clamp-1 max-w-[34rem] text-xs text-ink-muted">
             {ticket.category ? `${ticket.category}${ticket.subcategory ? ` · ${ticket.subcategory}` : ''}` : 'No category'}
           </span>
         </div>
       </td>
       <td className="py-3.5 pr-5 align-middle">
-        <Badge variant={STATUS_VARIANTS[ticket.status]} size="sm">{STATUS_LABELS[ticket.status]}</Badge>
+        <Badge variant={TICKET_STATUS_VARIANTS[ticket.status]} size="sm">{TICKET_STATUS_LABELS[ticket.status]}</Badge>
       </td>
       <td className="py-3.5 pr-5 align-middle">
-        <Badge variant={PRIORITY_VARIANTS[ticket.priority]} size="sm" dot>
-          {ticket.priority[0].toUpperCase() + ticket.priority.slice(1)}
+        <Badge variant={TICKET_PRIORITY_VARIANTS[ticket.priority]} size="sm" dot>
+          {ticketPriorityLabel(ticket.priority)}
         </Badge>
       </td>
       <td className="py-3.5 pr-5 align-middle"><SlaPosition ticket={ticket} /></td>

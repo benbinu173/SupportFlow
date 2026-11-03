@@ -9,7 +9,7 @@ import type { RealtimeEnvelope, RealtimeEventType } from './protocol'
  * Client counterpart to backend/app/websocket/events.py::REALTIME_FOR_EVENT.
  * Keep each event's effects explicit; consumers and this map share key factories.
  */
-export const REALTIME_INVALIDATIONS: Record<RealtimeEventType, readonly ('ticket-list' | 'ticket-detail' | 'ticket-events' | 'ticket-messages' | 'notifications')[]> = {
+export const REALTIME_INVALIDATIONS: Record<RealtimeEventType, readonly ('ticket-list' | 'ticket-detail' | 'ticket-events' | 'ticket-messages' | 'ticket-attachments' | 'ticket-ai' | 'notifications')[]> = {
   'ticket.created': ['ticket-list'],
   'ticket.assigned': ['ticket-list', 'ticket-detail', 'ticket-events'],
   'ticket.unassigned': ['ticket-list', 'ticket-detail', 'ticket-events'],
@@ -17,9 +17,9 @@ export const REALTIME_INVALIDATIONS: Record<RealtimeEventType, readonly ('ticket
   'ticket.priority_changed': ['ticket-list', 'ticket-detail', 'ticket-events'],
   'ticket.message_added': ['ticket-list', 'ticket-detail', 'ticket-events', 'ticket-messages'],
   'ticket.note_added': ['ticket-list', 'ticket-detail', 'ticket-events', 'ticket-messages'],
-  'ticket.attachment_added': ['ticket-list', 'ticket-detail', 'ticket-events', 'ticket-messages'],
+  'ticket.attachment_added': ['ticket-list', 'ticket-detail', 'ticket-events', 'ticket-messages', 'ticket-attachments'],
   'ticket.reopened': ['ticket-list', 'ticket-detail', 'ticket-events'],
-  'ticket.ai_analysis_completed': ['ticket-list', 'ticket-detail', 'ticket-events'],
+  'ticket.ai_analysis_completed': ['ticket-list', 'ticket-detail', 'ticket-events', 'ticket-messages', 'ticket-ai'],
   'notification.created': ['notifications'],
 }
 
@@ -38,6 +38,10 @@ export function invalidateForEnvelope(queryClient: QueryClient, envelope: Realti
         void queryClient.invalidateQueries({ queryKey: ticketKeys.events(envelope.ticket_id) })
       } else if (target === 'ticket-messages') {
         void queryClient.invalidateQueries({ queryKey: ticketKeys.messages(envelope.ticket_id) })
+      } else if (target === 'ticket-attachments') {
+        void queryClient.invalidateQueries({ queryKey: ticketKeys.attachments(envelope.ticket_id) })
+      } else if (target === 'ticket-ai') {
+        void queryClient.invalidateQueries({ queryKey: ticketKeys.aiAnalyses(envelope.ticket_id) })
       }
     }
   }
