@@ -7,12 +7,14 @@ import { HomePage } from '@/pages/HomePage'
 import { NotFoundPage } from '@/pages/NotFoundPage'
 import { TicketQueuePage } from '@/pages/tickets/TicketQueuePage'
 import { TicketDetailPage } from '@/features/tickets/TicketDetailPage'
+import { PortalRequestsPage } from '@/pages/portal/PortalRequestsPage'
+import { NewRequestPage } from '@/pages/portal/NewRequestPage'
 import { LoginPage } from '@/pages/auth/LoginPage'
 import { RegisterPage } from '@/pages/auth/RegisterPage'
 import { KitPage } from '@/pages/dev/KitPage'
 import { LandingPage } from '@/pages/marketing/LandingPage'
 import { RouteError } from '@/routes/RouteError'
-import { RedirectIfAuthenticated, RequireAuth, RequirePermission } from '@/routes/guards'
+import { RedirectIfAuthenticated, RequireAuth, RequirePermission, RequirePortalRole, RequireStaffRole } from '@/routes/guards'
 import { HOME_BY_ROLE } from '@/routes/navigation'
 import { PERMISSIONS, type UserRole } from '@/features/auth/permissions'
 
@@ -80,14 +82,31 @@ export const router = createBrowserRouter([
         children: [
           { path: '/dashboard', element: <HomePage /> },
           {
-            element: <RequirePermission permission={PERMISSIONS.TICKET_LIST} />,
-            children: [{ path: '/tickets', element: <TicketQueuePage /> }],
+            element: <RequireStaffRole />,
+            children: [
+              {
+                element: <RequirePermission permission={PERMISSIONS.TICKET_LIST} />,
+                children: [{ path: '/tickets', element: <TicketQueuePage /> }],
+              },
+            ],
           },
           {
             element: <RequirePermission permission={PERMISSIONS.TICKET_VIEW} />,
             children: [{ path: '/tickets/:ticketId', element: <TicketDetailPage /> }],
           },
-          { path: '/portal', element: <HomePage /> },
+          {
+            element: <RequirePortalRole />,
+            children: [
+              {
+                element: <RequirePermission permission={PERMISSIONS.TICKET_LIST} />,
+                children: [{ path: '/portal', element: <PortalRequestsPage /> }],
+              },
+              {
+                element: <RequirePermission permission={PERMISSIONS.TICKET_CREATE} />,
+                children: [{ path: '/portal/new', element: <NewRequestPage /> }],
+              },
+            ],
+          },
         ],
       },
 

@@ -3,6 +3,7 @@ import { Navigate, Outlet, useLocation } from 'react-router-dom'
 import { ErrorState } from '@/components/ui/States'
 import { Spinner } from '@/components/ui/Spinner'
 import { can, type Permission, type UserRole } from '@/features/auth/permissions'
+import { HOME_BY_ROLE } from '@/routes/navigation'
 import { useSessionStore } from '@/store/auth'
 
 /**
@@ -76,6 +77,22 @@ export function RequirePermission({ permission }: { permission: Permission }) {
     )
   }
 
+  return <Outlet />
+}
+
+/** Keep customer portal URLs role-specific while the API independently enforces row scope. */
+export function RequirePortalRole() {
+  const role = useSessionStore((state) => state.user?.role)
+
+  if (role === 'customer') return <Outlet />
+  return <Navigate to={role ? HOME_BY_ROLE[role] : '/login'} replace />
+}
+
+/** Staff queue is a separate workspace; customer accounts use /portal. */
+export function RequireStaffRole() {
+  const role = useSessionStore((state) => state.user?.role)
+
+  if (role === 'customer') return <Navigate to="/portal" replace />
   return <Outlet />
 }
 

@@ -17,7 +17,7 @@ import { useSessionStore } from '@/store/auth'
  * entitled to. A page claiming to be a dashboard while showing nothing would be
  * exactly the fabrication §60 rules out, so this one states its purpose instead.
  *
- * It is replaced screen by screen: `/dashboard` by F7, `/portal` by F9.
+ * The customer portal moved to F6. The staff dashboard replaces this checkpoint in F7.
  */
 export function HomePage() {
   const user = useSessionStore((state) => state.user)
