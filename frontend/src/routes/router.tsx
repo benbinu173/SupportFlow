@@ -16,6 +16,7 @@ import { NotificationsPage } from '@/features/notifications/NotificationsPage'
 import { AnalyticsPage } from '@/features/analytics/AnalyticsPage'
 import { SlaPage } from '@/features/sla/SlaPage'
 import { KnowledgePage } from '@/features/knowledge/KnowledgePage'
+import { AuditPage } from '@/features/audit/AuditPage'
 import { LoginPage } from '@/pages/auth/LoginPage'
 import { RegisterPage } from '@/pages/auth/RegisterPage'
 import { KitPage } from '@/pages/dev/KitPage'
@@ -102,6 +103,10 @@ export const router = createBrowserRouter([
               {
                 element: <RequirePermission permission={PERMISSIONS.KB_LIST} />,
                 children: [{ path: '/knowledge', element: <KnowledgePage /> }],
+              },
+              {
+                element: <RequirePermission permission={PERMISSIONS.AUDIT_VIEW} />,
+                children: [{ path: '/audit', element: <AuditPage /> }],
               },
               {
                 element: <RequirePermission permission={PERMISSIONS.TICKET_LIST} />,
