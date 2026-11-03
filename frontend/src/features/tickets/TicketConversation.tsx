@@ -17,8 +17,8 @@ type Customer = components['schemas']['CustomerRead']
 
 interface TicketConversationProps {
   ticket: Ticket
-  customer?: Customer
-  messages?: Message[]
+  customer?: Customer | undefined
+  messages?: Message[] | undefined
   messagesLoading: boolean
   messagesError: unknown
   onRetryMessages: () => void
@@ -55,7 +55,7 @@ function MessageItem({
   onAcceptDraft,
 }: {
   message: Message
-  customer?: Customer
+  customer?: Customer | undefined
   currentUserId: string
   canAcceptDraft: boolean
   onAcceptDraft: (draft: Message, body: string) => Promise<void>

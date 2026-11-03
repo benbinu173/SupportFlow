@@ -82,7 +82,7 @@ export function TicketActivity({
   currentUserId,
   onRetry,
 }: {
-  events?: TicketEvent[]
+  events?: TicketEvent[] | undefined
   loading: boolean
   error: unknown
   currentUserId: string

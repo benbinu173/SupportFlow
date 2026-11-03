@@ -154,7 +154,7 @@ export function CustomersPage() {
       </div>
 
       <Dialog open={createOpen} onClose={() => setCreateOpen(false)} title="Add a customer" description="Create a support contact in your organization.">
-        {createMutation.error && <p role="alert" className="mb-4 text-sm text-danger-text">{toApiError(createMutation.error).message}</p>}
+        {createMutation.error != null && <p role="alert" className="mb-4 text-sm text-danger-text">{toApiError(createMutation.error).message}</p>}
         {createOpen && <CustomerForm key="new-customer" saving={createMutation.isPending} onSubmit={(values) => createMutation.mutate(values)} onCancel={() => setCreateOpen(false)} />}
       </Dialog>
     </AppShell>

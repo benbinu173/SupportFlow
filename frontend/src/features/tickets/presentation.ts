@@ -30,6 +30,7 @@ export const TICKET_PRIORITY_VARIANTS: Record<TicketPriority, BadgeVariant> = {
 }
 
 export function ticketPriorityLabel(priority: TicketPriority): string {
-  return priority[0].toUpperCase() + priority.slice(1)
+  const first = priority.charAt(0)
+  return first ? first.toUpperCase() + priority.slice(1) : ''
 }
 

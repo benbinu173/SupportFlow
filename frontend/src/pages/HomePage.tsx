@@ -41,7 +41,7 @@ function Metric({ label, value, note, variant = 'neutral' }: { label: string; va
   )
 }
 
-function DashboardMetrics({ overview, sla }: { overview: AnalyticsOverview; sla?: AnalyticsSLA }) {
+function DashboardMetrics({ overview, sla }: { overview: AnalyticsOverview; sla?: AnalyticsSLA | undefined }) {
   const statuses = overview.totals.by_status
   const active = (statuses.open ?? 0) + (statuses.assigned ?? 0) + (statuses.in_progress ?? 0) + (statuses.waiting_for_customer ?? 0)
   return (

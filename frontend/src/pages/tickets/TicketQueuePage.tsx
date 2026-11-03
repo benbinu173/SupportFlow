@@ -178,14 +178,16 @@ export function TicketQueuePage() {
 
   const filters = useMemo<TicketListFilters>(() => {
     const [sort, order] = sortValue.split(':') as [TicketSortKey, SortOrder]
+    const createdAfterParam = localStartOfDay(createdAfter)
+    const createdBeforeParam = localDayAfter(createdBefore)
     return {
       ...(status ? { status } : {}),
       ...(priority ? { priority } : {}),
       ...(assignment === 'mine' && user ? { assigned_agent_id: user.id } : {}),
       ...(assignment === 'unassigned' ? { unassigned: true } : {}),
       ...(searchValue.committed ? { q: searchValue.committed } : {}),
-      ...(localStartOfDay(createdAfter) ? { created_after: localStartOfDay(createdAfter) } : {}),
-      ...(localDayAfter(createdBefore) ? { created_before: localDayAfter(createdBefore) } : {}),
+      ...(createdAfterParam ? { created_after: createdAfterParam } : {}),
+      ...(createdBeforeParam ? { created_before: createdBeforeParam } : {}),
       sort,
       order,
       limit: PAGE_SIZE,

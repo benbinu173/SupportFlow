@@ -120,7 +120,7 @@ function TicketSlaPanel({ ticket }: { ticket: Ticket }) {
       <div className="flex items-start justify-between gap-3 border-b border-border-subtle px-4 py-3.5">
         <div>
           <h2 className="text-sm font-semibold text-ink">Service targets</h2>
-          <p className="mt-0.5 text-[0.6875rem] text-ink-muted">{ticket.sla.policy.name}</p>
+          <p className="mt-0.5 text-[0.6875rem] text-ink-muted">{ticketPriorityLabel(ticket.sla.policy.priority)} priority policy</p>
         </div>
         <Clock aria-hidden="true" className="mt-0.5 size-4 text-ink-subtle" />
       </div>
@@ -168,7 +168,7 @@ function TicketSlaPanel({ ticket }: { ticket: Ticket }) {
   )
 }
 
-function CustomerPanel({ customer, loading }: { customer?: Customer; loading: boolean }) {
+function CustomerPanel({ customer, loading }: { customer?: Customer | undefined; loading: boolean }) {
   return (
     <Card variant="bezel" className="overflow-hidden">
       <div className="border-b border-border-subtle px-4 py-3.5">
@@ -221,7 +221,7 @@ function AttachmentsPanel({
   uploading,
   onUpload,
 }: {
-  attachments?: Attachment[]
+  attachments?: Attachment[] | undefined
   loading: boolean
   error: unknown
   onRetry: () => void
@@ -603,11 +603,11 @@ export function TicketDetailPage() {
                 onRetryMessages={() => { void messagesQuery.refetch() }}
                 currentUserId={user.id}
                 canAcceptDraft={canSuggest && can(role, PERMISSIONS.MESSAGE_POST_REPLY) && ticket.status !== 'closed'}
-                onAcceptDraft={(draft, body) => acceptDraftMutation.mutateAsync({ draft, body })}
+                onAcceptDraft={async (draft, body) => { await acceptDraftMutation.mutateAsync({ draft, body }) }}
                 canReply={can(role, PERMISSIONS.MESSAGE_POST_REPLY)}
                 canPostInternal={can(role, PERMISSIONS.MESSAGE_POST_INTERNAL)}
                 sending={messageMutation.isPending}
-                onSend={(body, internal) => messageMutation.mutateAsync({ body, internal })}
+                onSend={async (body, internal) => { await messageMutation.mutateAsync({ body, internal }) }}
               />
 
               {canAssign && (
@@ -687,7 +687,7 @@ export function TicketDetailPage() {
                 onDownload={(attachment) => { void downloadAttachment(attachment) }}
                 canUpload={canUpload}
                 uploading={uploadMutation.isPending}
-                onUpload={(file) => uploadMutation.mutateAsync(file).then(() => undefined)}
+                onUpload={async (file) => { await uploadMutation.mutateAsync(file) }}
               />
               <TicketActivity
                 events={eventsQuery.data}

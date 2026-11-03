@@ -280,7 +280,7 @@ export function TeamPage() {
       </div>
 
       <Dialog open={createOpen} onClose={() => setCreateOpen(false)} title="Create an account" description="Add a staff member or link a customer to the portal.">
-        {createMutation.error && <p role="alert" className="mb-4 text-sm text-danger-text">{toApiError(createMutation.error).message}</p>}
+        {createMutation.error != null && <p role="alert" className="mb-4 text-sm text-danger-text">{toApiError(createMutation.error).message}</p>}
         {createOpen && <NewMemberForm customers={customersQuery.data ?? []} customersLoading={customersQuery.isPending} saving={createMutation.isPending} onSubmit={(payload) => createMutation.mutate(payload)} onCancel={() => setCreateOpen(false)} />}
       </Dialog>
 

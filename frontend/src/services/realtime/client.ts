@@ -23,6 +23,9 @@ export function realtimeUrl(apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? ''
 
 /** Owns one authenticated connection and its reconnect timers. */
 export class RealtimeClient {
+  private readonly queryClient: QueryClient
+  private readonly onStatus: StatusListener
+  private readonly url: string
   private socket: WebSocket | null = null
   private retryTimer: ReturnType<typeof setTimeout> | null = null
   private stopped = true
@@ -31,11 +34,11 @@ export class RealtimeClient {
   private hasConnected = false
   private status: RealtimeStatus = 'inactive'
 
-  constructor(
-    private readonly queryClient: QueryClient,
-    private readonly onStatus: StatusListener,
-    private readonly url = realtimeUrl(),
-  ) {}
+  constructor(queryClient: QueryClient, onStatus: StatusListener, url = realtimeUrl()) {
+    this.queryClient = queryClient
+    this.onStatus = onStatus
+    this.url = url
+  }
 
   start(): void {
     if (!this.stopped) return

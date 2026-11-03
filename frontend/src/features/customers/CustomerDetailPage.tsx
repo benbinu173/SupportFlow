@@ -148,7 +148,7 @@ export function CustomerDetailPage() {
 
       {customer && (
         <Dialog open={editOpen} onClose={() => setEditOpen(false)} title="Edit customer details" description="Update this customer’s contact information.">
-          {updateMutation.error && <p role="alert" className="mb-4 text-sm text-danger-text">{toApiError(updateMutation.error).message}</p>}
+          {updateMutation.error != null && <p role="alert" className="mb-4 text-sm text-danger-text">{toApiError(updateMutation.error).message}</p>}
           {editOpen && <CustomerForm key={customer.id} customer={customer} saving={updateMutation.isPending} onSubmit={(values) => updateMutation.mutate(values)} onCancel={() => setEditOpen(false)} />}
         </Dialog>
       )}

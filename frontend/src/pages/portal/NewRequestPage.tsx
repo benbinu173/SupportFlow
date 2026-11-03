@@ -107,7 +107,7 @@ export function NewRequestPage() {
                   />
                 </Field>
 
-                {createMutation.error && (
+                {createMutation.error != null && (
                   <div role="alert" className="rounded-xl border border-danger-border bg-danger-subtle px-4 py-3 text-sm text-danger-text">
                     {toApiError(createMutation.error).message}
                   </div>
