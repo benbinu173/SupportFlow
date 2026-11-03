@@ -12,6 +12,7 @@ import { NewRequestPage } from '@/pages/portal/NewRequestPage'
 import { CustomersPage } from '@/features/customers/CustomersPage'
 import { CustomerDetailPage } from '@/features/customers/CustomerDetailPage'
 import { TeamPage } from '@/features/team/TeamPage'
+import { NotificationsPage } from '@/features/notifications/NotificationsPage'
 import { LoginPage } from '@/pages/auth/LoginPage'
 import { RegisterPage } from '@/pages/auth/RegisterPage'
 import { KitPage } from '@/pages/dev/KitPage'
@@ -83,10 +84,10 @@ export const router = createBrowserRouter([
       {
         element: <RequireAuth />,
         children: [
-          { path: '/dashboard', element: <HomePage /> },
           {
             element: <RequireStaffRole />,
             children: [
+              { path: '/dashboard', element: <HomePage /> },
               {
                 element: <RequirePermission permission={PERMISSIONS.TICKET_LIST} />,
                 children: [{ path: '/tickets', element: <TicketQueuePage /> }],
@@ -120,6 +121,10 @@ export const router = createBrowserRouter([
                 children: [{ path: '/portal/new', element: <NewRequestPage /> }],
               },
             ],
+          },
+          {
+            element: <RequirePermission permission={PERMISSIONS.NOTIFICATION_LIST} />,
+            children: [{ path: '/notifications', element: <NotificationsPage /> }],
           },
         ],
       },

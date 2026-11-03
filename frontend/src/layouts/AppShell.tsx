@@ -1,11 +1,18 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { useLocation } from 'react-router-dom'
 
 import { Logo } from '@/components/layout/Logo'
 import { SidebarNav } from '@/components/layout/SidebarNav'
 import { Topbar } from '@/components/layout/Topbar'
 import { navigationFor } from '@/routes/navigation'
+import { notificationKeys } from '@/features/notifications/keys'
+import { can, PERMISSIONS } from '@/features/auth/permissions'
+import { apiClient } from '@/services/api/client'
 import type { SessionUser } from '@/types/session'
+import type { components } from '@/types/api'
+
+type NotificationUnreadCount = components['schemas']['NotificationUnreadCount']
 
 export interface AppShellProps {
   user: SessionUser
@@ -23,10 +30,17 @@ export interface AppShellProps {
  * over an always-visible page is a modal, and a modal that exists only to show
  * six links is a focus trap and a scroll lock bought for nothing.
  */
-export function AppShell({ user, onSignOut, unreadCount = 0, children }: AppShellProps) {
+export function AppShell({ user, onSignOut, unreadCount, children }: AppShellProps) {
   const [navOpen, setNavOpen] = useState(false)
   const location = useLocation()
   const sections = navigationFor(user.role)
+  const unreadQuery = useQuery({
+    queryKey: notificationKeys.unreadCount(),
+    queryFn: async () => (await apiClient.get<NotificationUnreadCount>('/notifications/unread-count')).data,
+    enabled: can(user.role, PERMISSIONS.NOTIFICATION_LIST),
+    staleTime: 30_000,
+  })
+  const currentUnreadCount = unreadCount ?? unreadQuery.data?.unread ?? 0
 
   const closeNav = useCallback(() => {
     setNavOpen(false)
@@ -83,7 +97,7 @@ export function AppShell({ user, onSignOut, unreadCount = 0, children }: AppShel
             setNavOpen((value) => !value)
           }}
           onSignOut={onSignOut}
-          unreadCount={unreadCount}
+          unreadCount={currentUnreadCount}
         />
 
         {navOpen && (
