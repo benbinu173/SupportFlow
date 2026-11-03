@@ -9,6 +9,9 @@ import { TicketQueuePage } from '@/pages/tickets/TicketQueuePage'
 import { TicketDetailPage } from '@/features/tickets/TicketDetailPage'
 import { PortalRequestsPage } from '@/pages/portal/PortalRequestsPage'
 import { NewRequestPage } from '@/pages/portal/NewRequestPage'
+import { CustomersPage } from '@/features/customers/CustomersPage'
+import { CustomerDetailPage } from '@/features/customers/CustomerDetailPage'
+import { TeamPage } from '@/features/team/TeamPage'
 import { LoginPage } from '@/pages/auth/LoginPage'
 import { RegisterPage } from '@/pages/auth/RegisterPage'
 import { KitPage } from '@/pages/dev/KitPage'
@@ -87,6 +90,17 @@ export const router = createBrowserRouter([
               {
                 element: <RequirePermission permission={PERMISSIONS.TICKET_LIST} />,
                 children: [{ path: '/tickets', element: <TicketQueuePage /> }],
+              },
+              {
+                element: <RequirePermission permission={PERMISSIONS.CUSTOMER_LIST} />,
+                children: [
+                  { path: '/customers', element: <CustomersPage /> },
+                  { path: '/customers/:customerId', element: <CustomerDetailPage /> },
+                ],
+              },
+              {
+                element: <RequirePermission permission={PERMISSIONS.USER_LIST} />,
+                children: [{ path: '/users', element: <TeamPage /> }],
               },
             ],
           },
