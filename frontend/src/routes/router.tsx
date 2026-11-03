@@ -15,6 +15,7 @@ import { TeamPage } from '@/features/team/TeamPage'
 import { NotificationsPage } from '@/features/notifications/NotificationsPage'
 import { AnalyticsPage } from '@/features/analytics/AnalyticsPage'
 import { SlaPage } from '@/features/sla/SlaPage'
+import { KnowledgePage } from '@/features/knowledge/KnowledgePage'
 import { LoginPage } from '@/pages/auth/LoginPage'
 import { RegisterPage } from '@/pages/auth/RegisterPage'
 import { KitPage } from '@/pages/dev/KitPage'
@@ -97,6 +98,10 @@ export const router = createBrowserRouter([
               {
                 element: <RequirePermission permission={PERMISSIONS.SLA_VIEW} />,
                 children: [{ path: '/sla', element: <SlaPage /> }],
+              },
+              {
+                element: <RequirePermission permission={PERMISSIONS.KB_LIST} />,
+                children: [{ path: '/knowledge', element: <KnowledgePage /> }],
               },
               {
                 element: <RequirePermission permission={PERMISSIONS.TICKET_LIST} />,
