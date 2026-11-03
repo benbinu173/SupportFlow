@@ -34,6 +34,8 @@ type AnalyticsTickets = components['schemas']['AnalyticsTickets']
 type AnalyticsAgents = components['schemas']['AnalyticsAgents']
 type AnalyticsSLA = components['schemas']['AnalyticsSLA']
 type AnalyticsSentiment = components['schemas']['AnalyticsSentiment']
+type AIUsageSummary = components['schemas']['AIUsageSummary']
+type AIOperation = components['schemas']['AIOperation']
 type WindowChoice = 7 | 30 | 90
 
 const WINDOWS: WindowChoice[] = [7, 30, 90]
@@ -42,6 +44,14 @@ const PRIORITY_COLORS: Record<string, string> = {
   high: 'var(--color-warning)',
   medium: 'var(--color-brand)',
   low: 'var(--color-ink-subtle)',
+}
+const AI_OPERATION_LABELS: Record<AIOperation, string> = {
+  classify: 'Ticket classification',
+  sentiment: 'Sentiment analysis',
+  summarize: 'Conversation summaries',
+  suggest_response: 'Reply suggestions',
+  embed: 'Document indexing',
+  knowledge_answer: 'Knowledge answers',
 }
 
 function windowBounds(days: WindowChoice) {
@@ -107,6 +117,50 @@ function LoadingPanels() {
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">{Array.from({ length: 4 }, (_, i) => <Skeleton key={i} className="h-28 rounded-xl" />)}</div>
       <Skeleton className="h-80 rounded-xl" />
       <div className="grid gap-5 lg:grid-cols-2"><Skeleton className="h-72 rounded-xl" /><Skeleton className="h-72 rounded-xl" /></div>
+    </div>
+  )
+}
+
+function AIUsageDetails({ usage }: { usage: AIUsageSummary }) {
+  const operations = [...usage.by_operation].sort((a, b) => Number(b.cost_usd) - Number(a.cost_usd))
+  const maxCost = Math.max(0, ...operations.map((operation) => Number(operation.cost_usd)))
+  const maxCalls = Math.max(1, ...operations.map((operation) => operation.calls))
+  const failureRate = usage.calls ? (usage.failed_calls / usage.calls) * 100 : 0
+  const cacheRate = usage.calls ? (usage.cached_calls / usage.calls) * 100 : 0
+
+  return (
+    <div className="grid items-start gap-5 lg:grid-cols-[minmax(15rem,0.8fr)_minmax(0,1.2fr)]">
+      <Card className="overflow-hidden">
+        <PanelHeading title="AI usage" detail="Provider activity in the selected period." />
+        <div className="p-5">
+          <p className="text-xs text-ink-muted">Recorded cost</p>
+          <p className="mt-1 text-3xl font-semibold tracking-[-0.05em] tabular-nums text-ink">{formatCost(usage.cost_usd)}</p>
+          <p className="mt-1 text-xs text-ink-subtle">Includes failed calls that may have consumed provider quota.</p>
+          <div className="mt-5 grid grid-cols-2 gap-3">
+            <div className="rounded-lg bg-surface-sunken p-3"><p className="text-[0.6875rem] text-ink-muted">Prompt tokens</p><p className="mt-1 text-sm font-semibold tabular-nums text-ink">{usage.prompt_tokens.toLocaleString()}</p></div>
+            <div className="rounded-lg bg-surface-sunken p-3"><p className="text-[0.6875rem] text-ink-muted">Completion tokens</p><p className="mt-1 text-sm font-semibold tabular-nums text-ink">{usage.completion_tokens.toLocaleString()}</p></div>
+          </div>
+          <div className="mt-4 space-y-3 border-t border-border-subtle pt-4">
+            <div className="flex items-center justify-between gap-3 text-xs"><span className="text-ink-muted">Cached responses</span><span className="font-medium tabular-nums text-ink">{usage.cached_calls.toLocaleString()} <span className="font-normal text-ink-subtle">({cacheRate.toFixed(1)}%)</span></span></div>
+            <div className="flex items-center justify-between gap-3 text-xs"><span className="text-ink-muted">Failed calls</span><span className={usage.failed_calls ? 'font-medium tabular-nums text-danger-text' : 'font-medium tabular-nums text-ink'}>{usage.failed_calls.toLocaleString()} <span className="font-normal text-ink-subtle">({failureRate.toFixed(1)}%)</span></span></div>
+            <div className="flex items-center justify-between gap-3 text-xs"><span className="text-ink-muted">Total calls</span><span className="font-medium tabular-nums text-ink">{usage.calls.toLocaleString()}</span></div>
+          </div>
+        </div>
+      </Card>
+
+      <Card className="overflow-hidden">
+        <PanelHeading title="Usage by operation" detail="See which AI capabilities account for the calls and cost." />
+        {operations.length ? <div className="divide-y divide-border-subtle">
+          {operations.map((operation) => {
+            const amount = Number(operation.cost_usd)
+            const relative = maxCost > 0 ? amount / maxCost : operation.calls / maxCalls
+            return <div key={operation.operation} className="px-5 py-4">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1"><p className="min-w-0 flex-1 text-xs font-medium text-ink">{AI_OPERATION_LABELS[operation.operation]}</p><span className="text-xs tabular-nums text-ink-muted">{operation.calls.toLocaleString()} calls</span><span className="w-16 text-right text-xs font-semibold tabular-nums text-ink">{formatCost(operation.cost_usd)}</span></div>
+              <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-surface-sunken"><span className="block h-full rounded-full bg-ai transition-[width] duration-300" style={{ width: `${Math.max(relative > 0 ? 3 : 0, relative * 100)}%` }} /></div>
+            </div>
+          })}
+        </div> : <EmptyState icon={<ChartLineUp aria-hidden="true" />} title="No AI calls in this period" description="Usage details will appear when AI features are used." />}
+      </Card>
     </div>
   )
 }
@@ -199,6 +253,8 @@ export function AnalyticsPage() {
               <Metric label="First response" value={formatDuration(overview.data.response_time.average_seconds)} detail={`${overview.data.response_time.count} tickets received a reply`} icon={<Clock aria-hidden="true" className="size-4" />} tone="warning" />
               <Metric label="AI usage" value={formatCost(overview.data.ai_usage.cost_usd)} detail={`${overview.data.ai_usage.calls} calls · ${overview.data.ai_usage.failed_calls} failed`} icon={<CurrencyDollar aria-hidden="true" className="size-4" />} tone="brand" />
             </section>
+
+            <AIUsageDetails usage={overview.data.ai_usage} />
 
             <Card className="overflow-hidden">
               <PanelHeading title="Ticket volume" detail="Tickets created each day. Empty days are shown as zero." />
