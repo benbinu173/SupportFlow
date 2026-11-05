@@ -229,7 +229,7 @@ describe('route table', () => {
     renderAt('/dashboard')
 
     expect(
-      await screen.findByRole('heading', { level: 1, name: 'Signed in as Avery Chen' })
+      await screen.findByRole('heading', { level: 1, name: 'Welcome back, Avery' })
     ).toBeVisible()
   })
 
@@ -250,7 +250,19 @@ describe('route table', () => {
       '/login',
       '/register',
       '/dashboard',
+      '/analytics',
+      '/sla',
+      '/knowledge',
+      '/audit',
+      '/tickets',
+      '/customers',
+      '/customers/:customerId',
+      '/users',
+      '/tickets/:ticketId',
       '/portal',
+      '/portal/new',
+      '/preferences',
+      '/notifications',
       '/dev/kit',
       '/dev/health',
       '*',

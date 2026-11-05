@@ -1,6 +1,6 @@
 import react from '@vitejs/plugin-react'
 import { fileURLToPath } from 'node:url'
-import { defineConfig } from 'vitest/config'
+import { configDefaults, defineConfig } from 'vitest/config'
 
 // Separate from vite.config.ts: Vitest 5 no longer accepts a `test` key inside
 // the Vite config. Tailwind is omitted here since tests do not assert on styles.
@@ -12,13 +12,19 @@ export default defineConfig({
     },
   },
   test: {
+    // Playwright uses the same `.spec.ts` convention as Vitest, but its browser
+    // fixtures cannot run inside the jsdom unit-test pool.
+    exclude: [...configDefaults.exclude, 'e2e/**'],
+    // Form-flow tests exercise long accessible labels and policy feedback in
+    // jsdom; fifteen seconds leaves room for slower Windows CI workers.
+    testTimeout: 15_000,
     environment: 'jsdom',
     globals: true,
     setupFiles: ['./src/test/setup.ts'],
     // The default `forks` pool fails to hand off workers on Windows
     // ("Timeout waiting for worker to respond"); threads is reliable here.
     pool: 'threads',
-    // Pre-bundle dependencies with esbuild instead of leaving Vitest's module
+    // Pre-bundle dependencies instead of leaving Vitest's module
     // runner to resolve them file by file at run time.
     //
     // This exists for one package. `@phosphor-icons/react` is published as
@@ -35,17 +41,18 @@ export default defineConfig({
     // environment concern only; the application build is untouched.
     deps: {
       optimizer: {
-        web: {
+        // Vitest 5 uses `client` for jsdom. The old `web` key is ignored, so
+        // enabling it did not actually bundle the icon package.
+        client: {
           enabled: true,
+          include: ['@phosphor-icons/react'],
         },
       },
     },
-    // Two, and not Vitest's default of roughly one worker per core. Every
-    // worker already carries its own jsdom, and the icon bundle above is
-    // duplicated per worker too, so the handle budget rather than the CPU is
-    // what sets the ceiling. Two costs nothing — the suite runs in about twenty
-    // seconds — and it is what makes a many-core developer machine behave like
-    // a CI runner.
-    maxWorkers: 2,
+    // Run one file at a time. Every worker carries its own jsdom and the icon
+    // bundle above; parallel startup can exceed Windows' worker handshake
+    // timeout before assertions begin. Serial execution is slower but stable.
+    fileParallelism: false,
+    maxWorkers: 1,
   },
 })

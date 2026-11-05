@@ -108,7 +108,7 @@ describe('creating a workspace', () => {
     await fillAndSubmit()
 
     expect(
-      await screen.findByRole('heading', { level: 1, name: 'Signed in as Dana Whitfield' })
+      await screen.findByRole('heading', { level: 1, name: 'Welcome back, Dana' })
     ).toBeVisible()
 
     expect(memoryRouter.state.location.pathname).toBe('/dashboard')

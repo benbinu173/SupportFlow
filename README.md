@@ -36,7 +36,7 @@ count.
 | Background jobs | Celery + beat |
 | AI | Provider-agnostic interface; Claude or Groq for generation, separate embedding provider |
 | Storage | S3-compatible (MinIO locally) |
-| Testing | pytest, Vitest, Testing Library |
+| Testing | pytest, Vitest, Testing Library, Playwright |
 | Infrastructure | Docker Compose, GitHub Actions |
 
 Library choices that deviate from convention — Argon2id over bcrypt, PyJWT over
@@ -51,6 +51,7 @@ python-jose, opaque refresh tokens over JWTs — are justified in
 | [docs/architecture.md](docs/architecture.md) | Component diagram, layering, auth / tenancy / AI / RAG / real-time / job flows |
 | [docs/data-model.md](docs/data-model.md) | ERD, table reference, index strategy, schema-level business rules |
 | [docs/architecture-decisions.md](docs/architecture-decisions.md) | Every deviation from the specification, with reasoning and cost |
+| [docs/project-status.md](docs/project-status.md) | Current frontend checkpoint, verification, and recommended next step |
 
 ## Local setup
 
@@ -180,6 +181,8 @@ python scripts/phase_x_walkthrough.py
 npm test
 npm run typecheck
 npm run build
+npx playwright install chromium   # once, for browser workflow checks
+npm run test:e2e
 ```
 
 A [Makefile](Makefile) wraps the common combinations (`make test`, `make check`,
@@ -2266,10 +2269,10 @@ than an application one — and it is the one grep-shaped gap in the row above.
 - **A reopen discards the assignment**, so the ticket goes back on the queue rather than
   to whoever had it. That is a deliberate reading of `OPEN` as "nobody owns this", and
   the history is not lost: it is in `ticket_events`.
-- **The frontend has no screens for any of this.** Every phase since C has been
-  backend-only; the routes are exercised by the test suite and by a walkthrough script per phase, and
-  the SPA still shows the Phase C scaffolding. Dashboards were the one screen the specification
-  assigned to a phase and that phase (S) built the API and not the UI — §8's first success
-  criterion is that the backend is exercisable without it, which is what
-  `scripts/phase_s_walkthrough.py` demonstrates (ADR-026).
+- **Frontend browser checks use deterministic HTTP and WebSocket fixtures.** The
+  app now includes staff and customer workspaces for the user-facing backend features.
+  [Browser workflow checks](frontend/README.md#browser-workflow-checks) cover role
+  navigation, ticket actions and conversations, session handling, and realtime updates.
+  Live backend and deployment checks run through the walkthrough and smoke scripts
+  under [backend/scripts/](backend/scripts/).
 

@@ -90,7 +90,7 @@ export function Topbar({
       label: 'Your profile',
       icon: <UserCircle />,
       onSelect: () => {
-        navigate('/profile')
+        navigate('/preferences')
       },
     },
     ...themeItems,

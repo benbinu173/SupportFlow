@@ -22,7 +22,7 @@ import { Dialog } from '@/components/ui/Dialog'
 import { ErrorState } from '@/components/ui/States'
 import { Select } from '@/components/ui/Select'
 import { customerKeys } from '@/features/customers/keys'
-import { can, isPortalRole, PERMISSIONS } from '@/features/auth/permissions'
+import { can, isPortalRole, PERMISSIONS, TICKET_SCOPE_BY_ROLE } from '@/features/auth/permissions'
 import { teamKeys } from '@/features/team/keys'
 import { ticketKeys } from '@/features/tickets/keys'
 import { auditHistoryUrl } from '@/features/audit/keys'
@@ -399,8 +399,15 @@ export function TicketDetailPage() {
       return response.data
     },
     onSuccess: (updated, action) => {
-      queryClient.setQueryData(ticketKeys.detail(ticketId), updated)
-      void queryClient.invalidateQueries({ queryKey: ticketKeys.events(ticketId) })
+      // Reopening clears the assignment, so an assigned-scope agent can no
+      // longer read this ticket or its conversation from the server.
+      if (user && TICKET_SCOPE_BY_ROLE[user.role] === 'assigned' && updated.assigned_agent_id !== user.id) {
+        queryClient.removeQueries({ queryKey: ticketKeys.detail(ticketId) })
+        navigate('/tickets', { replace: true })
+      } else {
+        queryClient.setQueryData(ticketKeys.detail(ticketId), updated)
+        void queryClient.invalidateQueries({ queryKey: ticketKeys.events(ticketId) })
+      }
       void queryClient.invalidateQueries({ queryKey: ticketKeys.lists() })
       setAssignmentDraft(null)
       setConfirmation(null)

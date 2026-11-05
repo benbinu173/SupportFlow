@@ -101,7 +101,7 @@ describe('signing in', () => {
     await signIn()
 
     expect(
-      await screen.findByRole('heading', { level: 1, name: 'Signed in as Avery Chen' })
+      await screen.findByRole('heading', { level: 1, name: 'Welcome back, Avery' })
     ).toBeVisible()
 
     expect(memoryRouter.state.location.pathname).toBe('/dashboard')
@@ -147,7 +147,7 @@ describe('signing in', () => {
 
     await signIn()
 
-    await screen.findByRole('heading', { level: 1, name: 'Signed in as Avery Chen' })
+    await screen.findByRole('heading', { level: 1, name: 'Welcome back, Avery' })
 
     expect(tokenAtFetch).toBe('issued-access-token')
   })
@@ -157,7 +157,7 @@ describe('signing in', () => {
 
     await signIn()
 
-    await screen.findByRole('heading', { level: 1, name: 'Signed in as Avery Chen' })
+    await screen.findByRole('heading', { level: 1, name: 'Welcome back, Avery' })
 
     // The backend issues the refresh token as `HttpOnly` specifically so that a
     // cross-site-scripting flaw cannot read it. A client that copied the access

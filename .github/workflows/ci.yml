@@ -128,7 +128,7 @@ jobs:
         run: pytest --cov=app --cov-report=term-missing
 
   frontend:
-    name: Frontend — lint, types, tests, build
+    name: Frontend — lint, types, tests, browser workflows, build
     runs-on: ubuntu-latest
 
     defaults:
@@ -169,6 +169,23 @@ jobs:
 
       - name: Build
         run: npm run build
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Browser workflows
+        run: npm run test:e2e
+
+      - name: Upload browser failure details
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-browser-failures
+          path: |
+            frontend/playwright-report/
+            frontend/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
 
   docker:
     name: Docker — build images

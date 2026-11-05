@@ -35,11 +35,9 @@ import { PERMISSIONS, type UserRole } from '@/features/auth/permissions'
  * Vite replaces the flag with `false` at build time, so the branch and the
  * imports behind it are both dropped from the shipped bundle.
  *
- * `/dev/health` is the scaffold's readiness probe. It lost its place at `/` when
- * the landing page took the root, and it is here rather than deleted because it
- * still has a job before F8: it is the one screen that shows, without anything
- * between it and the server, whether the API, the database and the object store
- * are actually up. F8 moves that panel into the admin screen and deletes this.
+ * `/dev/health` is a developer-facing readiness probe. It stays out of the
+ * shipped application because its raw dependency status belongs in local
+ * diagnostics, not in the staff or customer product navigation.
  */
 const devRoutes: RouteObject[] = import.meta.env.DEV
   ? [
@@ -54,11 +52,9 @@ const devRoutes: RouteObject[] = import.meta.env.DEV
  * The root entry is pathless: it renders nothing of its own and exists to carry
  * the error element over every route at once.
  *
- * Note what is *not* here. The four role homes are one component, because in F2
- * they are one honest placeholder — the permission matrix is what differs, and
- * that lives in the sidebar and the store rather than in a route. F7 and F9
- * split them apart when there is genuinely different content to show; adding
- * four near-identical routes now would be four places to update for no gain.
+ * Staff and portal routes share the same authentication boundary, then add the
+ * narrowest role and permission guards required by each workflow. Keeping the
+ * full route inventory explicit makes omissions visible in the route tests.
  */
 export const router = createBrowserRouter([
   {
