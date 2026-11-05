@@ -135,11 +135,3 @@ export function navigationFor(role: UserRole): NavSection[] {
     }))
     .filter((section) => section.items.length > 0)
 }
-
-/** Where a role lands after signing in. */
-export const HOME_BY_ROLE: Record<UserRole, string> = {
-  admin: '/dashboard',
-  manager: '/dashboard',
-  agent: '/dashboard',
-  customer: '/portal',
-}

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { fireEvent, render, screen } from '@testing-library/react'
+import { configure, fireEvent, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { RouterProvider, createMemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -8,6 +8,9 @@ import { router } from '@/routes/router'
 import { ApiError, ERROR_CODES } from '@/services/api/errors'
 import { useSessionStore } from '@/store/auth'
 import type { SessionUser } from '@/types/session'
+
+// The form and destination screens are loaded asynchronously by the router.
+configure({ asyncUtilTimeout: 10_000 })
 
 /**
  * Creating a workspace, through the real route table.

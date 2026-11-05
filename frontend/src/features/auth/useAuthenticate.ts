@@ -1,7 +1,7 @@
 import { useCallback, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
-import { HOME_BY_ROLE } from '@/routes/navigation'
+import { HOME_BY_ROLE } from '@/routes/home'
 import { ApiError, toApiError } from '@/services/api/errors'
 import { fetchCurrentUser } from '@/services/api/auth'
 import type { TokenResponse } from '@/services/api/session-refresh'

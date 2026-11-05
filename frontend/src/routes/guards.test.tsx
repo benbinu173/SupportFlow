@@ -3,7 +3,7 @@ import { RouterProvider, createMemoryRouter, type RouteObject } from 'react-rout
 import { beforeEach, describe, expect, it } from 'vitest'
 
 import { PERMISSIONS, type UserRole } from '@/features/auth/permissions'
-import { HOME_BY_ROLE } from '@/routes/navigation'
+import { HOME_BY_ROLE } from '@/routes/home'
 import { useSessionStore } from '@/store/auth'
 import type { SessionUser } from '@/types/session'
 

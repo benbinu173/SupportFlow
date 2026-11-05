@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen } from '@testing-library/react'
+import { configure, render, screen } from '@testing-library/react'
 import { RouterProvider, createMemoryRouter, type RouteObject } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -7,6 +7,9 @@ import { useSessionStore } from '@/store/auth'
 import type { SessionUser } from '@/types/session'
 
 import { router } from './router'
+
+// Importing a screen is now part of navigation rather than test-module setup.
+configure({ asyncUtilTimeout: 10_000 })
 
 /**
  * The API client is stubbed for exactly one route, and it is worth being precise

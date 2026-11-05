@@ -14,7 +14,7 @@ export default defineConfig({
   test: {
     // Playwright uses the same `.spec.ts` convention as Vitest, but its browser
     // fixtures cannot run inside the jsdom unit-test pool.
-    exclude: [...configDefaults.exclude, 'e2e/**'],
+    exclude: [...configDefaults.exclude, 'e2e/**', 'e2e-live/**'],
     // Form-flow tests exercise long accessible labels and policy feedback in
     // jsdom; fifteen seconds leaves room for slower Windows CI workers.
     testTimeout: 15_000,

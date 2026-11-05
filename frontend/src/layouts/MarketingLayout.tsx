@@ -3,7 +3,7 @@ import { Link, Outlet } from 'react-router-dom'
 
 import { Logo } from '@/components/layout/Logo'
 import { useSessionStore } from '@/store/auth'
-import { HOME_BY_ROLE } from '@/routes/navigation'
+import { HOME_BY_ROLE } from '@/routes/home'
 
 /**
  * The public shell: a floating nav, the page, a footer.

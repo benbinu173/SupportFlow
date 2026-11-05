@@ -1,13 +1,27 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen } from '@testing-library/react'
+import { configure, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { RouterProvider, createMemoryRouter } from 'react-router-dom'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { router } from '@/routes/router'
 import { ApiError, ERROR_CODES } from '@/services/api/errors'
 import { useSessionStore } from '@/store/auth'
 import type { SessionUser } from '@/types/session'
+
+// Route modules now load during rendering. Allow their imports to settle on
+// slower Windows filesystems before asserting on the resulting screen.
+configure({ asyncUtilTimeout: 10_000 })
+
+// Browser tests cover chunk delays and failures. Prepare the modules used by
+// these form-flow tests before their interaction timeout starts.
+beforeAll(async () => {
+  await Promise.all([
+    import('@/layouts/AuthLayout'),
+    import('@/pages/auth/LoginPage'),
+    import('@/pages/HomePage'),
+  ])
+}, 30_000)
 
 /**
  * Signing in, through the real route table.

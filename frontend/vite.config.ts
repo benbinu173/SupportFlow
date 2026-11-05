@@ -10,6 +10,10 @@ export default defineConfig({
       '@': fileURLToPath(new URL('./src', import.meta.url)),
     },
   },
+  build: {
+    // Records the static and dynamic dependency graph for bundle verification.
+    manifest: true,
+  },
   server: {
     port: 5173,
     // Proxy in dev so the browser sees one origin. Cookies stay same-origin

@@ -3,7 +3,7 @@ import { Navigate, Outlet, useLocation } from 'react-router-dom'
 import { ErrorState } from '@/components/ui/States'
 import { Spinner } from '@/components/ui/Spinner'
 import { can, type Permission, type UserRole } from '@/features/auth/permissions'
-import { HOME_BY_ROLE } from '@/routes/navigation'
+import { HOME_BY_ROLE } from '@/routes/home'
 import { useSessionStore } from '@/store/auth'
 
 /**

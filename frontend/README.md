@@ -29,3 +29,48 @@ An unhandled API request or uncaught browser error fails the test.
 `npm run typecheck` checks both application and browser-test code. CI runs both suites and
 uploads browser traces, screenshots, and the HTML report on failure. Local reports
 are available with `npx playwright show-report`; test output is ignored by Git.
+
+## Live backend browser checks
+
+`npm run test:e2e:live` checks the production frontend against the real local API.
+Start the infrastructure with `docker compose up -d`, then run the API and Celery
+worker using the main README's commands (`make api` and `make worker` also work
+from Git Bash). The API must listen on port 8000 and Mailpit on port 8025; the
+worker must consume `notifications`. No scheduler is needed for these workflows.
+
+If a parent terminal defines `DEBUG` as a non-boolean value, set it to `false`
+for the API and worker processes. This check does not require an AI provider key.
+The SMTP configuration must point to the local Mailpit service.
+
+The command builds the frontend and serves it at `http://127.0.0.1:4174`, using
+Vite's existing HTTP and WebSocket proxies. It performs no response or socket
+mocking. Separate browser sessions sign in as manager, agent, and customer and
+verify assignment, public replies, internal-note privacy, resolution,
+close/reopen, session restoration, and agent access after assignment is cleared.
+Realtime assertions read the recipient's screen without reloading. Email checks
+read Mailpit and match both the recipient and the current ticket reference.
+
+The checks create and reuse a dedicated **Local live browser checks** tenant
+with accounts under `supportflow-live.example.com` and create fresh tickets per
+run. The local test password is defined in `e2e-live/workflow.spec.ts`. Existing
+data is retained so results can be inspected, and registration/login limits still
+apply. Run this command against the local development stack.
+
+Live reports are stored under `playwright-report/live` and `test-results/live`,
+both ignored by Git. The deterministic F18 suite continues to run with
+`npm run test:e2e`; the live suite is a separate local integration check.
+
+## Route loading and bundle size
+
+Product screens and the auth/marketing layouts load through `React.lazy`.
+Session and permission guards run before protected screens download. A screen
+that is still downloading shows an accessible `Loading page` status; a failed
+download uses the existing error page, where Reload retries the application.
+
+The production build emits `dist/.vite/manifest.json`, which records each
+screen's chunk and its static dependencies. Count the entry and all its static
+imports when measuring startup JavaScript; the size of `index-*.js` alone omits
+shared chunks. The project checkpoint records the before/after measurements.
+
+The deterministic browser suite also checks protected-screen downloads,
+delayed loading, and recovery from a failed screen download.

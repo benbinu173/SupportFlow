@@ -1,30 +1,17 @@
-import { Outlet, createBrowserRouter, type RouteObject } from 'react-router-dom'
+import { lazy } from 'react'
+import { createBrowserRouter, type RouteObject } from 'react-router-dom'
 
-import { AuthLayout } from '@/layouts/AuthLayout'
-import { MarketingLayout } from '@/layouts/MarketingLayout'
-import { HealthPage } from '@/pages/HealthPage'
-import { HomePage } from '@/pages/HomePage'
 import { NotFoundPage } from '@/pages/NotFoundPage'
-import { TicketQueuePage } from '@/pages/tickets/TicketQueuePage'
-import { TicketDetailPage } from '@/features/tickets/TicketDetailPage'
-import { PortalRequestsPage } from '@/pages/portal/PortalRequestsPage'
-import { NewRequestPage } from '@/pages/portal/NewRequestPage'
-import { CustomersPage } from '@/features/customers/CustomersPage'
-import { CustomerDetailPage } from '@/features/customers/CustomerDetailPage'
-import { TeamPage } from '@/features/team/TeamPage'
-import { NotificationsPage } from '@/features/notifications/NotificationsPage'
-import { AnalyticsPage } from '@/features/analytics/AnalyticsPage'
-import { SlaPage } from '@/features/sla/SlaPage'
-import { KnowledgePage } from '@/features/knowledge/KnowledgePage'
-import { AuditPage } from '@/features/audit/AuditPage'
-import { PreferencesPage } from '@/features/profile/PreferencesPage'
-import { LoginPage } from '@/pages/auth/LoginPage'
-import { RegisterPage } from '@/pages/auth/RegisterPage'
-import { KitPage } from '@/pages/dev/KitPage'
-import { LandingPage } from '@/pages/marketing/LandingPage'
 import { RouteError } from '@/routes/RouteError'
+import { RouteOutlet } from '@/routes/RouteOutlet'
+import {
+  AnalyticsPage, AuditPage, AuthLayout, CustomerDetailPage, CustomersPage, HomePage,
+  KnowledgePage, LandingPage, LoginPage, MarketingLayout, NewRequestPage, NotificationsPage,
+  PortalRequestsPage, PreferencesPage, RegisterPage, SlaPage, TeamPage,
+  TicketDetailPage, TicketQueuePage,
+} from '@/routes/lazy-pages'
 import { RedirectIfAuthenticated, RequireAuth, RequirePermission, RequirePortalRole, RequireStaffRole } from '@/routes/guards'
-import { HOME_BY_ROLE } from '@/routes/navigation'
+import { HOME_BY_ROLE } from '@/routes/home'
 import { PERMISSIONS, type UserRole } from '@/features/auth/permissions'
 
 /**
@@ -41,16 +28,16 @@ import { PERMISSIONS, type UserRole } from '@/features/auth/permissions'
  */
 const devRoutes: RouteObject[] = import.meta.env.DEV
   ? [
-      { path: '/dev/kit', element: <KitPage /> },
-      { path: '/dev/health', element: <HealthPage /> },
+      { path: '/dev/kit', Component: lazy(() => import('@/pages/dev/KitPage').then((module) => ({ default: module.KitPage }))) },
+      { path: '/dev/health', Component: lazy(() => import('@/pages/HealthPage').then((module) => ({ default: module.HealthPage }))) },
     ]
   : []
 
 /**
  * The route table.
  *
- * The root entry is pathless: it renders nothing of its own and exists to carry
- * the error element over every route at once.
+ * The pathless root provides the screen-loading boundary and error element
+ * across the route table.
  *
  * Staff and portal routes share the same authentication boundary, then add the
  * narrowest role and permission guards required by each workflow. Keeping the
@@ -58,7 +45,7 @@ const devRoutes: RouteObject[] = import.meta.env.DEV
  */
 export const router = createBrowserRouter([
   {
-    element: <Outlet />,
+    element: <RouteOutlet />,
     errorElement: <RouteError />,
     children: [
       {
