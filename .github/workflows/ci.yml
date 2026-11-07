@@ -204,8 +204,21 @@ jobs:
           context: ./backend
           target: production
           push: false
+          load: true
+          tags: supportflow-backend:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Check production Redis task transport
+        run: |
+          docker run --rm -i --entrypoint python supportflow-backend:ci - <<'PY'
+          from celery import Celery
+
+          app = Celery(broker='redis://localhost:6379/2', backend='redis://localhost:6379/2')
+          with app.connection() as connection:
+              print(f'Broker transport: {connection.transport.driver_type}')
+          print(f'Result backend: {app.backend.__class__.__name__}')
+          PY
 
       - name: Validate compose configuration
         run: |

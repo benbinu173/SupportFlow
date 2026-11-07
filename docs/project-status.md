@@ -1,6 +1,6 @@
 # Project checkpoint
 
-Updated: 2026-11-05.
+Updated: 2026-11-07.
 
 ## Current milestone
 
@@ -10,6 +10,9 @@ Route code splitting is complete and verified.
 The live checks, route code splitting, and this checkpoint are recorded together
 in Git.
 The backend's A–Z milestones are recorded as complete in the main README.
+Local production deployment verification is now complete. The Redis worker
+dependency fix, production-image CI check, and updated runbook are in the
+working tree following `52c90a4`.
 
 ## F18 scope
 
@@ -81,7 +84,50 @@ tickets for inspection. Instructions are in the frontend README. AI-provider
 calls, scheduler-driven SLA alerts, and the deployed Caddy/TLS path are separate
 checks; the existing walkthrough and smoke scripts remain under `backend/scripts/`.
 
+## Local production deployment verification
+
+Rebuilt and started `docker-compose.prod.yml` against the retained local
+production volumes. The existing Acme Support and smoke tenants were reused;
+the seed was not reset. Only Caddy publishes host ports.
+
+- The existing deployment smoke script passed **23 checks, 0 failures**.
+  The final run enabled TLS verification using the stack's public Caddy root
+  certificate through `SSL_CERT_FILE`; HTTPS and WSS both validated successfully.
+  This verifies the local CA and hostname, not public certificate trust.
+- Liveness, PostgreSQL/Redis readiness, administrator login, API security
+  headers and request IDs, two-sided tenant isolation, indistinguishable 404
+  bodies, and a real `ticket.created` WebSocket event passed through Caddy.
+- Separate HTTP checks verified the HTTP-to-HTTPS redirect, six frontend deep
+  links, document CSP/security headers and `no-cache`, all 60 manifest assets
+  with immutable caching (including 19 dynamic entries), and a missing-asset
+  404. These checked HTTP responses, not browser interaction or CSP execution.
+- The knowledge question returned a refusal with **zero sources**. Generation
+  and embedding keys are empty, so this does not verify live AI or RAG. SMTP
+  is also unconfigured in this local production environment.
+
+The initial rebuild exposed a runtime-only dependency failure: Kombu 5.7.0's
+Redis transport imports `packaging`, which is installed by its Redis extra.
+Declaring plain `celery` plus the Redis client did not install that extra;
+both worker and beat restarted with `ModuleNotFoundError: packaging` while
+the HTTP/WebSocket smoke script still passed. The dependency is now
+`celery[redis]==5.6.3` so transport requirements reach the runtime image.
+
+CI now loads the built production image and initializes Celery's Redis broker
+transport and result backend without development dependencies or a live broker.
+That check reproduced the failure before the fix and passed on the rebuilt
+image afterwards. The deployed worker responded `pong`, and beat started its
+persistent scheduler. The README documents certificate verification from
+PowerShell without modifying the host's trust store.
+
 ## Next recommended step
 
-Run the existing deployment smoke script against the local production stack to
-verify Caddy, TLS, security headers, and WebSocket upgrades together.
+Review and update the frontend dependencies flagged during the image build.
+`npm audit --omit=dev` reported one high-severity entry in `follow-redirects`,
+an Axios Node adapter dependency; the production frontend runs as static browser
+assets behind nginx, so the report alone does not establish browser exposure.
+The full install reported six entries (three moderate, three high). Package
+updates have not been applied in this deployment verification step.
+
+Then extend live browser workflows to the deployed HTTPS origin to verify
+sign-in, secure refresh cookies, lazy screens, CSP, and realtime behavior in
+the browser through Caddy. The current live suite uses the Vite preview proxy.

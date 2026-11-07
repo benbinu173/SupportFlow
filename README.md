@@ -1922,11 +1922,30 @@ make prod-seed        # ARGS='--reset' make prod-seed to start over
 make smoke            # backend/scripts/deploy_smoke.py, against https://localhost
 ```
 
-`SITE_ADDRESS=localhost` uses Caddy's internal CA, so the browser warning is expected — run
-`caddy trust` inside the container, or point `SITE_ADDRESS` at a real domain and let ACME issue a
-certificate. **TLS verification is off by default** in the smoke script for that reason;
-`--verify-tls` is the mode that actually protects anything, and it is what you would run against a
-real hostname.
+`SITE_ADDRESS=localhost` uses Caddy's internal CA, so the browser warning is expected until
+the browser's host trusts that CA. Running `caddy trust` inside the container only changes the
+container's trust store. A real domain uses ACME issuance instead.
+
+**TLS verification is off by default** in the smoke script. To verify the local certificate
+and hostname without changing the host's trust store, copy the stack's public root certificate
+and pass it to Python through `SSL_CERT_FILE`. From the project root in PowerShell:
+
+```powershell
+docker compose --env-file .env.production -f docker-compose.prod.yml cp caddy:/data/caddy/pki/authorities/local/root.crt backend/.caddy-local-root.pem
+Push-Location backend
+$previousCertFile = $env:SSL_CERT_FILE
+try {
+    $env:SSL_CERT_FILE = (Resolve-Path .caddy-local-root.pem).Path
+    .venv/Scripts/python.exe -m scripts.deploy_smoke --verify-tls
+} finally {
+    $env:SSL_CERT_FILE = $previousCertFile
+    Pop-Location
+}
+```
+
+The `.pem` file is gitignored. This validates HTTPS and WSS against that local CA; it does not
+claim public certificate trust. Against a real hostname, use `--verify-tls` with the normal
+system trust configuration.
 
 ### Upgrading an existing deployment
 
