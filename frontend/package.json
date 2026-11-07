@@ -14,6 +14,7 @@
     "test:watch": "vitest",
     "test:e2e": "playwright test",
     "test:e2e:live": "playwright test --config playwright.live.config.ts",
+    "test:e2e:production": "playwright test --config playwright.production.config.ts",
     "types:api": "openapi-typescript http://localhost:8000/openapi.json -o src/types/api.d.ts"
   },
   "dependencies": {
@@ -40,14 +41,14 @@
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
     "@vitejs/plugin-react": "^6.1.0",
-    "@vitest/coverage-v8": "^5.0.0",
+    "@vitest/coverage-v8": "^5.1.0",
     "jsdom": "^29.1.1",
     "openapi-typescript": "^7.13.0",
     "oxlint": "^1.79.0",
     "tailwindcss": "^4.3.3",
     "typescript": "~6.0.2",
-    "vite": "^8.2.2",
-    "vitest": "^5.0.0"
+    "vite": "^8.3.6",
+    "vitest": "^5.1.0"
   },
   "//overrides": "openapi-typescript@7.13.0 declares `peer typescript@^5.x`, and no release accepts TypeScript 6. TypeScript is not in its `dependencies` at all — it is metadata inherited from @redocly/openapi-core, and the CLI never imports tsc at runtime. Pinning the peer to this project's own TypeScript is how npm is told the range is stale. If `npm run types:api` ever emits a broken file, this override is the first thing to suspect.",
   "overrides": {

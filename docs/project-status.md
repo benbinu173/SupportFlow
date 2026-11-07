@@ -10,9 +10,10 @@ Route code splitting is complete and verified.
 The live checks, route code splitting, and this checkpoint are recorded together
 in Git.
 The backend's A–Z milestones are recorded as complete in the main README.
-Local production deployment verification is now complete. The Redis worker
-dependency fix, production-image CI check, and updated runbook are in the
-working tree following `52c90a4`.
+Local production deployment verification, the Redis worker dependency fix,
+and the production-image CI check are committed as `6eb4bb3`.
+Patched frontend dependencies and browser coverage through Caddy are now
+implemented and verified.
 
 ## F18 scope
 
@@ -119,15 +120,49 @@ image afterwards. The deployed worker responded `pong`, and beat started its
 persistent scheduler. The README documents certificate verification from
 PowerShell without modifying the host's trust store.
 
+## Dependency updates and production browser workflows
+
+The six reported dependency entries are resolved. The lockfile now installs
+Vite 8.3.6, Vitest and coverage-v8 5.1.0, follow-redirects 1.16.2, and undici
+7.30.2. `npm audit` and the Docker build's `npm ci` report **0 vulnerabilities**.
+Vite's declared minimum was raised to the patched version; Vitest and coverage
+were updated together to keep their peer versions aligned.
+
+`npm run test:e2e:production` runs against `https://localhost` without Vite.
+Setup/readback, browser HTTP, and WSS all use Caddy. Shared live-test helpers
+retain the separate development suite's existing API/preview URLs. The
+production suite reuses a dedicated **Local production browser checks** tenant.
+The local `docker-compose.browser-checks.yml` override captures notifications
+in Mailpit and exposes inspection only on `127.0.0.1:8026`.
+
+The first browser run exposed the theme bootstrap being blocked by production
+CSP. The inline script is now a classic, blocking same-origin file at
+`/theme-init.js`, which nginx revalidates with `no-cache`. It still runs before
+the body paints; `script-src 'self'` remains enforced. Browser reports/traces
+are excluded from the Docker build context.
+
+Verification after the changes:
+
+- Lint, TypeScript, realtime contract, and Docker production build passed.
+- All 103 component/service cases were verified across 15 files. The initial
+  run passed 93 cases but hit a Windows worker-start timeout on the router
+  file; that file's 10 cases passed on a targeted rerun.
+- All 16 existing deterministic browser workflows passed.
+- All 4 production browser checks passed: saved theme before application
+  modules can load; admin Secure/HttpOnly/SameSite cookie rotation, lazy
+  preferences loading, CSP, deep-link restoration and sign-out; manager/agent/
+  customer conversations, privacy, lifecycle, realtime and captured emails;
+  and agent access revocation after reopening clears assignment.
+
+Chromium accepts the local certificate for browser interaction; cryptographic
+certificate/hostname verification remains in the separate smoke check using
+the stack's public CA. The normal production compose configuration is restored
+after the browser checks, with the temporary Mailpit container removed and all
+database/object-store volumes retained.
+
 ## Next recommended step
 
-Review and update the frontend dependencies flagged during the image build.
-`npm audit --omit=dev` reported one high-severity entry in `follow-redirects`,
-an Axios Node adapter dependency; the production frontend runs as static browser
-assets behind nginx, so the report alone does not establish browser exposure.
-The full install reported six entries (three moderate, three high). Package
-updates have not been applied in this deployment verification step.
-
-Then extend live browser workflows to the deployed HTTPS origin to verify
-sign-in, secure refresh cookies, lazy screens, CSP, and realtime behavior in
-the browser through Caddy. The current live suite uses the Vite preview proxy.
+Verify scheduler-driven SLA alerts end to end on the local production stack,
+including due-ticket sweeps, realtime warning delivery, and captured emails.
+Existing Phase Q walkthroughs provide the starting point. Live AI/RAG checks
+still need generation and embedding provider credentials.

@@ -52,13 +52,47 @@ read Mailpit and match both the recipient and the current ticket reference.
 
 The checks create and reuse a dedicated **Local live browser checks** tenant
 with accounts under `supportflow-live.example.com` and create fresh tickets per
-run. The local test password is defined in `e2e-live/workflow.spec.ts`. Existing
+run. The local test password is defined in `e2e-live/helpers.ts`. Existing
 data is retained so results can be inspected, and registration/login limits still
 apply. Run this command against the local development stack.
 
 Live reports are stored under `playwright-report/live` and `test-results/live`,
 both ignored by Git. The deterministic F18 suite continues to run with
 `npm run test:e2e`; the live suite is a separate local integration check.
+
+## Production stack browser checks
+
+`npm run test:e2e:production` runs the live role workflows against the local
+Docker production stack at `https://localhost`. It starts no Vite server:
+browser traffic and test setup/readback use Caddy's HTTPS origin, and realtime
+connections use WSS. A separate admin workflow checks secure HttpOnly refresh
+cookies, rotation on reload, a lazy-loaded preferences screen, CSP errors,
+deep-link session restoration, and sign-out.
+
+From the project root, start the stack with the local mail-capture override:
+
+```powershell
+docker compose --env-file .env.production -f docker-compose.prod.yml -f docker-compose.browser-checks.yml up -d --build
+Push-Location frontend
+try { npm run test:e2e:production } finally { Pop-Location }
+```
+
+The override routes backend/worker SMTP to Mailpit on the compose network and
+exposes its inspection API only at `127.0.0.1:8026`. It changes neither the
+production env file nor the database volumes. Use it only for local verification.
+The suite creates/reuses **Local production browser checks**, with accounts
+under `supportflow-production-browser.example.com`, and retains test tickets.
+
+Chromium accepts Caddy's local certificate with `ignoreHTTPSErrors`; certificate
+chain and hostname validation remain a separate `deploy_smoke --verify-tls`
+check, documented in the root README. The suite does not configure AI providers.
+Reports and traces are under `playwright-report/production` and
+`test-results/production`, both gitignored. To restore the regular production
+stack and remove the temporary Mailpit container after verification:
+
+```powershell
+docker compose --env-file .env.production -f docker-compose.prod.yml up -d --remove-orphans
+```
 
 ## Route loading and bundle size
 

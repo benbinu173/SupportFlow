@@ -3,6 +3,7 @@ import { defineConfig, devices } from '@playwright/test'
 /** Local integration checks require the API, Redis, Postgres, worker, and Mailpit. */
 export default defineConfig({
   testDir: './e2e-live',
+  testIgnore: '**/production.spec.ts',
   workers: 1,
   timeout: 120_000,
   expect: { timeout: 15_000 },

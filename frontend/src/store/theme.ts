@@ -4,7 +4,7 @@ export type ThemePreference = 'light' | 'dark' | 'system'
 export type ResolvedTheme = 'light' | 'dark'
 
 /**
- * Deliberately duplicated in the pre-paint script in `index.html`, which runs
+ * Deliberately duplicated in the pre-paint script in `public/theme-init.js`, which runs
  * before any module is parsed and therefore cannot import this. Two readers of
  * one key: rename it here and the flash of the wrong theme comes back.
  */

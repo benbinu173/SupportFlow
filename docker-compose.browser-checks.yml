@@ -1,0 +1,30 @@
+# Local browser verification only: capture production-stack notifications in Mailpit.
+# Combine with docker-compose.prod.yml; never use this override on a public host.
+services:
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "127.0.0.1:8026:8025"
+    restart: unless-stopped
+
+  backend:
+    environment:
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+      SMTP_STARTTLS: "false"
+      SMTP_USERNAME: ""
+      SMTP_PASSWORD: ""
+    depends_on:
+      mailpit:
+        condition: service_started
+
+  worker:
+    environment:
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+      SMTP_STARTTLS: "false"
+      SMTP_USERNAME: ""
+      SMTP_PASSWORD: ""
+    depends_on:
+      mailpit:
+        condition: service_started

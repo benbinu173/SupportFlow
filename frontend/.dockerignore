@@ -28,6 +28,8 @@ dist/
 .git/
 .gitignore
 coverage/
+playwright-report/
+test-results/
 Dockerfile
 .dockerignore
 README.md

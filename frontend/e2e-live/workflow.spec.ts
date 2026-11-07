@@ -1,82 +1,13 @@
-import { randomUUID } from 'node:crypto'
-import { expect, test, type APIRequestContext, type Browser, type Page } from '@playwright/test'
+import { expect, test, type APIRequestContext, type Page } from '@playwright/test'
+
+import { createWorld, json, settings, signIn } from './helpers'
 
 import type { components } from '../src/types/api'
 
-type User = components['schemas']['UserRead']
 type Ticket = components['schemas']['TicketRead']
 type Message = components['schemas']['MessageRead']
 type Notification = components['schemas']['NotificationRead']
-type Role = 'manager' | 'agent' | 'customer'
-type Account = { user: User; password: string }
 type Mail = { ID: string; Subject: string; To: Array<{ Address: string }> }
-
-const apiURL = 'http://127.0.0.1:8000/api/v1'
-const mailpitURL = 'http://127.0.0.1:8025'
-const password = 'LocalBrowserPassw0rd!23'
-const domain = 'supportflow-live.example.com'
-let tenant: Promise<Awaited<ReturnType<typeof createTenant>>> | undefined
-
-async function json<T>(response: Awaited<ReturnType<APIRequestContext['get']>>): Promise<T> {
-  // Status is enough to diagnose a failed setup without printing tokens or credentials.
-  expect(response.ok(), `Expected successful HTTP response, received ${response.status()}`).toBe(true)
-  return response.json() as Promise<T>
-}
-
-async function createTenant(request: APIRequestContext) {
-  const login = await request.post(`${apiURL}/auth/login`, { data: { email: `admin@${domain}`, password } })
-  const token = await json<components['schemas']['TokenResponse']>(login.status() === 401 ? await request.post(`${apiURL}/auth/register`, {
-    data: {
-      organization_name: 'Local live browser checks',
-      name: 'Live Browser Admin', email: `admin@${domain}`, password,
-    },
-  }) : login)
-  const headers = { Authorization: `Bearer ${token.access_token}` }
-  const customers = await json<components['schemas']['CustomerRead'][]>(await request.get(`${apiURL}/customers`, { headers }))
-  const customer = customers.find((record) => record.email === `customer@${domain}`) ??
-    await json<components['schemas']['CustomerRead']>(await request.post(`${apiURL}/customers`, {
-      headers, data: { name: 'Live Browser Customer', email: `customer@${domain}` },
-    }))
-  const users = await json<User[]>(await request.get(`${apiURL}/users`, { headers }))
-  const accounts = {} as Record<Role, Account>
-  for (const role of ['manager', 'agent', 'customer'] as const) {
-    const user = users.find((record) => record.email === `${role}@${domain}`) ?? await json<User>(await request.post(`${apiURL}/users`, {
-      headers,
-      data: {
-        name: `Live Browser ${role}`, email: `${role}@${domain}`, password, role,
-        customer_id: role === 'customer' ? customer.id : null,
-      },
-    }))
-    accounts[role] = { user, password }
-  }
-  return { accounts, headers, customer }
-}
-
-async function createWorld(request: APIRequestContext) {
-  const ready = await json<{ status: string }>(await request.get('http://127.0.0.1:8000/health/ready'))
-  expect(ready.status).toBe('ready')
-  await json(await request.get(`${mailpitURL}/api/v1/info`))
-  tenant ??= createTenant(request)
-  const { accounts, headers, customer } = await tenant
-  const suffix = randomUUID().slice(0, 8)
-  const ticket = await json<Ticket>(await request.post(`${apiURL}/tickets`, {
-    headers,
-    data: { customer_id: customer.id, subject: `Live delivery check ${suffix}`, description: 'Verify the complete support workflow.' },
-  }))
-  return { accounts, headers, ticket }
-}
-
-async function signIn(browser: Browser, account: Account): Promise<Page> {
-  const context = await browser.newContext({ baseURL: 'http://127.0.0.1:4174' })
-  const page = await context.newPage()
-  await page.goto('/login')
-  await expect(page.getByRole('heading', { level: 1, name: 'Sign in' })).toBeVisible()
-  await page.getByRole('textbox', { name: 'Email', exact: true }).fill(account.user.email)
-  await page.getByLabel(/^Password\s*\*?$/).fill(account.password)
-  await page.getByRole('button', { name: 'Sign in', exact: true }).click()
-  await expect(page.getByRole('status').filter({ hasText: /^Live$/ })).toBeVisible()
-  return page
-}
 
 async function confirm(page: Page, action: 'Close' | 'Reopen', number: number) {
   await page.getByRole('button', { name: `${action} ticket`, exact: true }).click()
@@ -85,7 +16,7 @@ async function confirm(page: Page, action: 'Close' | 'Reopen', number: number) {
   await expect(page.getByRole('dialog')).toHaveCount(0)
 }
 
-async function deliveredMail(request: APIRequestContext, address: string, title: string, ticket: Ticket) {
+async function deliveredMail(request: APIRequestContext, address: string, title: string, ticket: Ticket, mailpitURL: string) {
   let delivered: Mail | undefined
   await expect.poll(async () => {
     const inbox = await json<{ messages: Mail[] }>(await request.get(`${mailpitURL}/api/v1/search`, {
@@ -107,13 +38,13 @@ async function deliveredMail(request: APIRequestContext, address: string, title:
 }
 
 test('live manager, agent, and customer workflow persists and delivers realtime updates and email', async ({ browser, request }, testInfo) => {
-  const world = await createWorld(request)
+  const { apiURL, mailpitURL } = settings(testInfo)
+  const world = await createWorld(request, testInfo)
   const pages: Page[] = []
   const errors: string[] = []
   try {
     for (const role of ['manager', 'agent', 'customer'] as const) {
-      const page = await signIn(browser, world.accounts[role])
-      page.on('pageerror', (error) => errors.push(error.message))
+      const page = await signIn(browser, world.accounts[role], testInfo, errors)
       pages.push(page)
     }
     const [manager, agent, customer] = pages as [Page, Page, Page]
@@ -131,7 +62,7 @@ test('live manager, agent, and customer workflow persists and delivers realtime 
     const assignment = agent.getByRole('article').filter({ hasText: world.ticket.subject })
     await expect(assignment.getByText('Ticket assigned to you', { exact: true })).toBeVisible()
     await expect(customer.getByText('Assigned', { exact: true })).toBeVisible()
-    await deliveredMail(request, world.accounts.agent.user.email, 'Ticket assigned to you', world.ticket)
+    await deliveredMail(request, world.accounts.agent.user.email, 'Ticket assigned to you', world.ticket, mailpitURL)
     await assignment.getByRole('link', { name: 'View ticket', exact: true }).click()
     await agent.getByRole('button', { name: 'Start working' }).click()
     await expect(customer.getByText('In progress', { exact: true })).toBeVisible()
@@ -149,10 +80,10 @@ test('live manager, agent, and customer workflow persists and delivers realtime 
     await customer.getByRole('textbox', { name: 'Your reply' }).fill('Thank you for confirming the date.')
     await customer.getByRole('button', { name: 'Send reply' }).click()
     await expect(agent.getByText('Thank you for confirming the date.', { exact: true })).toBeVisible()
-    await deliveredMail(request, world.accounts.agent.user.email, 'New reply from the customer', world.ticket)
+    await deliveredMail(request, world.accounts.agent.user.email, 'New reply from the customer', world.ticket, mailpitURL)
     await agent.getByRole('button', { name: 'Resolve ticket' }).click()
     await expect(customer.getByText('Resolved', { exact: true })).toBeVisible()
-    await deliveredMail(request, world.accounts.customer.user.email, 'Your ticket has been resolved', world.ticket)
+    await deliveredMail(request, world.accounts.customer.user.email, 'Your ticket has been resolved', world.ticket, mailpitURL)
 
     await customer.reload()
     await expect(customer.getByText(reply, { exact: true })).toBeVisible()
@@ -187,8 +118,9 @@ test('live manager, agent, and customer workflow persists and delivers realtime 
   }
 })
 
-test('an agent reopening a live ticket returns to the queue and loses detail access', async ({ browser, request }) => {
-  const world = await createWorld(request)
+test('an agent reopening a live ticket returns to the queue and loses detail access', async ({ browser, request }, testInfo) => {
+  const { apiURL } = settings(testInfo)
+  const world = await createWorld(request, testInfo)
   const path = `/tickets/${world.ticket.id}`
   await json(await request.post(`${apiURL}${path}/assign`, {
     headers: world.headers, data: { assigned_agent_id: world.accounts.agent.user.id },
@@ -197,7 +129,8 @@ test('an agent reopening a live ticket returns to the queue and loses detail acc
     await json(await request.post(`${apiURL}${path}/status`, { headers: world.headers, data: { status } }))
   }
   await json(await request.post(`${apiURL}${path}/close`, { headers: world.headers }))
-  const page = await signIn(browser, world.accounts.agent)
+  const errors: string[] = []
+  const page = await signIn(browser, world.accounts.agent, testInfo, errors)
   try {
     await page.goto(path)
     await expect(page.getByRole('heading', { level: 1, name: world.ticket.subject })).toBeVisible()
@@ -214,6 +147,7 @@ test('an agent reopening a live ticket returns to the queue and loses detail acc
     expect(stored.assigned_agent_id).toBeNull()
     const notifications = await json<Notification[]>(await request.get(`${apiURL}/notifications`, { headers: world.headers }))
     expect(notifications.every((notification) => notification.ticket_id !== stored.id)).toBe(true)
+    expect(errors).toEqual([])
   } finally {
     await page.context().close()
   }
