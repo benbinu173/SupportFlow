@@ -13,7 +13,9 @@ The backend's A–Z milestones are recorded as complete in the main README.
 Local production deployment verification, the Redis worker dependency fix,
 and the production-image CI check are committed as `6eb4bb3`.
 Patched frontend dependencies and browser coverage through Caddy are now
-implemented and verified.
+implemented and verified as `b999bb5`.
+Scheduler-driven SLA alerts are now verified end to end on the local production
+stack through Caddy, with naturally aging tickets and captured email.
 
 ## F18 scope
 
@@ -160,9 +162,55 @@ the stack's public CA. The normal production compose configuration is restored
 after the browser checks, with the temporary Mailpit container removed and all
 database/object-store volumes retained.
 
+## Scheduler-driven SLA verification
+
+`backend/scripts/sla_scheduler_check.py` passed **47 checks, 0 failures** on
+2026-11-07, from 04:49:34 to 04:52:02 UTC. It observes the actual production
+beat, Redis broker, Celery worker, PostgreSQL, HTTPS/WSS through Caddy, and
+SMTP delivery to Mailpit. HTTPS/WSS certificate and hostname verification
+use Caddy's public local CA certificate.
+
+Only the dedicated **Local SLA Scheduler Checks** tenant received shortened
+policies: first response in one minute, resolution in two minutes, warning
+at 50%. Tickets aged naturally; no timestamps were rewritten and no tasks
+were manually dispatched. The local override reduced beat's interval to
+five seconds. This verifies delivery using an accelerated schedule, rather
+than measuring alert latency under the normal five-minute interval.
+
+- Beat dispatched automatically **29 times**, with gaps of 5.000–5.006 seconds.
+- Assigned and unassigned tickets each received both warning and breach for
+  both timers: **8 system-authored timeline events**, with the original
+  deadlines preserved. Events were recorded **2.462–2.673 seconds** after
+  their thresholds; these are event-recording delays, not email timings.
+- The assigned agent received 4 alerts, and each of two managers received 8.
+  **20 notification rows** matched both API inboxes and WSS frames. The own
+  administrator and another tenant's administrator received none.
+- Mailpit captured **20 matching emails**, one per SLA notification, with
+  correct recipients, subjects, and ticket references; every row had
+  `emailed_at` set. Worker logs independently confirmed four warnings, four
+  breaches, 20 queued emails, and 20 published notifications.
+- An internal note left the response timer running. On-time public reply and
+  resolution stayed met without alerts; the inactive policy produced none.
+  Another tenant's ticket read returned 404.
+- Two further automatic tenant sweeps completed without duplicating events,
+  notifications, or emails. All five WSS observers remained connected.
+
+The checker handles Celery's nested JSON logs and uses IPv4 loopback for
+local WSS transport while verifying the `localhost` certificate. Initial
+attempts exposed a checker log-parsing mismatch and intermittent local WSS
+connection timeouts; the final run passed with both addressed in the checker.
+Ruff lint/format and strict mypy passed for the new script.
+
+Original test-tenant policies are restored and all generated tickets are
+closed; accounts and history remain for inspection. Normal production
+compose settings are restored, including the 300-second scheduler interval
+and original SMTP configuration. Mailpit is removed and storage volumes
+are retained. This verifies captured SMTP delivery, not an external email
+provider. The repeat procedure is in the main README; detailed evidence
+is saved locally in the gitignored `backend/.sla-scheduler-report.local`.
+
 ## Next recommended step
 
-Verify scheduler-driven SLA alerts end to end on the local production stack,
-including due-ticket sweeps, realtime warning delivery, and captured emails.
-Existing Phase Q walkthroughs provide the starting point. Live AI/RAG checks
-still need generation and embedding provider credentials.
+Verify live AI analysis and knowledge ingestion/retrieval end to end. This
+needs generation and embedding provider credentials; neither is configured
+in the current local production environment.

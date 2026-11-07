@@ -1947,6 +1947,39 @@ The `.pem` file is gitignored. This validates HTTPS and WSS against that local C
 claim public certificate trust. Against a real hostname, use `--verify-tls` with the normal
 system trust configuration.
 
+### Checking scheduler-driven SLA alerts locally
+
+[backend/scripts/sla_scheduler_check.py](backend/scripts/sla_scheduler_check.py) observes
+automatic beat dispatch, worker sweeps, persisted timeline alerts, API inboxes, verified
+WSS delivery, and captured email on the local production stack. It uses a dedicated test
+tenant, one- and two-minute deadlines, and a temporary five-second scheduler interval.
+Tickets age naturally: the checker neither rewrites timestamps nor dispatches Celery tasks.
+Allow about three minutes. The backend development environment must be installed first.
+
+From the project root in PowerShell, with Docker Desktop running:
+
+```powershell
+try {
+    docker compose --env-file .env.production -f docker-compose.prod.yml -f docker-compose.browser-checks.yml -f docker-compose.sla-checks.yml up -d --wait
+    docker compose --env-file .env.production -f docker-compose.prod.yml cp caddy:/data/caddy/pki/authorities/local/root.crt backend/.caddy-local-root.pem
+    Push-Location backend
+    try {
+        .venv/Scripts/python.exe -m scripts.sla_scheduler_check
+    } finally {
+        Pop-Location
+    }
+} finally {
+    docker compose --env-file .env.production -f docker-compose.prod.yml up -d --remove-orphans --wait
+}
+```
+
+The checker restores the tenant's original policies and closes its generated tickets;
+accounts and ticket history remain available for inspection. The outer `finally` restores
+normal scheduler and SMTP settings, removes Mailpit, and retains storage volumes. Use these
+overrides only on the local stack. Mailpit captures SMTP delivery; it does not verify delivery
+through an external email provider. Results and ticket references are saved in the gitignored
+`backend/.sla-scheduler-report.local`; the process exits nonzero if any check fails.
+
 ### Upgrading an existing deployment
 
 The object-storage image changed, and two things about it are not drop-in.

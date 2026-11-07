@@ -1,0 +1,6 @@
+# Local SLA verification only. Combine with production and browser-checks compose files.
+# Shorten the scheduler interval; ticket clocks and tenant policies remain real API data.
+services:
+  beat:
+    environment:
+      SLA_SWEEP_INTERVAL_SECONDS: "5"
