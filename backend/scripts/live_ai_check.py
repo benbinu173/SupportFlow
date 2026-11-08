@@ -401,6 +401,12 @@ def run_checks(e: Evidence, client: httpx.Client, values: dict[str, str], only: 
             ),
         )
     finally:
+        # Preserve scoped evidence before cleanup and container recreation on failures too.
+        if "database" not in e.details:
+            try:
+                e.details["database"] = witness(owner, since)
+            except Exception:
+                e.check("database evidence captured before cleanup", False)
         for document in documents:
             try:
                 response = client.delete(
@@ -479,6 +485,7 @@ def rag_checks(
         deadline = time.monotonic() + 180
         while time.monotonic() < deadline:
             state = call("GET", f"/knowledge/{document['id']}")
+            e.details.setdefault("document_states", {})[document["id"]] = state
             if state["status"] in ("completed", "failed"):
                 break
             time.sleep(2)

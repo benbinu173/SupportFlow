@@ -17,7 +17,8 @@ drawn in the right place. Compare this file to `groq.py`: same client discipline
 translation, same validation entry point, and a different request body.
 
 **One status this module reads differently, and it is not a detail.** A `429` whose
-`error.code` is `insufficient_quota` means the account is out of credit. Groq's 429 means
+`error.code` is `insufficient_quota` or `credit_balance_exhausted` means the account is
+out of credit. Groq's 429 means
 "slow down" and retrying is exactly right; this one cannot succeed however long the caller
 waits, and treating it as transient would spend the whole attempt budget — three sleeps and
 three refused requests — to arrive at the same failure. So the code is checked before the
@@ -64,9 +65,9 @@ _API_ROOT = "https://api.openai.com/v1"
 # `groq.py` retry on.
 _RETRYABLE_STATUS = frozenset({408, 409, 429})
 
-#: The `error.code` that outranks its status. A 429 normally means "slow down"; this one means
+#: Quota error codes outrank their status. A 429 normally means "slow down"; these mean
 #: the account has no credit left, which no amount of waiting changes. See the module docstring.
-_INSUFFICIENT_QUOTA = "insufficient_quota"
+_QUOTA_ERROR_CODES = frozenset({"insufficient_quota", "credit_balance_exhausted"})
 
 #: A short reason per status, with a generic fallback so a code we have not seen is reported
 #: rather than crashing the translation.
@@ -88,6 +89,7 @@ _STATUS_REASONS: dict[int, str] = {
 _ERROR_CODE_REASONS: dict[str, str] = {
     "invalid_api_key": "the provider rejected the API key",
     "insufficient_quota": "the account has no remaining quota",
+    "credit_balance_exhausted": "the account has no remaining quota",
     "model_not_found": "the configured embedding model does not exist",
     "rate_limit_exceeded": "the provider rate-limited the request",
     "context_length_exceeded": "a passage exceeded the model's token limit",
@@ -179,11 +181,11 @@ def _reason_for(response: httpx.Response) -> str:
 def _from_status(exc: httpx.HTTPStatusError) -> AIError:
     """Turn a status error into one of our three types, with a reason.
 
-    `insufficient_quota` is checked first and is the only code that outranks its status — see
+    Quota codes are checked first and outrank their status — see
     the module docstring. Everything else follows the status: 408/409/429 and 5xx are worth
     another attempt, and the rest are not.
     """
-    if _error_code(exc.response) == _INSUFFICIENT_QUOTA:
+    if _error_code(exc.response) in _QUOTA_ERROR_CODES:
         return AIPermanentError(_reason_for(exc.response))
 
     if exc.response.status_code in _RETRYABLE_STATUS or exc.response.status_code >= 500:

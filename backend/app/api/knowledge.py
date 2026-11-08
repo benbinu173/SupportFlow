@@ -38,6 +38,7 @@ from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
 
 from app.api.deps import Context, DbSession, Origin, require_permission
 from app.api.rate_limits import limit_ai, limit_upload
+from app.core.exceptions import AIServiceError
 from app.core.permissions import Permission
 from app.schemas.knowledge import (
     KnowledgeAnswerRead,
@@ -255,4 +256,12 @@ async def search_knowledge(
     Rate limited per user (§45, `limit_ai`), because this route makes a provider call in the
     request path — the one place in this module where a client's request spends money.
     """
-    return await knowledge_service.answer(db, context, payload)
+    # The request owns the transaction. Preserve every staged provider attempt,
+    # including a failed one, before the session dependency rolls back on errors.
+    try:
+        answered = await knowledge_service.answer(db, context, payload)
+    except AIServiceError:
+        await db.commit()
+        raise
+    await db.commit()
+    return answered

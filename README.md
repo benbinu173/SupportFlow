@@ -1992,16 +1992,20 @@ Set `AI_PROVIDER`, `AI_MODEL`, and `AI_API_KEY` in the gitignored `.env.producti
 `.env`. The existing local configuration uses Groq with `openai/gpt-oss-120b`. RAG also
 needs `EMBEDDING_PROVIDER=openai`, `EMBEDDING_MODEL=text-embedding-3-small`, and an
 `EMBEDDING_API_KEY` from [the OpenAI API dashboard](https://platform.openai.com/api-keys).
+The embedding account also needs available API credits; check
+[API billing](https://platform.openai.com/settings/organization/billing/overview).
+HTTP 429 with `insufficient_quota` or `credit_balance_exhausted` requires credits
+before another attempt can succeed.
 For each provider, the checker chooses the first file with a nonempty credential,
 checking `.env.production` before `.env`, and takes its provider and model from that file.
 
 With Docker Desktop running, from `backend/` in PowerShell:
 
 ```powershell
-# Generation alone, while the embedding credential is unavailable:
+# Generation alone, while embedding access is unavailable:
 .venv/Scripts/python.exe -m scripts.live_ai_check --generation-only
 
-# Full generation + RAG, once both credentials are configured:
+# Full generation + RAG, once both credentials and API quota are available:
 .venv/Scripts/python.exe -m scripts.live_ai_check
 ```
 
@@ -2014,8 +2018,11 @@ Live calls use the provider account's quota; recorded costs use published model 
 which can differ from the account's invoice or free-tier charge.
 
 Reports are saved in `backend/.live-ai-generation-report.local` or
-`backend/.live-ai-rag-report.local`. The generation check passed on 2026-11-08. The full
-RAG run remains pending the embedding credential; its checks cover PDF/Markdown/manual
+`backend/.live-ai-rag-report.local`, with scoped database and document-state evidence
+captured before cleanup even when a run fails. The generation check passed on
+2026-11-08. The full RAG attempt recorded 32 passed and 2 failed when OpenAI refused
+embedding ingestion with `credit_balance_exhausted`. The credential is configured
+locally; RAG remains pending API credits. Its checks cover PDF/Markdown/manual
 ingestion, stored vectors, grounded answers and citations, refusal, tenant isolation,
 and grounded drafts. A generation-only pass does not verify semantic retrieval.
 

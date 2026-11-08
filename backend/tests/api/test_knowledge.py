@@ -29,6 +29,8 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import text
+from sqlalchemy.engine import Engine
 
 from app.ai.errors import AIPermanentError
 from app.ai.fake import FakeEmbeddingProvider, FakeProvider
@@ -717,6 +719,55 @@ def test_a_question_is_bounded_at_both_ends(
     org = register_org()
 
     assert org.post(SEARCH, json={"question": question}).status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Search usage must survive the request's database session
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("outcome", ["answer", "embedding_failure", "generation_failure"])
+def test_search_commits_usage_even_when_the_provider_fails(
+    register_org: Any, monkeypatch: pytest.MonkeyPatch, sync_engine: Engine, outcome: str
+) -> None:
+    """A separate connection must see the charged attempt after the HTTP response."""
+    org = register_org()
+    if outcome == "embedding_failure":
+        _pretend_something_is_published(monkeypatch)
+        monkeypatch.setattr(ai_service, "_embedding_provider", lambda: _BrokenEmbeddings())
+    else:
+        _retrieve(
+            monkeypatch, [_match(index=0, content="Refunds take 5 working days.", similarity=0.9)]
+        )
+        if outcome == "generation_failure":
+            _use_generator(monkeypatch, AIPermanentError("the account has no remaining quota"))
+        else:
+            _use_generator(
+                monkeypatch, {"answer": "Refunds take 5 working days.", "used_sources": [1]}
+            )
+
+    response = org.post(SEARCH, json={"question": "How long do refunds take?"})
+    assert response.status_code == (200 if outcome == "answer" else 503)
+    with sync_engine.connect() as connection:
+        rows = (
+            connection.execute(
+                text(
+                    "SELECT operation::text, was_successful, prompt_tokens, completion_tokens, "
+                    "cost_usd FROM ai_usage WHERE user_id = :user"
+                ),
+                {"user": uuid.UUID(org.user_id)},
+            )
+            .mappings()
+            .all()
+        )
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["operation"] == ("embed" if outcome == "embedding_failure" else "knowledge_answer")
+    assert row["was_successful"] == (outcome == "answer")
+    if outcome == "answer":
+        assert row["prompt_tokens"] > 0 and row["completion_tokens"] > 0 and row["cost_usd"] > 0
+    else:
+        assert row["prompt_tokens"] == row["completion_tokens"] == row["cost_usd"] == 0
 
 
 # ---------------------------------------------------------------------------

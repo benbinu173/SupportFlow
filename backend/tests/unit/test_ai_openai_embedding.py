@@ -319,7 +319,8 @@ async def test_each_status_becomes_the_error_type_that_decides_whether_to_retry(
     assert caught.value.reason == reason
 
 
-async def test_a_quota_exhausted_429_is_permanent_and_not_retried(wire: Wire) -> None:
+@pytest.mark.parametrize("code", ["insufficient_quota", "credit_balance_exhausted"])
+async def test_a_quota_exhausted_429_is_permanent_and_not_retried(wire: Wire, code: str) -> None:
     """**The one status this module reads differently from `groq.py`, and the reason is money.**
 
     A `429` normally means "slow down", and retrying is exactly right. `insufficient_quota`
@@ -328,7 +329,7 @@ async def test_a_quota_exhausted_429_is_permanent_and_not_retried(wire: Wire) ->
     refused requests — to arrive at the failure it could have reported immediately.
     """
     wire.answers(
-        {"error": {"code": "insufficient_quota", "message": "You exceeded your current quota"}},
+        {"error": {"code": code, "type": "insufficient_quota", "message": "Quota exhausted"}},
         status_code=429,
     )
 
@@ -336,6 +337,7 @@ async def test_a_quota_exhausted_429_is_permanent_and_not_retried(wire: Wire) ->
         await _provider().generate_embedding(TEXTS)
 
     assert caught.value.reason == "the account has no remaining quota"
+    assert len(wire.requests) == 1
 
 
 async def test_a_rate_limited_429_without_the_quota_code_is_still_transient(wire: Wire) -> None:

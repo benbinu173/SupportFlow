@@ -16,7 +16,8 @@ Patched frontend dependencies and browser coverage through Caddy are now
 implemented and verified as `b999bb5`.
 Scheduler-driven SLA alerts are now verified end to end on the local production
 stack through Caddy, with naturally aging tickets and captured email.
-Live Groq generation is verified; live RAG remains pending an embedding credential.
+Live Groq generation is verified. The embedding credential is configured locally;
+live RAG is blocked by exhausted OpenAI API credits.
 
 ## F18 scope
 
@@ -246,10 +247,43 @@ never printed or committed; the original `.env` files were preserved. The
 repeat procedure is in the main README, and local evidence is saved in the
 gitignored `backend/.live-ai-generation-report.local`.
 
+## Live RAG attempt and quota handling
+
+The embedding credential is now stored in the gitignored `.env`, with
+`EMBEDDING_PROVIDER=openai` and `EMBEDDING_MODEL=text-embedding-3-small`.
+The full checker ran on 2026-11-08 from 04:34:10 to 04:35:07 UTC and recorded
+**32 passed, 2 failed**. It stopped when the worker could not ingest the first
+knowledge document. A minimal direct embedding request confirmed HTTP 429,
+type `insufficient_quota`, and code `credit_balance_exhausted`; no vector was
+returned. This is an API credit blocker, and no further live embedding calls
+are being made until credits are available.
+
+The attempt exposed two application issues that are now fixed:
+
+- Both OpenAI quota error codes are treated as permanent failures, preventing
+  retries that cannot succeed without credits. Ordinary rate limits remain
+  eligible for retry.
+- Knowledge search commits its provider usage after a successful answer and
+  after an AI failure, so usage records survive the request's database session.
+
+The checker now captures scoped database evidence and document processing
+states before cleanup on failed runs. Provider and knowledge regression suites
+passed **83 tests**, including separate-connection checks of committed usage
+after successful answers, embedding failures, and generation failures. Ruff
+lint/format and strict mypy passed, and the production backend image rebuilt
+successfully and was applied to the local stack.
+
+Normal production provider settings are restored, the temporary credential
+file is removed, generated knowledge documents are deleted, and the generated
+ticket is closed. The failed report remains in the gitignored
+`backend/.live-ai-rag-report.local`; the earlier generation pass remains valid.
+Credentials are excluded from reports and Git.
+
 ## Next recommended step
 
-Run the full live AI/RAG checker after adding `EMBEDDING_API_KEY` to `.env`
-or `.env.production`, with `EMBEDDING_PROVIDER=openai` and
-`EMBEDDING_MODEL=text-embedding-3-small`. The generation credential is already
-available locally. Semantic retrieval, live document embeddings, grounded
-answers/citations, and RAG-grounded drafts are **not yet verified**.
+Check or add OpenAI API credits at
+[the API billing dashboard](https://platform.openai.com/settings/organization/billing/overview),
+then rerun `.venv/Scripts/python.exe -m scripts.live_ai_check` from `backend/`.
+Both provider credentials are already available locally. Semantic retrieval,
+live document embeddings, grounded answers/citations, and RAG-grounded drafts
+are **not yet verified**.
