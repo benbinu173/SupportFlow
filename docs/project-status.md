@@ -258,6 +258,12 @@ type `insufficient_quota`, and code `credit_balance_exhausted`; no vector was
 returned. This is an API credit blocker, and no further live embedding calls
 are being made until credits are available.
 
+A replacement embedding credential was saved locally and checked with one
+minimal request on 2026-11-08. It returned the same HTTP 429 and
+`credit_balance_exhausted`, with no embedding vector. The full checker was
+not rerun because embedding access remains unavailable. Sanitized probe
+evidence is in the gitignored `backend/.embedding-quota-probe.local`.
+
 The attempt exposed two application issues that are now fixed:
 
 - Both OpenAI quota error codes are treated as permanent failures, preventing
