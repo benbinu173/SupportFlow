@@ -1,0 +1,7 @@
+# Local live-provider verification only. The checker creates and removes this secret env file.
+# Combine with docker-compose.prod.yml; do not use this override on a public host.
+services:
+  backend:
+    env_file: .env.ai-checks.local
+  worker:
+    env_file: .env.ai-checks.local

@@ -1,6 +1,6 @@
 # Project checkpoint
 
-Updated: 2026-11-07.
+Updated: 2026-11-08.
 
 ## Current milestone
 
@@ -16,6 +16,7 @@ Patched frontend dependencies and browser coverage through Caddy are now
 implemented and verified as `b999bb5`.
 Scheduler-driven SLA alerts are now verified end to end on the local production
 stack through Caddy, with naturally aging tickets and captured email.
+Live Groq generation is verified; live RAG remains pending an embedding credential.
 
 ## F18 scope
 
@@ -209,8 +210,46 @@ are retained. This verifies captured SMTP delivery, not an external email
 provider. The repeat procedure is in the main README; detailed evidence
 is saved locally in the gitignored `backend/.sla-scheduler-report.local`.
 
+## Live AI generation verification
+
+`backend/scripts/live_ai_check.py --generation-only` passed **31 checks,
+0 failures** on 2026-11-08. Docker Desktop was restarted and the retained
+local production stack brought up. The checker used the existing Groq
+credential from `.env` temporarily, with `openai/gpt-oss-120b`, and accessed
+the API through Caddy with verified HTTPS.
+
+- Classification and sentiment completed in the production Celery worker;
+  validated results matched the ticket, whose actual priority stayed low.
+- Summaries completed, remained separate from ticket classification/lifecycle
+  fields, reused the same stored row on an unchanged conversation, and
+  regenerated after a new message.
+- Drafts and internal notes stayed private to staff. Regeneration retained
+  both internal drafts. A human accepted an edited reply; the customer saw
+  that public message, and acceptance made no additional model call.
+- Regeneration and edited acceptance were audited. Another tenant received
+  404 from the analysis, summary, and suggested-response routes.
+- A read-only PostgreSQL witness confirmed **6 successful real calls** and
+  **1 cache hit**, with 4,552 prompt tokens and 514 completion tokens. Live
+  provider latencies were 636–879 ms. The ledger recorded **$0.000992** at
+  published model prices; this is not a claim about the account's invoice.
+  The cache hit had zero tokens and zero cost.
+
+The first checker run compared the full ticket representation, including
+the ticking SLA display, when asserting a summary changed no ticket fields.
+That comparison was corrected to classification and lifecycle fields. The
+final run passed; no application behavior needed changing. Ruff lint/format
+and strict mypy passed for the checker.
+
+The generated tickets are closed. Original production AI/embedding settings
+are restored and `.env.ai-checks.local` is removed. Provider credentials were
+never printed or committed; the original `.env` files were preserved. The
+repeat procedure is in the main README, and local evidence is saved in the
+gitignored `backend/.live-ai-generation-report.local`.
+
 ## Next recommended step
 
-Verify live AI analysis and knowledge ingestion/retrieval end to end. This
-needs generation and embedding provider credentials; neither is configured
-in the current local production environment.
+Run the full live AI/RAG checker after adding `EMBEDDING_API_KEY` to `.env`
+or `.env.production`, with `EMBEDDING_PROVIDER=openai` and
+`EMBEDDING_MODEL=text-embedding-3-small`. The generation credential is already
+available locally. Semantic retrieval, live document embeddings, grounded
+answers/citations, and RAG-grounded drafts are **not yet verified**.

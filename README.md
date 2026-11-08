@@ -1980,6 +1980,45 @@ overrides only on the local stack. Mailpit captures SMTP delivery; it does not v
 through an external email provider. Results and ticket references are saved in the gitignored
 `backend/.sla-scheduler-report.local`; the process exits nonzero if any check fails.
 
+### Checking live AI and RAG locally
+
+[backend/scripts/live_ai_check.py](backend/scripts/live_ai_check.py) verifies real
+provider calls through the local production API and Celery worker over verified HTTPS.
+It reuses two dedicated test tenants and reads PostgreSQL evidence without changing it.
+Generation checks cover classification, sentiment, summary caching and freshness, draft
+regeneration, customer privacy, human acceptance, audit records, and tenant isolation.
+
+Set `AI_PROVIDER`, `AI_MODEL`, and `AI_API_KEY` in the gitignored `.env.production` or
+`.env`. The existing local configuration uses Groq with `openai/gpt-oss-120b`. RAG also
+needs `EMBEDDING_PROVIDER=openai`, `EMBEDDING_MODEL=text-embedding-3-small`, and an
+`EMBEDDING_API_KEY` from [the OpenAI API dashboard](https://platform.openai.com/api-keys).
+For each provider, the checker chooses the first file with a nonempty credential,
+checking `.env.production` before `.env`, and takes its provider and model from that file.
+
+With Docker Desktop running, from `backend/` in PowerShell:
+
+```powershell
+# Generation alone, while the embedding credential is unavailable:
+.venv/Scripts/python.exe -m scripts.live_ai_check --generation-only
+
+# Full generation + RAG, once both credentials are configured:
+.venv/Scripts/python.exe -m scripts.live_ai_check
+```
+
+The checker creates a temporary, gitignored `.env.ai-checks.local`, enables the selected
+providers with `docker-compose.ai-checks.yml`, and restores normal compose settings in
+`finally`. It removes the temporary credential file, closes its generated tickets, and
+deletes its test knowledge documents through the API. Accounts, ticket history, and
+usage records remain for inspection. The original environment files are preserved.
+Live calls use the provider account's quota; recorded costs use published model prices,
+which can differ from the account's invoice or free-tier charge.
+
+Reports are saved in `backend/.live-ai-generation-report.local` or
+`backend/.live-ai-rag-report.local`. The generation check passed on 2026-11-08. The full
+RAG run remains pending the embedding credential; its checks cover PDF/Markdown/manual
+ingestion, stored vectors, grounded answers and citations, refusal, tenant isolation,
+and grounded drafts. A generation-only pass does not verify semantic retrieval.
+
 ### Upgrading an existing deployment
 
 The object-storage image changed, and two things about it are not drop-in.
