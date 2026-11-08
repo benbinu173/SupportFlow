@@ -52,6 +52,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai import prompts
 from app.ai.provider import AIRequest
+from app.core import cache, redis
 from app.core.config import get_settings
 from app.core.exceptions import (
     AIServiceError,
@@ -586,6 +587,9 @@ async def run_ingestion(
     # finishing means — see the column's own comment on why the two columns stay separate.
     document.is_published = True
     await session.commit()
+    # A worker owns a fresh loop for each task; its Redis client must have the same lifetime.
+    async with redis.scoped_client() as client:
+        await cache.invalidate(context.organization_id, client=client)
 
     logger.info(
         "knowledge_document_ingested",
@@ -678,6 +682,8 @@ async def _fail(session: AsyncSession, document: KnowledgeDocument, *, reason: s
     document.chunk_count = 0
     document.is_published = False
     await session.commit()
+    async with redis.scoped_client() as client:
+        await cache.invalidate(document.organization_id, client=client)
 
     logger.error(
         "knowledge_ingestion_failed",
@@ -754,10 +760,10 @@ async def answer(
 
     Two branches, and the difference between them is the whole of §24.
 
-    **Nothing above the threshold: no model call, no ledger row, no answer from priors.** The
-    response is `NO_ANSWER` with `sources: []`. It is the cheaper branch and the more honest one —
-    there is no model in the loop to hallucinate a policy, and nothing that could fabricate a
-    citation — and it is what §24's last line asks for in as many words.
+    **Nothing above the threshold: no generation call and no answer from priors.** The response
+    is `NO_ANSWER` with `sources: []`. Searching a populated index still stages the query's
+    embedding usage; an empty index makes no provider call. Neither branch asks a model to
+    invent a policy or fabricate a citation, which is what §24's last line requires.
 
     **Something above it: one grounded call.** `prompts.knowledge_content` numbers the passages
     and `prompts.KNOWLEDGE_INSTRUCTION` tells the model to use only them, to say when they do not
@@ -770,8 +776,8 @@ async def answer(
     §24's *"do not fabricate citations"* served by a mapping rather than by a hope.
 
     **No commit here.** `ai_service` stages its ledger rows and the caller owns the transaction;
-    the route's session commits them at the end of the request, including on the branch that made
-    no call — where there is no row to commit, which is the point of that branch.
+    the route commits both successful and failed attempts, then invalidates the tenant's
+    analytics. An empty index leaves no ledger row to commit.
     """
     matches = await retrieve(session, context, payload.question, ticket_id=ticket_id)
     if not matches:

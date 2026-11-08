@@ -38,6 +38,7 @@ from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
 
 from app.api.deps import Context, DbSession, Origin, require_permission
 from app.api.rate_limits import limit_ai, limit_upload
+from app.core import cache
 from app.core.exceptions import AIServiceError
 from app.core.permissions import Permission
 from app.schemas.knowledge import (
@@ -262,6 +263,8 @@ async def search_knowledge(
         answered = await knowledge_service.answer(db, context, payload)
     except AIServiceError:
         await db.commit()
+        await cache.invalidate(context.organization_id)
         raise
     await db.commit()
+    await cache.invalidate(context.organization_id)
     return answered

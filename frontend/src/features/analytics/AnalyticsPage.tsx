@@ -50,7 +50,7 @@ const AI_OPERATION_LABELS: Record<AIOperation, string> = {
   sentiment: 'Sentiment analysis',
   summarize: 'Conversation summaries',
   suggest_response: 'Reply suggestions',
-  embed: 'Document indexing',
+  embed: 'Knowledge indexing and search',
   knowledge_answer: 'Knowledge answers',
 }
 

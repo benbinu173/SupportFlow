@@ -18,6 +18,8 @@ lifecycle (including returning agents to the queue when reopening clears their
 assignment), customer close/reopen and replies, the customer portal, AI draft
 review, failed-reply recovery, session
 restoration, profile navigation and sign-out, realtime replies, and reconnect recovery.
+Knowledge workflows also verify that returning to analytics refreshes usage after
+successful and failed questions, and after source processing completes or fails.
 
 HTTP responses and WebSocket frames use isolated, deterministic fixtures typed
 against the generated API schemas. These checks exercise the browser interface

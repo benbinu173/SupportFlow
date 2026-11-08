@@ -35,6 +35,7 @@ path reports the ledger at all.
 
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -638,18 +639,11 @@ async def test_a_tenant_that_has_spent_nothing_reads_zeros(
     assert (await aggregate(db, spender))["calls"] == 1
 
 
-async def test_the_row_scope_is_what_admits_a_call_to_the_totals(
-    db: AsyncSession, spender: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("role", [UserRole.ADMIN, UserRole.MANAGER, UserRole.AGENT])
+async def test_non_ticket_usage_belongs_to_the_organization_view(
+    db: AsyncSession, spender: dict[str, Any], monkeypatch: pytest.MonkeyPatch, role: UserRole
 ) -> None:
-    """A call with no ticket is a real row that no row-scoped view can see.
-
-    `analytics_repository.ai_usage` scopes through the *ticket*, because `ai_usage` has no
-    `customer_id` and no `assigned_agent_id` — a call's audience is the ticket it was made
-    for. Embedding calls during ingestion belong to no ticket and are therefore outside
-    every row-scoped view, which the repository's docstring states. This is that sentence
-    as an assertion, and it is deliberately not "the row is dropped": the ledger keeps it,
-    because cost attribution and ingestion's own spend report need every call.
-    """
+    """Organization totals include calls without tickets; assigned-work totals exclude them."""
     use_provider(monkeypatch, FakeProvider(classify_payload()))
 
     # No `ticket_id`: the shape an ingestion-time call has.
@@ -657,7 +651,24 @@ async def test_the_row_scope_is_what_admits_a_call_to_the_totals(
     await db.commit()
 
     assert len(await ledger_rows(db, spender["organization"].id)) == 1
-    assert (await aggregate(db, spender))["calls"] == 0
+    viewer = {**spender, "context": replace(spender["context"], role=role)}
+    summary = await aggregate(db, viewer)
+    assert summary["calls"] == (0 if role is UserRole.AGENT else 1)
+    assert summary["cost_usd"] == (Decimal(0) if role is UserRole.AGENT else EXPECTED_COST)
+    assert len(summary["by_operation"]) == (0 if role is UserRole.AGENT else 1)
+
+
+async def test_non_ticket_usage_is_invisible_to_another_organization(
+    db: AsyncSession, ledgers: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ticketless call still carries the caller's tenant boundary."""
+    spender, bystander = ledgers["spender"], ledgers["bystander"]
+    use_provider(monkeypatch, FakeProvider(classify_payload()))
+    await ai_service.classify_ticket(db, spender["context"], request())
+    await db.commit()
+
+    assert (await aggregate(db, spender))["calls"] == 1
+    assert (await aggregate(db, bystander))["calls"] == 0
 
 
 async def test_a_call_is_not_visible_to_another_tenants_ticket(

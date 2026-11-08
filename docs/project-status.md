@@ -18,6 +18,8 @@ Scheduler-driven SLA alerts are now verified end to end on the local production
 stack through Caddy, with naturally aging tickets and captured email.
 Live Groq generation is verified. The embedding credential is configured locally;
 live RAG is blocked by exhausted OpenAI API credits.
+Knowledge usage analytics is implemented and verified locally: organization totals include
+document embeddings and knowledge questions, with refreshes after committed usage.
 
 ## F18 scope
 
@@ -284,6 +286,38 @@ file is removed, generated knowledge documents are deleted, and the generated
 ticket is closed. The failed report remains in the gitignored
 `backend/.live-ai-rag-report.local`; the earlier generation pass remains valid.
 Credentials are excluded from reports and Git.
+
+## Knowledge usage analytics
+
+The organization overview now includes AI calls made without a ticket, including
+document ingestion and knowledge questions. Calls, failures, tokens, cost, and the
+operation breakdown use the existing ledger's tenant boundary. Agents' analytics
+remain scoped to their assigned tickets.
+
+Searches invalidate the Redis analytics cache after committing usage on successful
+answers, refusals after embedding a query, and provider failures. Document processing
+does the same on completion or failure, with a Redis client scoped to each worker
+invocation. The browser invalidates its analytics queries when a question settles
+or observed document processing finishes. The embedding operation is labeled
+**Knowledge indexing and search** to reflect both uses.
+
+The backend operator scripts now have an explicit package marker so the normal
+whole-project mypy command resolves shared checker imports consistently. Generated
+frontend API declarations reflect the updated usage scope documentation.
+
+Live embedding calls remain deferred until API credits are available. This work
+uses scripted test providers against the local test database and deterministic
+browser fixtures.
+
+Verification passed:
+
+- 174 backend cases across analytics caching, knowledge APIs, usage persistence,
+  ingestion, retrieval, draft grounding, and tenant/role isolation.
+- All 103 frontend component/service cases across 15 files.
+- All 20 production-bundle browser workflows, including four new knowledge
+  analytics checks for successful and failed questions and document processing.
+- Backend Ruff lint/format and strict mypy (145 source files); frontend lint,
+  TypeScript, and the realtime contract check.
 
 ## Next recommended step
 

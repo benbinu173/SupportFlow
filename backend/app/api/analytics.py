@@ -106,8 +106,9 @@ async def overview(
     that has made no calls, and §8's eleventh criterion is that analytics come from real
     aggregation queries and never hardcoded values. It is **cached**, unlike `/tickets`:
     it is an aggregate over a window, and the TTL is the trade `app/core/cache.py`
-    documents. `calls` counts only calls attributed to a ticket in the caller's row scope,
-    so a call made with no ticket is spend without a place on this screen.
+    documents. Organization totals include document embeddings and knowledge questions
+    made without a ticket. An assigned-work view counts only calls attributed to tickets
+    in the caller's row scope. Both are narrowed by the ledger's tenant predicate.
 
     An agent calling this gets their own totals; a manager calling it gets the
     organization's. Same route, same SQL, one row-scope predicate in between.

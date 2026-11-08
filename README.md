@@ -1126,6 +1126,18 @@ administrator or a manager the organization and an agent their assigned work —
 aggregate instead of a list, with no second scope map to disagree with the first. A customer
 holds neither analytics capability and is refused with `403` on all five.
 
+**Organization AI totals include work outside tickets.** Document ingestion and knowledge
+questions write tenant-scoped ledger rows without a `ticket_id`; administrators and managers
+see their calls, failed attempts, tokens, costs, and operation breakdown alongside ticket AI.
+Agents see usage attributed to their assigned tickets. Both views apply the ledger's
+`organization_id` boundary (ADR-034).
+
+Knowledge searches commit usage and invalidate analytics after successful answers, refusals
+following a query embedding, and provider failures. Ingestion workers do the same after
+completing or failing a document, using a Redis client owned by that task's event loop. The
+knowledge screen also refreshes the browser's cached analytics when a question settles or
+observed processing finishes, so returning to insights picks up the new totals.
+
 `/analytics/agents` is the exception and requires `ANALYTICS_ORG`, because comparing agents
 against each other is org-wide analytics (§3); an agent's own performance is what the other four
 routes already return for them. It is also the only route that pages (`limit`, `offset`, and a
@@ -2208,14 +2220,11 @@ than an application one — and it is the one grep-shaped gap in the row above.
   fills as analyses complete, because the worker writes `tickets.sentiment` — a ticket whose analysis
   has not run yet, or whose sentiment call failed, stays in the `null` bucket, which is what that
   bucket describes rather than a gap.
-- **AI spend read up to one TTL stale in Phase T; the worker closes that in Phase U.** An `ai_usage`
-  write does not itself bump the analytics version integer, and `ai_service` cannot invalidate from
-  where it sits — it stages rows and does not commit, and invalidating before the caller’s commit
-  lands is the race `ticket_service` comments about — so **whoever commits owns the invalidation**
-  (ADR-027). Since Phase U that caller is `run_analysis`, which invalidates the tenant’s cache after
-  its own commit, so the analytics block is current as of the last analysis. `ai_service` called by
-  something that staged a row and never committed would still leave it stale; no production path
-  does, and the worker is what makes that true rather than the service.
+- **AI usage invalidation belongs to the caller that commits it.** `ai_service` stages rows;
+  ticket analysis, summary cache hits, knowledge questions, and document ingestion commit and
+  then invalidate the tenant's analytics (ADR-027, ADR-034). Successful and failed attempts
+  follow the same rule. A Redis outage can still leave a cached total stale for its remaining
+  TTL; the committed ledger remains available for the next fresh aggregate.
 - **Retrieval is one vector query, one threshold, one prompt.** No hybrid search, no re-ranking, no
   query rewriting, and no answer cache — §22's flow and no more. `knowledge_chunks.embedding_model` is
   written so a model change can be re-embedded later, but nothing reads it yet, so changing

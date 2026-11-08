@@ -279,8 +279,9 @@ class AIUsageSummary(BaseModel):
     `cost_usd`, which is what zero was going to look like anyway; the count is the only
     evidence the row exists.
 
-    `calls` counts only calls attributed to a ticket in the caller's row scope, because
-    `ai_usage` has no `customer_id` to scope by — see `AnalyticsRepository.ai_usage`.
+    Organization totals include ticketless document embeddings and knowledge questions.
+    Assigned-work totals require a ticket in the caller's row scope. Both retain the
+    ledger's tenant boundary — see `AnalyticsRepository.ai_usage`.
     """
 
     calls: int

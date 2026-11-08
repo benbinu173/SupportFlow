@@ -25,6 +25,8 @@ model's indices into stored passages and drops the ones that name nothing.
 """
 
 import uuid
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -726,13 +728,32 @@ def test_a_question_is_bounded_at_both_ends(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("outcome", ["answer", "embedding_failure", "generation_failure"])
+@pytest.mark.parametrize(
+    "outcome", ["answer", "no_match", "embedding_failure", "generation_failure"]
+)
 def test_search_commits_usage_even_when_the_provider_fails(
     register_org: Any, monkeypatch: pytest.MonkeyPatch, sync_engine: Engine, outcome: str
 ) -> None:
-    """A separate connection must see the charged attempt after the HTTP response."""
+    """The committed attempt must reach the next read of an already cached overview."""
     org = register_org()
-    if outcome == "embedding_failure":
+    now = datetime.now(UTC)
+    params = {
+        "start": (now - timedelta(hours=1)).isoformat(),
+        "end": (now + timedelta(hours=1)).isoformat(),
+    }
+    before = org.get(f"{API}/analytics/overview", params=params)
+    assert before.status_code == 200, before.text
+    assert before.json()["ai_usage"]["calls"] == 0
+
+    if outcome == "no_match":
+        _pretend_something_is_published(monkeypatch)
+        monkeypatch.setattr(ai_service, "_embedding_provider", FakeEmbeddingProvider)
+
+        async def no_matches(*args: Any, **kwargs: Any) -> list[ChunkMatch]:
+            return []
+
+        monkeypatch.setattr(knowledge_service.knowledge_repository, "search_chunks", no_matches)
+    elif outcome == "embedding_failure":
         _pretend_something_is_published(monkeypatch)
         monkeypatch.setattr(ai_service, "_embedding_provider", lambda: _BrokenEmbeddings())
     else:
@@ -747,7 +768,10 @@ def test_search_commits_usage_even_when_the_provider_fails(
             )
 
     response = org.post(SEARCH, json={"question": "How long do refunds take?"})
-    assert response.status_code == (200 if outcome == "answer" else 503)
+    successful = outcome in {"answer", "no_match"}
+    assert response.status_code == (200 if successful else 503)
+    if outcome == "no_match":
+        assert response.json() == {"answer": NO_ANSWER, "sources": []}
     with sync_engine.connect() as connection:
         rows = (
             connection.execute(
@@ -762,12 +786,29 @@ def test_search_commits_usage_even_when_the_provider_fails(
         )
     assert len(rows) == 1
     row = rows[0]
-    assert row["operation"] == ("embed" if outcome == "embedding_failure" else "knowledge_answer")
-    assert row["was_successful"] == (outcome == "answer")
+    assert row["operation"] == (
+        "embed" if outcome in {"embedding_failure", "no_match"} else "knowledge_answer"
+    )
+    assert row["was_successful"] == successful
     if outcome == "answer":
         assert row["prompt_tokens"] > 0 and row["completion_tokens"] > 0 and row["cost_usd"] > 0
+    elif outcome == "no_match":
+        assert row["prompt_tokens"] > 0 and row["completion_tokens"] == 0
     else:
         assert row["prompt_tokens"] == row["completion_tokens"] == row["cost_usd"] == 0
+
+    after = org.get(f"{API}/analytics/overview", params=params)
+    assert after.status_code == 200, after.text
+    usage = after.json()["ai_usage"]
+    assert usage["calls"] == 1
+    assert usage["failed_calls"] == (0 if successful else 1)
+    assert usage["prompt_tokens"] == row["prompt_tokens"]
+    assert usage["completion_tokens"] == row["completion_tokens"]
+    assert Decimal(usage["cost_usd"]) == row["cost_usd"]
+    assert len(usage["by_operation"]) == 1
+    assert usage["by_operation"][0]["operation"] == row["operation"]
+    assert usage["by_operation"][0]["calls"] == 1
+    assert Decimal(usage["by_operation"][0]["cost_usd"]) == row["cost_usd"]
 
 
 # ---------------------------------------------------------------------------

@@ -50,11 +50,11 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import ColumnElement, and_, case, distinct, func, select
+from sqlalchemy import ColumnElement, and_, case, distinct, func, or_, select
 from sqlalchemy.orm import InstrumentedAttribute
 from sqlalchemy.sql import Select
 
-from app.core.permissions import TICKET_SCOPE_BY_ROLE
+from app.core.permissions import TICKET_SCOPE_BY_ROLE, RowScope
 from app.models.ai_usage import AIUsage
 from app.models.enums import Sentiment, TicketPriority, TicketStatus
 from app.models.sla_policy import SLAPolicy
@@ -371,14 +371,12 @@ class AnalyticsRepository(TenantScopedRepository[Ticket]):
         aggregation queries and never hardcoded values, and a query whose answer is zero is
         still a query.
 
-        **A row is counted only if it names a ticket in the caller's scope.** Row scope is
-        applied through the ticket, not on this table: `ai_usage` has no `customer_id` and
-        no `assigned_agent_id` — it is a ledger of calls, and a call's audience is the
-        ticket it was made for. So an agent's AI usage is the usage attributed to *their*
-        tickets, expressed as a subquery over `_scoped`, which keeps the scope rule in the
-        one place that owns it. Ingestion calls have no ticket and are therefore outside
-        every row-scoped view — for an agent, correctly so. `app/services/ai_service.py`
-        takes `ticket_id` as an optional argument for exactly this reason.
+        **Organization totals include calls made without a ticket.** Document ingestion
+        and knowledge questions are charged to `ai_usage.organization_id`, so their tokens,
+        failures, and costs belong in the organization's totals and operation breakdown.
+        Ticket-backed rows still require a ticket in the caller's scope. An agent therefore
+        sees only their assigned tickets; ticketless calls never widen that view. The scope
+        comes from `TICKET_SCOPE_BY_ROLE`, and the tenant predicate applies to both branches.
 
         `cost_usd` is `Numeric`, so a `SUM` comes back as a `Decimal` and is kept as one.
         Six decimal places of a fraction of a cent is exactly the quantity floating point
@@ -393,7 +391,9 @@ class AnalyticsRepository(TenantScopedRepository[Ticket]):
         """
         ticket_ids = self._scoped().with_only_columns(Ticket.id)
         window = [AIUsage.created_at >= start, AIUsage.created_at < end]
-        attributed = AIUsage.ticket_id.in_(ticket_ids)
+        attributed: ColumnElement[bool] = AIUsage.ticket_id.in_(ticket_ids)
+        if self.context.scope_for(TICKET_SCOPE_BY_ROLE) is RowScope.ORGANIZATION:
+            attributed = or_(attributed, AIUsage.ticket_id.is_(None))
 
         totals = select(
             func.count(),

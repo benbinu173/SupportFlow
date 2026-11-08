@@ -15,7 +15,7 @@ import {
   WarningCircle,
 } from '@phosphor-icons/react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { Link } from 'react-router-dom'
 
 import { Badge } from '@/components/ui/Badge'
@@ -27,6 +27,7 @@ import { Input } from '@/components/ui/Input'
 import { Skeleton } from '@/components/ui/Skeleton'
 import { Textarea } from '@/components/ui/Textarea'
 import { can, PERMISSIONS } from '@/features/auth/permissions'
+import { analyticsKeys } from '@/features/analytics/keys'
 import { knowledgeKeys } from '@/features/knowledge/keys'
 import { auditHistoryUrl } from '@/features/audit/keys'
 import { AppShell } from '@/layouts/AppShell'
@@ -154,6 +155,7 @@ export function KnowledgePage() {
   const [question, setQuestion] = useState('')
   const [answer, setAnswer] = useState<KnowledgeAnswer | null>(null)
   const [questionError, setQuestionError] = useState<string>()
+  const processingDocuments = useRef(new Set<string>())
 
   useEffect(() => {
     const timeout = window.setTimeout(() => {
@@ -170,6 +172,18 @@ export function KnowledgePage() {
     refetchInterval: (query) => query.state.data?.some((document) => document.status === 'pending' || document.status === 'processing') ? 5_000 : false,
   })
 
+  useEffect(() => {
+    let usageChanged = false
+    for (const document of documents.data ?? []) {
+      if (document.status === 'pending' || document.status === 'processing') {
+        processingDocuments.current.add(document.id)
+      } else if (processingDocuments.current.delete(document.id)) {
+        usageChanged = true
+      }
+    }
+    if (usageChanged) void queryClient.invalidateQueries({ queryKey: analyticsKeys.all })
+  }, [documents.data, queryClient])
+
   const createDocument = useMutation({
     mutationFn: async ({ title, kind, content, url, file }: { title: string; kind: SourceKind; content: string; url: string; file: File | null }) => {
       if (kind === 'upload') {
@@ -182,6 +196,8 @@ export function KnowledgePage() {
       return (await apiClient.post<KnowledgeDocument>('/knowledge', kind === 'url' ? { title, url } : { title, content })).data
     },
     onSuccess: async (document) => {
+      // Processing may finish before the first list refresh returns.
+      processingDocuments.current.add(document.id)
       await queryClient.invalidateQueries({ queryKey: knowledgeKeys.all })
       toast.success('Document added', `${document.title} is queued for processing.`)
       setCreateOpen(false)
@@ -205,6 +221,7 @@ export function KnowledgePage() {
     mutationFn: async (value: string) => (await apiClient.post<KnowledgeAnswer>('/knowledge/search', { question: value })).data,
     onSuccess: (result) => { setAnswer(result); setQuestionError(undefined) },
     onError: (error) => { setAnswer(null); setQuestionError(toApiError(error).message) },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: analyticsKeys.all }),
   })
 
   const submitDocument = (event: FormEvent<HTMLFormElement>) => {

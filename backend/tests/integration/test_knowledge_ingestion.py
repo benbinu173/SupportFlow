@@ -31,6 +31,8 @@ so the pipeline needs neither: the embedding provider is the scripted double and
 """
 
 from collections.abc import Callable, Sequence
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import text
@@ -46,7 +48,7 @@ from app.services import knowledge_service, url_fetch
 from app.services.document_text import CHUNK_TARGET_TOKENS
 from app.services.url_fetch import FetchedPage
 from app.workers import knowledge_tasks
-from tests.conftest import KNOWLEDGE, OrgSession
+from tests.conftest import API, KNOWLEDGE, OrgSession
 
 pytestmark = pytest.mark.integration
 
@@ -222,6 +224,50 @@ class RefusingEmbeddings(FakeEmbeddingProvider):
 # ---------------------------------------------------------------------------
 # The pipeline, end to end
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("outcome", ["completed", "failed"])
+def test_each_worker_run_refreshes_the_cached_ai_usage(
+    org: OrgSession,
+    queued_ingestions: Queued,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    """Two separate worker loops must each expose their committed spend without a TTL wait."""
+    provider = use_embeddings(
+        monkeypatch, RefusingEmbeddings() if outcome == "failed" else FakeEmbeddingProvider()
+    )
+    now = datetime.now(UTC)
+    params = {
+        "start": (now - timedelta(hours=1)).isoformat(),
+        "end": (now + timedelta(hours=1)).isoformat(),
+    }
+
+    before = org.get(f"{API}/analytics/overview", params=params)
+    assert before.status_code == 200, before.text
+    assert before.json()["ai_usage"]["calls"] == 0
+
+    for count in (1, 2):
+        create(org, content=paragraphs(1), title=f"Refund policy {count}")
+        assert ingest(queued_ingestions)["status"] == outcome
+
+        after = org.get(f"{API}/analytics/overview", params=params)
+        assert after.status_code == 200, after.text
+        usage = after.json()["ai_usage"]
+        assert usage["calls"] == provider.calls == count
+        assert usage["failed_calls"] == (count if outcome == "failed" else 0)
+        assert len(usage["by_operation"]) == 1
+        assert usage["by_operation"][0]["operation"] == "embed"
+        assert usage["by_operation"][0]["calls"] == count
+        if outcome == "completed":
+            assert usage["prompt_tokens"] > 0
+            assert Decimal(usage["cost_usd"]) > 0
+        else:
+            assert usage["prompt_tokens"] == 0
+            assert Decimal(usage["cost_usd"]) == 0
+
+        assert ingest(queued_ingestions)["status"] == "skipped"
+        assert provider.calls == count
 
 
 def test_a_manual_document_is_ingested_and_published(

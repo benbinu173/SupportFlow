@@ -7,6 +7,7 @@ type User = components['schemas']['UserRead']
 type Ticket = components['schemas']['TicketRead']
 type Message = components['schemas']['MessageRead']
 type TicketEvent = components['schemas']['TicketEventRead']
+type KnowledgeDocument = components['schemas']['KnowledgeDocumentRead']
 export type Role = User['role']
 
 export const now = '2026-11-04T00:00:00Z'
@@ -60,6 +61,9 @@ const emptySla: components['schemas']['AnalyticsSLA'] = {
   open_tickets: 0,
   risks: [],
 }
+const emptyTickets: components['schemas']['AnalyticsTickets'] = { range, by_priority: [], by_category: [] }
+const emptyAgents: components['schemas']['AnalyticsAgents'] = { range, agents: [], total: 0 }
+const emptySentiment: components['schemas']['AnalyticsSentiment'] = { range, buckets: [], analysed: 0, unanalysed: 0 }
 
 interface ApiRequest {
   role: Role
@@ -81,11 +85,14 @@ class WorkflowApi {
   messages: Message[] = []
   events: TicketEvent[] = []
   users: User[] = Object.values(accounts).map((user) => ({ ...user }))
+  overview = structuredClone(emptyOverview)
+  knowledgeDocuments: KnowledgeDocument[] = []
   requests: ApiRequest[] = []
   unexpectedRequests: string[] = []
   pageErrors: string[] = []
   socketAuthentications: Record<Role, number> = { admin: 0, manager: 0, agent: 0, customer: 0 }
   failNextReply = false
+  failNextKnowledgeAnswer = false
   readonly page: Page
 
   private sequence = 100
@@ -121,6 +128,35 @@ class WorkflowApi {
       id: this.nextId(), event_type, actor_user_id: accounts[role].id,
       from_value: from, to_value: to, extra_data: {}, created_at: now,
     })
+  }
+
+  private recordKnowledgeUsage(operation: 'embed' | 'knowledge_answer', successful: boolean): void {
+    const usage = this.overview.ai_usage
+    const cost = successful ? 0.0032 : 0
+    usage.calls += 1
+    usage.failed_calls += successful ? 0 : 1
+    usage.prompt_tokens += successful ? 1200 : 0
+    usage.completion_tokens += successful && operation === 'knowledge_answer' ? 80 : 0
+    usage.cost_usd = (Number(usage.cost_usd) + cost).toFixed(6)
+    const entry = usage.by_operation.find((row) => row.operation === operation)
+    if (entry) {
+      entry.calls += 1
+      entry.cost_usd = (Number(entry.cost_usd) + cost).toFixed(6)
+    } else {
+      usage.by_operation.push({ operation, calls: 1, cost_usd: cost.toFixed(6) })
+    }
+  }
+
+  finishIngestion(documentId: string, outcome: 'completed' | 'failed'): void {
+    const document = this.knowledgeDocuments.find((item) => item.id === documentId)
+    expect(document).toBeDefined()
+    if (!document) throw new Error('The source must be created before it is processed.')
+    document.status = outcome
+    document.is_published = outcome === 'completed'
+    document.chunk_count = outcome === 'completed' ? 1 : 0
+    document.processed_at = outcome === 'completed' ? now : null
+    document.error_message = outcome === 'failed' ? 'The AI service is temporarily unavailable.' : null
+    this.recordKnowledgeUsage('embed', outcome === 'completed')
   }
 
   async install(role: Role, restored = true): Promise<void> {
@@ -171,8 +207,40 @@ class WorkflowApi {
         return route.fulfill({ status: 204 })
       }
       if (path === '/notifications/unread-count' && method === 'GET') return reply({ unread: 0 })
-      if (path === '/analytics/overview' && method === 'GET') return reply(emptyOverview)
+      if (path === '/analytics/overview' && method === 'GET') return reply(this.overview)
       if (path === '/analytics/sla' && method === 'GET') return reply(emptySla)
+      if (path === '/analytics/tickets' && method === 'GET') return reply(emptyTickets)
+      if (path === '/analytics/agents' && method === 'GET' && (role === 'admin' || role === 'manager')) return reply(emptyAgents)
+      if (path === '/analytics/sentiment' && method === 'GET') return reply(emptySentiment)
+      if (path === '/knowledge' && method === 'GET' && role !== 'customer') {
+        const query = url.searchParams.get('q')?.toLowerCase()
+        return reply(this.knowledgeDocuments.filter((document) => !query || document.title.toLowerCase().includes(query)))
+      }
+      if (path === '/knowledge' && method === 'POST' && role === 'admin') {
+        const payload = body as components['schemas']['KnowledgeDocumentCreate']
+        const document: KnowledgeDocument = {
+          id: this.nextId(), title: payload.title, source_type: payload.url ? 'url' : 'manual',
+          status: 'pending', is_published: false, chunk_count: 0, error_message: null,
+          created_by_id: accounts[role].id, created_at: now, updated_at: now, processed_at: null,
+        }
+        this.knowledgeDocuments.unshift(document)
+        return reply(document, 201)
+      }
+      if (path === '/knowledge/search' && method === 'POST' && role !== 'customer') {
+        const successful = !this.failNextKnowledgeAnswer
+        this.failNextKnowledgeAnswer = false
+        this.recordKnowledgeUsage('knowledge_answer', successful)
+        if (!successful) return reply({ error: { code: 'AI_SERVICE_ERROR', message: 'The AI service is temporarily unavailable.' } }, 503)
+        const document = this.knowledgeDocuments.find((item) => item.is_published)
+        const answer: components['schemas']['KnowledgeAnswerRead'] = {
+          answer: 'Refunds take five working days.',
+          sources: document ? [{
+            document_id: document.id, document_title: document.title, chunk_index: 0,
+            excerpt: 'Refunds take five working days.', similarity: 0.9,
+          }] : [],
+        }
+        return reply(answer)
+      }
       if (path === '/notifications' && method === 'GET') return reply([])
       if (path === '/audit-logs' && method === 'GET' && role === 'admin') return reply([])
       if (path === '/users' && method === 'GET' && (role === 'admin' || role === 'manager')) return reply(this.users)

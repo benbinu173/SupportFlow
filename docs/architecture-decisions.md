@@ -4330,4 +4330,29 @@ terminal in fact, and only because there is now a queue, a task, and a beat entr
 notice when it would have been. That is a cost paid every deployment, forever, to make a rare failure
 recoverable — recorded here as a deliberate trade rather than presented as a free fix.
 
+## ADR-034 — Organization AI analytics include knowledge usage
+
+**Status:** Accepted, 2026-11-08.
+
+**Context.** The ledger records document embeddings and knowledge questions with an
+organization but no ticket. Requiring a ticket for every analytics row excluded those
+attempts from organization totals. Knowledge callers also committed usage without
+invalidating cached analytics.
+
+**Decision.** Organization scope includes ticketless ledger rows as well as rows
+attributed to visible tickets. Assigned-work scope requires a visible assigned ticket.
+Both totals and the operation breakdown retain the ledger's `organization_id` predicate,
+derived from `TenantContext`, and use `TICKET_SCOPE_BY_ROLE` to choose the scope.
+
+Knowledge requests commit and invalidate analytics after successful and failed provider
+attempts, including query embeddings that find no matching passage. Ingestion workers
+invalidate after the terminal document commit using a Redis client scoped to the task's
+event loop. The browser invalidates cached analytics when a question settles or an
+observed processing document finishes.
+
+**Consequences.** Organization usage includes document indexing and semantic search;
+agents' metrics describe assigned tickets. Existing response fields and ledger indexes
+serve both scopes. Invalidation still fails open during a Redis outage, so the ledger is
+durable while cached totals can remain stale until their TTL expires.
+
 
