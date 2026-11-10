@@ -42,13 +42,18 @@ from fastapi import WebSocket
 from pydantic import ValidationError
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
+from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.config import get_settings
 from app.core.redis import get_client
 from app.core.tenancy import TenantContext
+from app.models.enums import OrganizationStatus
 from app.models.notification import Notification
+from app.models.organization import Organization
 from app.models.ticket import Ticket
 from app.models.ticket_event import TicketEvent
+from app.models.user import User
 from app.websocket.events import (
     ORG_CHANNEL_PATTERN,
     CloseCode,
@@ -134,7 +139,11 @@ class Connection:
         send timeout fires. Emptying the queue is what makes the marker the next thing the
         writer sees.
         """
-        self.close_code = CloseCode.SLOW_CONSUMER
+        self.request_close(CloseCode.SLOW_CONSUMER)
+
+    def request_close(self, code: CloseCode) -> None:
+        """Wake the sole writer to close, discarding any queued private content."""
+        self.close_code = code
         while True:
             try:
                 self._queue.get_nowait()
@@ -156,7 +165,7 @@ class Connection:
         while True:
             envelope = await self._queue.get()
             if envelope is _CLOSE:
-                await self._close(CloseCode.SLOW_CONSUMER)
+                await self._close(self.close_code or CloseCode.SLOW_CONSUMER)
                 return
             try:
                 await asyncio.wait_for(
@@ -249,6 +258,16 @@ class ConnectionManager:
             if connection.offer(envelope):
                 delivered += 1
         return delivered
+
+    def revoke_user(
+        self, organization_id: uuid.UUID, user_id: uuid.UUID, token_version: int
+    ) -> None:
+        for connection in tuple(self._by_organization.get(organization_id, ())):
+            if (
+                connection.context.user_id == user_id
+                and connection.context.token_version < token_version
+            ):
+                connection.request_close(CloseCode.UNAUTHENTICATED)
 
     @property
     def total(self) -> int:
@@ -518,6 +537,33 @@ def _text(value: bytes | str) -> str:
     return value.decode() if isinstance(value, bytes) else value
 
 
+async def _watch_credentials(connection: Connection) -> None:
+    # Separate short sessions avoid caching the user row read during authentication.
+    # This works independently of Redis, including when a revocation happened elsewhere.
+    from app.core.database import SessionFactory
+
+    while True:
+        await asyncio.sleep(get_settings().WS_SESSION_CHECK_INTERVAL_SECONDS)
+        try:
+            async with asyncio.timeout(5), SessionFactory() as session:
+                version = await session.scalar(
+                    select(User.token_version)
+                    .join(Organization, Organization.id == User.organization_id)
+                    .where(
+                        User.id == connection.context.user_id,
+                        User.organization_id == connection.organization_id,
+                        User.is_active.is_(True),
+                        Organization.status == OrganizationStatus.ACTIVE,
+                    )
+                )
+        except (SQLAlchemyError, TimeoutError):
+            connection.request_close(CloseCode.SLOW_CONSUMER)
+            return
+        if version != connection.context.token_version:
+            connection.request_close(CloseCode.UNAUTHENTICATED)
+            return
+
+
 async def serve(websocket: WebSocket, context: TenantContext) -> None:
     """Run a connection's whole life: register, pump both directions, unregister.
 
@@ -541,6 +587,7 @@ async def serve(websocket: WebSocket, context: TenantContext) -> None:
     )
 
     writer = asyncio.create_task(connection.writer(), name="realtime-writer")
+    watcher = asyncio.create_task(_watch_credentials(connection), name="realtime-credentials")
     try:
         # `RuntimeError` is suppressed rather than handled: Starlette raises it when `receive`
         # is called on a socket already recorded as disconnected — reachable when the writer
@@ -550,8 +597,11 @@ async def serve(websocket: WebSocket, context: TenantContext) -> None:
             await connection.reader()
     finally:
         writer.cancel()
+        watcher.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await writer
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
         manager.unregister(connection)
         logger.info(
             "realtime_disconnected",

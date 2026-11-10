@@ -1,7 +1,9 @@
 """Verify live generation and RAG through the local production stack, then restore it.
 
 Run from backend: .venv/Scripts/python.exe -m scripts.live_ai_check
-Use --generation-only while awaiting the embedding credential. Keys are read from the
+Use --generation-only while awaiting embedding access, or --preflight-only to check it
+without Docker or a generation key. Full runs check embedding access before deployment.
+Keys are read from the
 gitignored .env.production or .env, never arguments or terminal output. A temporary,
 gitignored production env file enables providers only for this run. Test accounts and
 AI spend history remain; generated tickets are closed and knowledge documents deleted.
@@ -11,6 +13,7 @@ AI spend history remain; generated tickets are closed and knowledge documents de
 
 import argparse
 import json
+import math
 import ssl
 import sys
 import time
@@ -22,6 +25,10 @@ from typing import Any, cast
 
 import httpx
 from dotenv import dotenv_values, set_key
+from pydantic import ValidationError
+
+from app.models.knowledge_chunk import EMBEDDING_DIMENSIONS
+from app.schemas.knowledge import Embedding
 from scripts.phase_x_walkthrough import (
     ANSWERED_QUESTION,
     MARKDOWN,
@@ -37,6 +44,20 @@ ROOT = Path(__file__).resolve().parents[2]
 DOMAIN = "live-ai.supportflow.example.com"
 COMPOSE = ("compose", "--env-file", ".env.production", "-f", "docker-compose.prod.yml")
 TEMP_ENV = ROOT / ".env.ai-checks.local"
+
+# Provider messages may contain credentials or submitted text. Only known codes and our
+# own explanations reach the console or report.
+EMBEDDING_ERROR_REASONS = {
+    "insufficient_quota": "Add OpenAI API credits before retrying live RAG verification",
+    "credit_balance_exhausted": "Add OpenAI API credits before retrying live RAG verification",
+    "organization_spend_limit_exceeded": "Review the OpenAI organization spend limit",
+    "project_spend_limit_exceeded": "Review the OpenAI project spend limit",
+    "organization_usage_limit_exceeded": "Review the OpenAI organization usage limit",
+    "invalid_api_key": "The embedding provider rejected the configured API key",
+    "model_not_found": "The configured embedding model is unavailable",
+    "rate_limit_exceeded": "The embedding provider rate-limited the request; retry later",
+    "slow_down": "The embedding provider rate-limited the request; retry later",
+}
 
 WITNESS = """
 import json, sys, uuid
@@ -82,13 +103,15 @@ def witness(owner: Account, since: str) -> dict[str, Any]:
     )
 
 
-def credentials(generation_only: bool) -> dict[str, str]:
+def credentials(generation_only: bool, *, embedding_only: bool = False) -> dict[str, str]:
     sources = [dotenv_values(ROOT / filename) for filename in (".env.production", ".env")]
     values: dict[str, str] = {}
     for prefix, default_provider, default_model in (
         ("AI", "anthropic", "claude-sonnet-5"),
         ("EMBEDDING", "openai", "text-embedding-3-small"),
     ):
+        if embedding_only and prefix == "AI":
+            continue
         source = next((row for row in sources if row.get(f"{prefix}_API_KEY")), None)
         if source is None:
             if prefix == "EMBEDDING" and generation_only:
@@ -104,6 +127,85 @@ def credentials(generation_only: bool) -> dict[str, str]:
         if values[f"{prefix}_PROVIDER"] == "fake":
             raise RuntimeError("Live verification requires real providers")
     return values
+
+
+def embedding_preflight(values: dict[str, str]) -> dict[str, Any]:
+    """One short embedding request, with no retries, database writes, or raw responses.
+
+    Match the application's request and vector width. Explicitly reducing dimensions here
+    would conceal a model whose default output cannot fit the production pgvector column.
+    This direct operator probe spends provider quota outside the application's usage ledger.
+    """
+    result: dict[str, Any] = {
+        "checked_at": datetime.now(UTC).isoformat(),
+        "provider": values["EMBEDDING_PROVIDER"],
+        "model": values["EMBEDDING_MODEL"],
+        "available": False,
+        "http_status": None,
+        "error_code": None,
+        "embedding_dimensions": 0,
+        "prompt_tokens": 0,
+        "reason": "The embedding provider returned an invalid response",
+    }
+    if values["EMBEDDING_PROVIDER"] != "openai":
+        result["reason"] = "Embedding preflight requires EMBEDDING_PROVIDER=openai"
+        return result
+    try:
+        with httpx.Client(timeout=25) as client:
+            response = client.post(
+                "https://api.openai.com/v1/embeddings",
+                headers={"Authorization": f"Bearer {values['EMBEDDING_API_KEY']}"},
+                json={
+                    "model": values["EMBEDDING_MODEL"],
+                    "input": ["SupportFlow embedding access check"],
+                },
+            )
+    except httpx.TimeoutException:
+        result["reason"] = "The embedding provider timed out; retry later"
+        return result
+    except httpx.HTTPError:
+        result["reason"] = "The embedding provider could not be reached; retry later"
+        return result
+    result["http_status"] = response.status_code
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+    if not response.is_success:
+        error = payload.get("error") if isinstance(payload, dict) else None
+        code = error.get("code") if isinstance(error, dict) else None
+        if isinstance(code, str) and code in EMBEDDING_ERROR_REASONS:
+            result["error_code"] = code
+            result["reason"] = EMBEDDING_ERROR_REASONS[code]
+        else:
+            result["reason"] = f"The embedding provider returned HTTP {response.status_code}"
+        return result
+    if not isinstance(payload, dict):
+        return result
+    usage = payload.get("usage")
+    tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+    if isinstance(tokens, int) and not isinstance(tokens, bool) and tokens >= 0:
+        result["prompt_tokens"] = tokens
+    data = payload.get("data")
+    if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
+        return result
+    if data[0].get("index") != 0:
+        return result
+    vector = data[0].get("embedding")
+    if not isinstance(vector, list):
+        return result
+    result["embedding_dimensions"] = len(vector)
+    try:
+        embedding = Embedding.model_validate({"vectors": [vector]})
+    except ValidationError:
+        return result
+    if not all(math.isfinite(value) for value in embedding.vectors[0]):
+        return result
+    result["available"] = True
+    result["reason"] = (
+        f"The embedding provider returned a valid {EMBEDDING_DIMENSIONS}-dimension vector"
+    )
+    return result
 
 
 def wait_ready(context: ssl.SSLContext) -> None:
@@ -613,9 +715,17 @@ def rag_checks(
     )
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--generation-only", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--generation-only", action="store_true", help="Skip embedding preflight and RAG"
+    )
+    mode.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Check embedding access without starting Docker",
+    )
     args = parser.parse_args()
     e = Evidence()
     e.details["started_at"] = datetime.now(UTC).isoformat()
@@ -625,14 +735,29 @@ def main() -> None:
         / (
             ".live-ai-generation-report.local"
             if args.generation_only
-            else ".live-ai-rag-report.local"
+            else ".embedding-preflight-report.local"
         )
     )
     prepared = False
     try:
-        values = credentials(args.generation_only)
-        if TEMP_ENV.exists():
+        values = credentials(args.generation_only, embedding_only=args.preflight_only)
+        if not args.preflight_only and TEMP_ENV.exists():
             raise RuntimeError("Temporary AI environment file already exists; inspect before reuse")
+        if not args.generation_only:
+            print("Checking embedding access with one short provider request", flush=True)
+            preflight = embedding_preflight(values)
+            e.details["scope"] = "embedding_preflight"
+            e.details["embedding_preflight"] = preflight
+            e.check("embedding provider access and vector width verified", preflight["available"])
+            print(preflight["reason"], flush=True)
+            if not preflight["available"]:
+                return 1
+            if args.preflight_only:
+                return 0
+            # A prerequisite failure must not overwrite the earlier full-run evidence.
+            report = ROOT / "backend" / ".live-ai-rag-report.local"
+        # A stopped daemon must fail before a secret override file needs restoration.
+        docker("info", "--format", "{{.ServerVersion}}")
         # Complete settings from the existing production file, with only AI fields replaced.
         with TEMP_ENV.open("x", encoding="utf-8") as stream:
             stream.write((ROOT / ".env.production").read_text(encoding="utf-8"))
@@ -706,8 +831,8 @@ def main() -> None:
             f"{e.details['passed']} passed, {e.details['failed']} failed. Report: {report}",
             flush=True,
         )
-    sys.exit(1 if e.details["failed"] else 0)
+    return 1 if e.details["failed"] else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

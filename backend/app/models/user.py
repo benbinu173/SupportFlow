@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, ForeignKey, String, UniqueConstraint, text
+from sqlalchemy import DateTime, ForeignKey, Integer, String, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -44,6 +44,10 @@ class User(UUIDPrimaryKeyMixin, OrganizationScopedMixin, TimestampMixin, Base):
 
     # Argon2id (ADR-001). Never exposed through any API response.
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    # A reset advances this version, invalidating access tokens and outstanding reset links.
+    token_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
 
     role: Mapped[UserRole] = mapped_column(
         USER_ROLE_ENUM,

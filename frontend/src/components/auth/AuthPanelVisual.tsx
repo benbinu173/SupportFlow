@@ -87,10 +87,13 @@ export function AuthPanelCards({
   cards,
   x,
   y,
+  overlap = true,
 }: {
   cards: readonly PanelCard[]
   x: MotionValue<number>
   y: MotionValue<number>
+  /** Prose cards can use separate space so their text remains readable. */
+  overlap?: boolean
 }) {
   const nearX = useTransform(x, (value) => value * 1.7)
   const nearY = useTransform(y, (value) => value * 1.7)
@@ -107,7 +110,7 @@ export function AuthPanelCards({
           <motion.div
             key={card.eyebrow}
             style={{ x: behind ? x : nearX, y: behind ? y : nearY }}
-            className={behind ? 'w-[88%]' : 'ml-auto -mt-8 w-[94%]'}
+            className={behind ? 'w-[88%]' : `ml-auto w-[94%] ${overlap ? '-mt-8' : 'mt-3'}`}
           >
             <div
               className="animate-enter"

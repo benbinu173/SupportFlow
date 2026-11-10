@@ -36,6 +36,7 @@ export const ERROR_CODES = {
   AUTHENTICATION_REQUIRED: 'AUTHENTICATION_REQUIRED',
   /** Bad email or password. Distinct from the above so login can say so. */
   INVALID_CREDENTIALS: 'INVALID_CREDENTIALS',
+  INVALID_RESET_TOKEN: 'INVALID_RESET_TOKEN',
   /** Valid identity, insufficient rights — or a deactivated account. */
   FORBIDDEN: 'FORBIDDEN',
   VALIDATION_ERROR: 'VALIDATION_ERROR',

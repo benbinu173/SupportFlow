@@ -43,9 +43,12 @@ from app.core.rate_limit import (
     RateLimiter,
     ai_rate_limit_key,
     login_rate_limit_key,
+    password_reset_email_rate_limit_key,
+    password_reset_rate_limit_key,
     register_rate_limit_key,
     upload_rate_limit_key,
 )
+from app.schemas.auth import ForgotPasswordRequest
 
 # One limiter for the process. It borrows the shared Redis client on first use, so there
 # is one client and one pool regardless of how many guards exist.
@@ -69,6 +72,28 @@ async def limit_register(request: Request) -> None:
         register_rate_limit_key(client_ip(request)),
         limit=settings.RATE_LIMIT_REGISTER_PER_HOUR,
         window_seconds=3600,
+    )
+
+
+async def limit_password_reset_request(request: Request, payload: ForgotPasswordRequest) -> None:
+    settings = get_settings()
+    await _limiter.enforce(
+        password_reset_rate_limit_key(client_ip(request)),
+        limit=settings.RATE_LIMIT_PASSWORD_RESET_PER_HOUR,
+        window_seconds=3600,
+    )
+    await _limiter.enforce(
+        password_reset_email_rate_limit_key(payload.email),
+        limit=settings.RATE_LIMIT_PASSWORD_RESET_EMAIL_PER_HOUR,
+        window_seconds=3600,
+    )
+
+
+async def limit_password_reset_confirm(request: Request) -> None:
+    await _limiter.enforce(
+        password_reset_rate_limit_key(client_ip(request), confirmation=True),
+        limit=get_settings().RATE_LIMIT_PASSWORD_RESET_CONFIRM_PER_MINUTE,
+        window_seconds=60,
     )
 
 

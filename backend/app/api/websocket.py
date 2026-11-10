@@ -156,6 +156,10 @@ async def realtime_socket(
     if context is None:
         return
 
+    # Authentication is read-only. Release its pooled connection before the long-lived
+    # socket starts; version checks use their own short database sessions.
+    await db.rollback()
+
     # The client's cue that it may start trusting the socket. Sent before registration so a
     # client cannot act on an acknowledgement for a connection the server has not yet
     # finished setting up.

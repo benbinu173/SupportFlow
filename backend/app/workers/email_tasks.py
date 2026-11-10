@@ -46,10 +46,66 @@ from sqlalchemy.pool import NullPool
 from app.core import event_loop
 from app.core.config import get_settings
 from app.core.mail import PermanentEmailError, TransientEmailError, send_email
+from app.core.security import create_password_reset_token
+from app.models.enums import OrganizationStatus
 from app.models.notification import Notification
+from app.models.user import User
 from app.workers.celery_app import celery_app
 
 logger = structlog.get_logger(__name__)
+
+
+@celery_app.task(  # type: ignore[untyped-decorator]
+    name="app.workers.email_tasks.send_password_reset_email",
+    autoretry_for=(TransientEmailError,),
+    retry_backoff=60,
+    retry_jitter=True,
+    max_retries=5,
+)
+def send_password_reset_email(user_id: str, token_version: int, expires_at: float) -> str:
+    return event_loop.run(_deliver_password_reset(uuid.UUID(user_id), token_version, expires_at))
+
+
+async def _deliver_password_reset(user_id: uuid.UUID, token_version: int, expiry: float) -> str:
+    expires_at = datetime.fromtimestamp(expiry, UTC)
+    if expires_at <= datetime.now(UTC):
+        return "expired"
+    async with _SessionFactory() as session:
+        result = await session.execute(
+            select(User).where(User.id == user_id).options(joinedload(User.organization))
+        )
+        user = result.scalar_one_or_none()
+        if (
+            user is None
+            or not user.is_active
+            or user.token_version != token_version
+            or user.organization.status != OrganizationStatus.ACTIVE
+        ):
+            return "no-recipient"
+        token = create_password_reset_token(
+            user.id, user.organization_id, token_version, expires_at=expires_at
+        )
+        settings = get_settings()
+        # A fragment is not transmitted to the frontend server or in HTTP referrers.
+        link = f"{str(settings.PUBLIC_APP_URL).rstrip('/')}/reset-password#token={token}"
+        send_email(
+            to=user.email,
+            subject=f"[{settings.PROJECT_NAME}] Reset your password — {user.organization.name}",
+            body=(
+                f"A password reset was requested for your {user.organization.name} workspace.\n\n"
+                f"Set a new password:\n{link}\n\n"
+                f"This link expires {expires_at:%d %b %Y at %H:%M UTC} and can be used once.\n"
+                "If you did not request this, you can ignore this email. "
+                "Your password is unchanged."
+            ),
+        )
+        logger.info(
+            "password_reset_email_delivered",
+            user_id=str(user.id),
+            organization_id=str(user.organization_id),
+        )
+        return "delivered"
+
 
 _settings = get_settings()
 

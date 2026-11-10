@@ -236,7 +236,7 @@ describe('route table', () => {
     ).toBeVisible()
   })
 
-  it('mounts every route the tests above cover, and no others', () => {
+  it('mounts every covered public and protected route, and no others', () => {
     // The inventory is the guard. A route added without a case here fails this
     // test, which is the point: a growing route table beside a one-line test
     // file is how a guard gets skipped. The paths are asserted rather than the
@@ -245,6 +245,7 @@ describe('route table', () => {
     // `/dev/kit` and `/dev/health` are present because `import.meta.env.DEV` is
     // true under Vitest; the production build drops both, along with the pages
     // behind them.
+    // PasswordRecovery.test.tsx covers the two public recovery flows.
     const rootRoute = router.routes[0]
     const paths = leafPaths(rootRoute?.children ?? [])
 
@@ -252,6 +253,8 @@ describe('route table', () => {
       '/',
       '/login',
       '/register',
+      '/forgot-password',
+      '/reset-password',
       '/dashboard',
       '/analytics',
       '/sla',

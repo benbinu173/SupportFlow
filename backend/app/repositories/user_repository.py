@@ -90,12 +90,13 @@ class UserRepository(TenantScopedRepository[User]):
         return result.scalars().all()
 
 
-async def find_users_by_email_across_tenants(session: AsyncSession, email: str) -> Sequence[User]:
+async def find_users_by_email_across_tenants(
+    session: AsyncSession, email: str, *, for_update: bool = False
+) -> Sequence[User]:
     """Every user with this email, in any organization. **Login only.**
 
-    This is the one query in the application that reads users without a tenant
-    filter, and it exists because login has no tenant to filter by — the credentials
-    are the only thing the client sends.
+    Login has no tenant to filter by: the credentials are the only thing the client
+    sends. Password recovery has its own active-account lookup before authentication.
 
     Why a list rather than a single row: `users` is unique on
     `(organization_id, email)`, not on `email` alone, because the same real person may
@@ -108,7 +109,10 @@ async def find_users_by_email_across_tenants(session: AsyncSession, email: str) 
     address is not a case worth serving, and an unbounded result would mean an
     unbounded number of Argon2 derivations per login attempt.
     """
-    result = await session.execute(
-        select(User).where(User.email == email).order_by(User.created_at).limit(5)
-    )
+    statement = select(User).where(User.email == email).order_by(User.created_at, User.id).limit(5)
+    if for_update:
+        # Serialize password verification/rehashing with recovery, so a concurrent login
+        # cannot overwrite the newly reset hash with an upgraded hash of the old password.
+        statement = statement.with_for_update()
+    result = await session.execute(statement)
     return result.scalars().all()

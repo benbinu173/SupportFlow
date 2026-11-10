@@ -4355,4 +4355,59 @@ agents' metrics describe assigned tickets. Existing response fields and ledger i
 serve both scopes. Invalidation still fails open during a Redis outage, so the ledger is
 durable while cached totals can remain stale until their TTL expires.
 
+## ADR-035 — Password recovery uses account versions and workspace-specific email links
+
+**Status:** Accepted, 2026-11-10.
+
+**Context.** Recovery must work before a tenant is authenticated. Email addresses are
+unique within an organization, so the same address can own several workspace accounts.
+A reset must end old access and refresh sessions, consume concurrent links once, and
+avoid putting a usable recovery credential in the broker or application logs.
+
+**Decision.** Public requests always return the same confirmation. Up to five active
+accounts with that email in active organizations receive individual workspace-named
+emails. Requests are limited by client address and a hash of the normalized email;
+confirmation attempts have their own address limit. Queue failures log only identifiers
+and error types and preserve the public response.
+
+The email task receives the account ID, current credential version, and original expiry.
+After rechecking the account, it signs a short-lived JWT with a key derived from the
+access-token secret for the `supportflow:password-reset` audience. Only the worker creates
+the usable link. `PUBLIC_APP_URL` supplies a validated origin. The email puts the token in
+a URL fragment, which the recovery page removes and retains only in component memory.
+
+Reset holds the user row lock while hashing the replacement password, incrementing
+`User.token_version`, revoking refresh rows, and recording the audit entry in one
+transaction. The version consumes all links issued for that account version and lets
+only one concurrent reset succeed. Access authentication checks it against the database;
+refresh rows also retain it, so a rotation racing reset cannot restore an old session.
+Refresh reuse revokes only the presented password version. Old-device retries and
+pre-reset cookies cannot end a session started with the replacement password, including
+when reset advances the version while reuse detection is in progress.
+Login locks its candidate user rows before verification and optional rehashing, preventing
+an old-password rehash from overwriting a concurrent reset.
+
+Local WebSockets enqueue an unauthenticated close after commit. Each other connection
+checks current account version and active status in a fresh short database session every
+30 seconds by default, independently of Redis. The sole writer sends the close and
+discards queued private content. The handshake releases its read-only transaction before
+the long-lived connection starts. The browser ends its session and clears private query
+data after a successful reset, then requires a fresh sign-in.
+
+**Consequences.** The migration adds version columns to users and refresh tokens, both
+defaulting to zero, plus a `password_reset` audit action. Existing access tokens without
+a version are treated as version zero until the account resets. Recovery links cannot
+authenticate as access tokens. A reset invalidates sibling links; requesting another
+link alone preserves existing sessions and links. Refreshing the recovery page loses
+its in-memory token, so the user must open the email link again. SMTP delivery still
+depends on the notifications worker and the configured mail provider. Cross-instance
+socket revocation can take the polling interval plus up to five seconds for the query;
+HTTP revocation is checked on the next request.
+
+Recovery security/API tests exercise expiry, replay, tenant selection, disabled accounts,
+queue failures, concurrent resets, session revocation, and worker link generation. The
+live browser check follows a real Mailpit email, verifies old sessions and a reused link
+are refused, and signs in with the new password. It disables credential-bearing traces
+and retains a sanitized verification record.
+
 

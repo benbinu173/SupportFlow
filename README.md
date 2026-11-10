@@ -230,17 +230,19 @@ Notes:
 ## Authentication
 
 Email and password, with Argon2id hashing (ADR-001) and short-lived JWT access tokens
-(ADR-002). Five endpoints, all under `/api/v1/auth`:
+(ADR-002). Seven endpoints, all under `/api/v1/auth`:
 
 | Endpoint | Auth | Purpose |
 |---|---|---|
 | `POST /register` | public | Creates an organization **and** its first administrator |
 | `POST /login` | public | Returns an access token; sets the refresh cookie |
+| `POST /forgot-password` | public | Accepts an email and queues workspace-specific recovery links |
+| `POST /reset-password` | reset link | Changes the password and ends the account's previous sessions |
 | `POST /refresh` | cookie | Rotates the refresh token; returns a new access token |
 | `POST /logout` | access token + cookie | Revokes the presented refresh token and clears the cookie |
 | `GET /me` | access token | The caller's own profile |
 
-**Access tokens** are HS256 JWTs carrying `sub`, `org`, `role`, and `exp`, valid for
+**Access tokens** are HS256 JWTs carrying `sub`, `org`, `role`, `ver`, and `exp`, valid for
 `ACCESS_TOKEN_EXPIRE_MINUTES` (default 15) and returned in the response body for the
 client to hold in memory.
 
@@ -251,11 +253,38 @@ returned in a response body. That cookie attribute is also the CSRF control — 
 cross-site POST does not carry it (ADR-014).
 
 Refreshing **rotates**: the presented token is revoked and a new one issued. Presenting
-an already-used token is treated as theft and **revokes every live session for that
-user** — not merely the token's own chain. A replayed token proves the theft but not
+an already-used token from the current password version is treated as theft and
+**revokes every live session issued under that version**. A replayed token proves the theft but not
 which holder is the thief, so the safe reading is "one of this user's sessions is
 compromised, and we do not know which". Every other device has to sign in again, which
 is a small cost against an attacker keeping a working session.
+Cookies from an earlier password version are refused without revoking sessions started
+with the replacement password.
+
+**Password recovery** starts at `/forgot-password`, linked from sign-in. Requests return
+the same `202` confirmation for known, unknown, and disabled accounts, including when
+the email queue is unavailable. Up to five active accounts matching an email across
+active organizations receive separate emails naming their workspace.
+
+Set `PUBLIC_APP_URL` to the frontend's public origin in the API and worker environment:
+`http://localhost:5173` for normal development, or the actual HTTPS origin for deployment.
+Paths, credentials, queries, and fragments are refused; plain HTTP is limited to loopback.
+The existing `notifications` worker delivers through SMTP (Mailpit in development).
+Links expire after `PASSWORD_RESET_EXPIRE_MINUTES`, default 30, measured from the request.
+
+The email opens `/reset-password#token=...`. The browser removes the fragment from the
+address and holds it only in component memory, then accepts a matching password and
+confirmation under the shared 12–128 character policy. Refreshing that screen requires
+opening the email link again. A successful reset invalidates every outstanding link for
+that account, revokes refresh tokens, and advances the version checked by access tokens.
+Expired, used, or invalid links return `400 INVALID_RESET_TOKEN` and offer a new request.
+
+Existing HTTP sessions fail on their next authenticated request. The local API requests
+WebSocket closure immediately; other connections check account state every
+`WS_SESSION_CHECK_INTERVAL_SECONDS` (default 30), with a five-second database timeout.
+The resetting browser ends its session and clears private cached data. Sign in with the
+new password to continue. [ADR-035](docs/architecture-decisions.md#adr-035--password-recovery-uses-account-versions-and-workspace-specific-email-links)
+records the credential and concurrency choices.
 
 ### The token is an identifier, not an authority
 
@@ -264,7 +293,7 @@ user is inactive, and then **uses the role from the database row** — not the c
 the token. A token whose `org` disagrees with the user's current `organization_id` is
 refused with `TENANT_ACCESS_DENIED`.
 
-The practical effect: a demotion, a promotion, or a deactivation takes effect on the
+The practical effect: a demotion, a promotion, a deactivation, or a password reset takes effect on the
 **next request** rather than up to 15 minutes later. ADR-013 records the trade-off.
 
 ```bash
@@ -632,22 +661,23 @@ status cannot use its second column for ordering.
 
 ## Rate limiting
 
-§45 names five endpoints to limit — login, registration, AI endpoints, knowledge-base
-processing, and file upload. All five are covered, by **four** guards: §22's three create routes
-share the upload limit and §23's question shares the AI one, because each is the same act — the same
-object written, the same provider called — as the limitation its twin already has. Every limit is a
-fixed window in Redis and returns `429 RATE_LIMITED` with a `Retry-After` header.
+Login, registration, password recovery, AI endpoints, knowledge-base processing, and file
+upload use fixed windows in Redis and return `429 RATE_LIMITED` with a `Retry-After` header.
+Knowledge uploads share the attachment upload guard; knowledge questions share the AI guard.
 
 | Endpoint | Key | Window | Default |
 |---|---|---|---|
 | `POST /auth/login` | client address | 1 minute | 10 |
 | `POST /auth/register` | client address | 1 hour | 5 |
+| `POST /auth/forgot-password` | client address | 1 hour | 5 |
+| `POST /auth/forgot-password` | SHA-256 of normalized email | 1 hour | 3 |
+| `POST /auth/reset-password` | client address | 1 minute | 10 |
 | `POST /tickets/{id}/attachments`, `POST /knowledge`, `POST /knowledge/upload` | **user id** | 1 hour | 60 |
 | the AI routes, `POST /knowledge/search` | **user id** | 1 hour | 30 |
 
-All three guards live in one file, [backend/app/api/rate_limits.py](backend/app/api/rate_limits.py),
+All guards live in one file, [backend/app/api/rate_limits.py](backend/app/api/rate_limits.py),
 so the entire limit surface is auditable in one read — the property that matters for an
-abuse control, and the reason both limits are not declared from their own routes.
+abuse control. Recovery email limits apply equally to known and unknown addresses.
 
 **Upload is keyed on the user, which is the opposite of login.** At login there is no
 identity yet — that is what the endpoint is for — and the attack is credential stuffing
@@ -2011,15 +2041,26 @@ before another attempt can succeed.
 For each provider, the checker chooses the first file with a nonempty credential,
 checking `.env.production` before `.env`, and takes its provider and model from that file.
 
-With Docker Desktop running, from `backend/` in PowerShell:
+From `backend/` in PowerShell:
 
 ```powershell
+# Check embedding access with one short request; Docker and a generation key are unnecessary:
+.venv/Scripts/python.exe -m scripts.live_ai_check --preflight-only
+
 # Generation alone, while embedding access is unavailable:
 .venv/Scripts/python.exe -m scripts.live_ai_check --generation-only
 
 # Full generation + RAG, once both credentials and API quota are available:
 .venv/Scripts/python.exe -m scripts.live_ai_check
 ```
+
+Generation and full checks require Docker Desktop running. Full checks first verify
+embedding access and the application's vector width, without retries. A failed preflight
+stops before containers, temporary credentials, or generation calls and saves a sanitized
+`backend/.embedding-preflight-report.local`, preserving earlier full-run evidence.
+The standalone preflight uses only the embedding credential. Its direct provider call
+consumes API quota outside the application's usage ledger; the local report records
+reported prompt tokens, status, and an allowlisted error code, without vectors or credentials.
 
 The checker creates a temporary, gitignored `.env.ai-checks.local`, enables the selected
 providers with `docker-compose.ai-checks.yml`, and restores normal compose settings in
@@ -2327,14 +2368,13 @@ than an application one — and it is the one grep-shaped gap in the row above.
   subdomain per organization), which a JSON API alone cannot express. Asserted rather
   than hidden — see
   [tests/security/test_tenant_isolation.py](backend/tests/security/test_tenant_isolation.py).
-- **Rate limiting is per client address, not per account**, so users behind a shared
-  NAT share one bucket. Fixing it needs a trusted-proxy list and a hybrid key, which
-  needs a deployment target. See ADR-014.
+- **Login and registration limits share a bucket behind a NAT.** Password recovery
+  also has a per-email limit; uploads and AI calls are limited per user. See ADR-014.
 - **No "log out everywhere" endpoint.** `/auth/logout` revokes one session; whole-family
   revocation exists for reuse detection. ADR-003 anticipates an all-sessions endpoint
   if it is wanted.
-- **No email verification or password reset** yet — both need the outbound mail path
-  (Mailpit is already in the stack for it).
+- **Email verification is not implemented.** Password recovery uses the existing
+  SMTP worker and Mailpit path.
 - **Ticket lists return every matching row for an admin.** Pagination caps the page, not
   the total, and `GET /tickets` has no `count()`. This matches `/users` and is the
   documented behaviour rather than an oversight — a total can be added later as a

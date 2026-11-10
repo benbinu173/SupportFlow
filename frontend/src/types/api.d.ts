@@ -93,6 +93,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/auth/forgot-password": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Request password recovery by email */
+        post: operations["forgot_password_api_v1_auth_forgot_password_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/reset-password": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Set a new password using a single-use email link */
+        post: operations["reset_password_api_v1_auth_reset_password_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/auth/refresh": {
         parameters: {
             query?: never;
@@ -1831,7 +1865,7 @@ export interface components {
          * @description Auditable actions, per the spec's list (§34).
          * @enum {string}
          */
-        AuditAction: "user_created" | "user_role_updated" | "user_deactivated" | "ticket_created" | "ticket_assigned" | "ticket_priority_changed" | "ticket_status_changed" | "ticket_resolved" | "ticket_reopened" | "knowledge_document_created" | "knowledge_document_deleted" | "ai_analysis_requested" | "ai_response_accepted" | "ai_response_regenerated" | "sla_policy_updated" | "organization_updated";
+        AuditAction: "user_created" | "user_role_updated" | "user_deactivated" | "ticket_created" | "ticket_assigned" | "ticket_priority_changed" | "ticket_status_changed" | "ticket_resolved" | "ticket_reopened" | "knowledge_document_created" | "knowledge_document_deleted" | "ai_analysis_requested" | "ai_response_accepted" | "ai_response_regenerated" | "sla_policy_updated" | "organization_updated" | "password_reset";
         /**
          * AuditLogRead
          * @description One audit entry as the API presents it.
@@ -2017,6 +2051,22 @@ export interface components {
             average_seconds: number | null;
             /** Count */
             count: number;
+        };
+        /** ForgotPasswordRequest */
+        ForgotPasswordRequest: {
+            /**
+             * Email
+             * Format: email
+             */
+            email: string;
+        };
+        /** ForgotPasswordResponse */
+        ForgotPasswordResponse: {
+            /**
+             * Detail
+             * @default If an active account matches that email, we'll send a password reset link.
+             */
+            detail: string;
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -2328,6 +2378,21 @@ export interface components {
             email: string;
             /** Password */
             password: string;
+        };
+        /** ResetPasswordRequest */
+        ResetPasswordRequest: {
+            /** Token */
+            token: string;
+            /** Password */
+            password: string;
+        };
+        /** ResetPasswordResponse */
+        ResetPasswordResponse: {
+            /**
+             * Detail
+             * @default Password updated. Sign in with your new password.
+             */
+            detail: string;
         };
         /**
          * SLAComplianceSummary
@@ -2902,6 +2967,72 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TokenResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    forgot_password_api_v1_auth_forgot_password_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ForgotPasswordRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ForgotPasswordResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    reset_password_api_v1_auth_reset_password_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResetPasswordRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResetPasswordResponse"];
                 };
             };
             /** @description Validation Error */

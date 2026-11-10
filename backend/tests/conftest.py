@@ -50,6 +50,9 @@ os.environ.setdefault("S3_REGION", "us-east-1")
 # has one test that lowers the value back down to prove the 429 wiring works.
 os.environ.setdefault("RATE_LIMIT_LOGIN_PER_MINUTE", "100000")
 os.environ.setdefault("RATE_LIMIT_REGISTER_PER_HOUR", "100000")
+os.environ.setdefault("RATE_LIMIT_PASSWORD_RESET_PER_HOUR", "100000")
+os.environ.setdefault("RATE_LIMIT_PASSWORD_RESET_EMAIL_PER_HOUR", "100000")
+os.environ.setdefault("RATE_LIMIT_PASSWORD_RESET_CONFIRM_PER_MINUTE", "100000")
 os.environ.setdefault("RATE_LIMIT_UPLOAD_PER_HOUR", "100000")
 # Phase U as well, for the same reason and with one more: `POST /tickets` now queues an
 # analysis, so every test that raises a ticket passes through the AI counter. Left at the

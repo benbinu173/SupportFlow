@@ -52,8 +52,13 @@ class RefreshTokenRepository(Repository[RefreshToken]):
         """Mark one token used, without committing."""
         token.revoked_at = datetime.now(UTC)
 
-    async def revoke_all_for_user(self, user_id: uuid.UUID) -> int:
-        """Revoke every live token belonging to a user. Returns how many were revoked.
+    async def revoke_all_for_user(
+        self, user_id: uuid.UUID, *, token_version: int | None = None
+    ) -> int:
+        """Revoke a user's live tokens, optionally within one password version.
+
+        Returns how many were revoked. Recovery revokes all versions; refresh reuse
+        is limited to the presented version so old cookies cannot end new sessions.
 
         Deliberately broader than the `replaced_by_id` chain ADR-003 describes. On
         reuse detection the honest statement is "one of this user's sessions has been
@@ -65,11 +70,12 @@ class RefreshTokenRepository(Repository[RefreshToken]):
         A single `UPDATE` rather than a chain walk, so it cannot be foiled by a broken
         link or a row that was cleaned up by the expiry sweep.
         """
-        result = await self.session.execute(
-            update(RefreshToken)
-            .where(RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None))
-            .values(revoked_at=datetime.now(UTC))
+        statement = update(RefreshToken).where(
+            RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None)
         )
+        if token_version is not None:
+            statement = statement.where(RefreshToken.token_version == token_version)
+        result = await self.session.execute(statement.values(revoked_at=datetime.now(UTC)))
         # `rowcount` lives on `CursorResult`, which async `execute()` does not advertise
         # even though it returns one for a DML statement. And with SQLAlchemy's
         # synchronize_session default the value is authoritative for an UPDATE.

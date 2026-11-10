@@ -20,6 +20,8 @@ review, failed-reply recovery, session
 restoration, profile navigation and sign-out, realtime replies, and reconnect recovery.
 Knowledge workflows also verify that returning to analytics refreshes usage after
 successful and failed questions, and after source processing completes or fails.
+Password recovery checks cover the sign-in link, conditional email confirmation,
+fragment removal, password confirmation, successful reset, invalid links, and mobile layout.
 
 HTTP responses and WebSocket frames use isolated, deterministic fixtures typed
 against the generated API schemas. These checks exercise the browser interface
@@ -43,6 +45,9 @@ worker must consume `notifications`. No scheduler is needed for these workflows.
 If a parent terminal defines `DEBUG` as a non-boolean value, set it to `false`
 for the API and worker processes. This check does not require an AI provider key.
 The SMTP configuration must point to the local Mailpit service.
+Set `PUBLIC_APP_URL=http://127.0.0.1:4174` for the API and email worker so delivered
+recovery links open the preview used by this suite. Set these on the test processes;
+normal development can retain `http://localhost:5173`.
 
 The command builds the frontend and serves it at `http://127.0.0.1:4174`, using
 Vite's existing HTTP and WebSocket proxies. It performs no response or socket
@@ -51,6 +56,15 @@ verify assignment, public replies, internal-note privacy, resolution,
 close/reopen, session restoration, and agent access after assignment is cleared.
 Realtime assertions read the recipient's screen without reloading. Email checks
 read Mailpit and match both the recipient and the current ticket reference.
+
+The recovery check creates a unique agent in that tenant, requests an email from the
+browser, and follows its unaltered fragment link from Mailpit. It confirms that previous
+browser sessions, access tokens, refresh cookies, and reused links are refused, then
+signs in and reloads with the replacement password. The generated agent is deactivated
+afterward; existing users and mailbox messages are retained. Desktop/mobile screenshots
+and a sanitized verification record are saved. Credential-bearing traces are disabled
+for this check. To run only recovery, use
+`npm run test:e2e:live -- password-reset.spec.ts`.
 
 The checks create and reuse a dedicated **Local live browser checks** tenant
 with accounts under `supportflow-live.example.com` and create fresh tickets per

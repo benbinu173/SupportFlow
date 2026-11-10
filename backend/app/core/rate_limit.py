@@ -20,6 +20,7 @@ The Redis client itself lives in `app/core/redis.py` — it is shared with the r
 probe, and a second consumer is the point at which it stops belonging to this module.
 """
 
+import hashlib
 import uuid
 
 import structlog
@@ -110,6 +111,17 @@ def login_rate_limit_key(ip_address: str) -> str:
 def register_rate_limit_key(ip_address: str) -> str:
     """Redis key for the registration limiter, per client IP."""
     return f"ratelimit:register:{ip_address}"
+
+
+def password_reset_rate_limit_key(ip_address: str, *, confirmation: bool = False) -> str:
+    endpoint = "confirm" if confirmation else "request"
+    return f"ratelimit:password-reset:{endpoint}:{ip_address}"
+
+
+def password_reset_email_rate_limit_key(email: str) -> str:
+    # Submitted addresses, including unknown ones, are counted without logging raw email.
+    digest = hashlib.sha256(email.casefold().encode()).hexdigest()
+    return f"ratelimit:password-reset:email:{digest}"
 
 
 def upload_rate_limit_key(user_id: uuid.UUID) -> str:

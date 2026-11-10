@@ -107,6 +107,14 @@ export function LoginPage() {
             </Enter>
 
             <Enter delay={380} y={10}>
+              <div className="mb-4 text-right">
+                <Link
+                  to="/forgot-password"
+                  className="rounded text-[0.8125rem] font-medium text-brand-text underline-offset-4 hover:underline"
+                >
+                  Forgot password?
+                </Link>
+              </div>
               {/* The marketing surface's pill CTA, with the arrow nested in its
                   own disc rather than sitting beside the label. `buttonClasses`
                   merges a caller's `className` last, which is what lets

@@ -49,6 +49,7 @@ class ErrorCode(StrEnum):
     # --- Authentication and authorization ---------------------------------
     AUTHENTICATION_REQUIRED = "AUTHENTICATION_REQUIRED"
     INVALID_CREDENTIALS = "INVALID_CREDENTIALS"
+    INVALID_RESET_TOKEN = "INVALID_RESET_TOKEN"  # noqa: S105 -- error code, not a credential.
     FORBIDDEN = "FORBIDDEN"
     TENANT_ACCESS_DENIED = "TENANT_ACCESS_DENIED"
 
@@ -157,6 +158,14 @@ class InvalidCredentialsError(AppError):
     code = ErrorCode.INVALID_CREDENTIALS
     status_code = status.HTTP_401_UNAUTHORIZED
     message = "Incorrect email or password."
+
+
+class InvalidResetTokenError(AppError):
+    """Expired, used, malformed, or inactive-account recovery links share one response."""
+
+    code = ErrorCode.INVALID_RESET_TOKEN
+    status_code = status.HTTP_400_BAD_REQUEST
+    message = "This reset link is invalid or has expired. Request a new one."
 
 
 class InactiveUserError(AppError):

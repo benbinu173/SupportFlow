@@ -82,6 +82,10 @@ PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
         # Rate limited by IP, and the response is identical for a wrong password and an
         # unknown address.
         ("POST", "/api/v1/auth/login"),
+        # Recovery is public by necessity: the email link supplies the credential.
+        # Request responses do not disclose account existence; both routes are limited.
+        ("POST", "/api/v1/auth/forgot-password"),
+        ("POST", "/api/v1/auth/reset-password"),
         # Refresh authenticates with the HttpOnly cookie rather than the bearer header,
         # because the access token is precisely what has expired. The cookie is
         # SameSite=Lax, which is the CSRF control (ADR-014).

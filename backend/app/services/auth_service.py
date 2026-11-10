@@ -216,7 +216,7 @@ async def login(
     because an unrelated organization suspended them would be wrong. Only if no active
     candidate matches does the deactivation become the reported reason.
     """
-    candidates = await find_users_by_email_across_tenants(session, payload.email)
+    candidates = await find_users_by_email_across_tenants(session, payload.email, for_update=True)
 
     matched: User | None = None
     inactive_match = False
@@ -274,14 +274,16 @@ async def refresh(
 ) -> AuthResult:
     """Exchange a refresh token for a new pair, rotating the old one out.
 
-    Three outcomes, and the middle one is the security-relevant case:
+    Replays are scoped to the password version that issued the credential:
 
     * **Unknown token** — 401. Nothing to revoke, nothing learned.
     * **Already-used token** — a replay. Either an attacker holding a stolen token or
       the legitimate user re-sending a request; both get the same response, and every
-      live session for that user is revoked (see `revoke_all_for_user`).
+      live session issued under that password version is revoked.
     * **Expired token** — 401, and the row is closed out so it cannot be presented
       again.
+    * **Superseded password version** — 401. Sessions created with the replacement
+      password survive old-device retries and stolen pre-reset cookies.
 
     The row lock taken in `find_by_hash` is what makes this safe under concurrency:
     two simultaneous refreshes of one token would otherwise both read an unrevoked row
@@ -294,14 +296,20 @@ async def refresh(
         logger.warning("refresh_token_unknown")
         raise AuthenticationRequiredError()
 
+    user = await session.get(User, token.user_id)
+    if user is not None and token.token_version != user.token_version:
+        await tokens.revoke_all_for_user(token.user_id, token_version=token.token_version)
+        await session.commit()
+        raise AuthenticationRequiredError()
+
     if token.revoked_at is not None:
         logger.warning(
             "refresh_token_reuse_detected",
             user_id=str(token.user_id),
             organization_id=str(token.organization_id),
-            detail="revoking every live session for this user",
+            detail="revoking live sessions for this password version",
         )
-        await tokens.revoke_all_for_user(token.user_id)
+        await tokens.revoke_all_for_user(token.user_id, token_version=token.token_version)
         await session.commit()
         raise AuthenticationRequiredError()
 
@@ -310,8 +318,6 @@ async def refresh(
         await tokens.revoke(token)
         await session.commit()
         raise AuthenticationRequiredError()
-
-    user = await session.get(User, token.user_id)
 
     if user is None:
         # The account was deleted while a token was still outstanding. Nothing to
@@ -396,6 +402,7 @@ def _issue_tokens(
         # Only the digest is stored. A database read must not yield a usable
         # credential (ADR-003).
         token_hash=hash_refresh_token(raw_refresh),
+        token_version=user.token_version or 0,
         expires_at=refresh_token_expiry(),
         # Recorded for post-incident investigation only. Both are client-controlled
         # and trivially forged, so neither is ever an authorization input.
@@ -405,7 +412,9 @@ def _issue_tokens(
 
     result = AuthResult(
         user=user,
-        access_token=create_access_token(user.id, user.organization_id, user.role),
+        access_token=create_access_token(
+            user.id, user.organization_id, user.role, token_version=user.token_version or 0
+        ),
         refresh_token=raw_refresh,
         expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
     )

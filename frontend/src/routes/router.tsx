@@ -8,7 +8,7 @@ import {
   AnalyticsPage, AuditPage, AuthLayout, CustomerDetailPage, CustomersPage, HomePage,
   KnowledgePage, LandingPage, LoginPage, MarketingLayout, NewRequestPage, NotificationsPage,
   PortalRequestsPage, PreferencesPage, RegisterPage, SlaPage, TeamPage,
-  TicketDetailPage, TicketQueuePage,
+  TicketDetailPage, TicketQueuePage, ForgotPasswordPage, ResetPasswordPage,
 } from '@/routes/lazy-pages'
 import { RedirectIfAuthenticated, RequireAuth, RequirePermission, RequirePortalRole, RequireStaffRole } from '@/routes/guards'
 import { HOME_BY_ROLE } from '@/routes/home'
@@ -66,6 +66,16 @@ export const router = createBrowserRouter([
               { path: '/register', element: <RegisterPage /> },
             ],
           },
+        ],
+      },
+
+      {
+        // Recovery links also work when a browser already has an account session.
+        // Successful recovery ends it and asks for a fresh sign-in.
+        element: <AuthLayout />,
+        children: [
+          { path: '/forgot-password', element: <ForgotPasswordPage /> },
+          { path: '/reset-password', element: <ResetPasswordPage /> },
         ],
       },
 

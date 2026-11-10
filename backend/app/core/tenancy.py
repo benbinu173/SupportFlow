@@ -54,6 +54,7 @@ class TenantContext:
     # represents "who is calling" beats threading a second parameter through every
     # audited call site.
     email: str | None = None
+    token_version: int = 0
 
     # Not a constructor parameter (`init=False`) so it cannot be supplied by a
     # caller. A `permissions=` argument would be a way for any code path to grant

@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, ForeignKey, Index, String, text
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -44,6 +44,10 @@ class RefreshToken(UUIDPrimaryKeyMixin, OrganizationScopedMixin, Base):
     # SHA-256 of the token, never the token itself: a database read must not yield
     # usable credentials. Unique so a hash collision cannot authenticate twice.
     token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    # Also checked during refresh, closing a concurrent rotation's window across a reset.
+    token_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
 
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 

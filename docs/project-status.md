@@ -1,6 +1,6 @@
 # Project checkpoint
 
-Updated: 2026-11-08.
+Updated: 2026-11-10.
 
 ## Current milestone
 
@@ -20,6 +20,8 @@ Live Groq generation is verified. The embedding credential is configured locally
 live RAG is blocked by exhausted OpenAI API credits.
 Knowledge usage analytics is implemented and verified locally: organization totals include
 document embeddings and knowledge questions, with refreshes after committed usage.
+Password recovery is implemented and verified locally, with expiring workspace-specific email links,
+password confirmation, audit entries, and revocation of the account's earlier sessions.
 
 ## F18 scope
 
@@ -62,7 +64,8 @@ Production JavaScript sizes (decimal kB, before compression):
 | First sign-in page, including its route and layout | 1,344.1 kB | 635.0 kB |
 | Largest individual JavaScript chunk | 1,344.1 kB | 473.1 kB |
 
-The build manifest contains 19 dynamic entries (17 screens and two layouts).
+The build manifest at that checkpoint contained 19 dynamic entries (17 screens and two layouts).
+Password recovery adds two more lazy screen modules.
 Analytics and its chart dependencies are deferred in their own 403.6 kB chunk.
 These are JavaScript download measurements; they do not claim a measured
 page-load timing improvement. CSS and font assets are outside this comparison.
@@ -319,11 +322,88 @@ Verification passed:
 - Backend Ruff lint/format and strict mypy (145 source files); frontend lint,
   TypeScript, and the realtime contract check.
 
+## Embedding preflight and resumed checkpoint
+
+A single minimal embedding request on 2026-11-10 at 10:34 IST still returned HTTP 429,
+`insufficient_quota` / `credit_balance_exhausted`, with no vector. Sanitized evidence
+is saved in the gitignored `backend/.embedding-access-probe.local`. Existing credentials,
+environment files, and full-run reports were preserved; the full RAG checker was not rerun.
+
+`scripts.live_ai_check --preflight-only` now checks embedding access without Docker or a
+generation credential. Full checks run the same preflight before preparing the stack and
+stop on unavailable access or a vector incompatible with the database. Blocked preflight
+reports are separate from the full RAG report. A stopped Docker daemon also fails before
+a temporary credential file is created. The direct preflight request consumes provider
+quota outside the application's usage ledger.
+
+The preflight and existing embedding-provider regression suites passed **50 tests**.
+Strict mypy passed for `app` and `scripts` (140 source files). No further live embedding
+calls were made after the credit failure.
+
+## Password recovery
+
+The sign-in screen links to `/forgot-password`. Known, unknown, disabled, and
+queue-failure requests receive the same public confirmation. Up to five active accounts
+sharing an email across active workspaces receive individual workspace-named messages
+through the existing notifications worker. Links expire after 30 minutes by default;
+request and confirmation endpoints have separate rate limits, including a hashed-email
+request bucket.
+
+Emails use a validated `PUBLIC_APP_URL` and put the recovery credential in a fragment.
+The reset page removes it from the address and retains it only in component memory.
+It checks the shared password policy and matching confirmation, handles missing/expired/
+used links, and clears the current browser session and private query cache after success.
+Recovery pages remain available while signed in. Desktop and phone layouts use the
+existing auth design, with room between the recovery panel's prose cards.
+
+Reset locks the account row, increments its credential version, revokes refresh rows,
+and records a safe audit entry in one transaction. Old access tokens fail on their next
+request; WebSockets receive a local close signal and periodically check fresh database
+state across API instances. The worker generates the signed link, so no usable recovery
+credential is stored or queued. Login rehashing is serialized with reset. Refresh reuse
+is limited to the presented password version, protecting new-password sessions from
+old-device retries and pre-reset cookies, including a late old-version refresh row.
+
+Migration `d64f197a3c20` adds account/refresh versions and the password-reset audit action.
+It is applied to the retained local development database; `alembic check` reports no
+schema differences. Production compose carries the public origin to API and worker;
+the migration service applies the new revision on deployment. Production SMTP and the
+actual public frontend origin must be configured for delivered links.
+
+Verification completed:
+
+- The complete backend suite passed all 1,675 cases.
+- Frontend: all 113 component/service cases passed across 16 files; the final auth and
+  route changes also passed 27 targeted cases.
+- All 24 production-bundle browser workflows passed, including four recovery cases.
+- Frontend lint, TypeScript, realtime contract, and production build passed.
+- Backend Ruff lint/format and strict mypy passed (147 source files).
+- An independent real-HTTP regression confirmed that a pre-reset cookie returns 401
+  while the new-password session still refreshes with 200 after that retry.
+- The live Mailpit recovery browser case passed against the updated API and worker,
+  including an old-cookie retry after a fresh sign-in. Final desktop/mobile screenshots
+  were inspected and the verification record is saved in the local Playwright report.
+
+The live browser checker uses a unique agent in the dedicated development tenant and
+follows its unaltered Mailpit link. It verifies session revocation, replay refusal,
+sign-in/reload with the new password, and old-cookie retries after that sign-in. It
+deactivates only its generated account and retains mailbox/history, desktop/mobile
+screenshots, and a sanitized record. Credential-bearing traces are disabled.
+The repeat procedure is in the frontend README; [ADR-035](architecture-decisions.md#adr-035--password-recovery-uses-account-versions-and-workspace-specific-email-links)
+records the security and concurrency choices.
+
+Temporary verification API, worker, and preview processes are stopped. Development
+infrastructure and test history are retained; the real environment files were preserved.
+
 ## Next recommended step
 
-Check or add OpenAI API credits at
-[the API billing dashboard](https://platform.openai.com/settings/organization/billing/overview),
-then rerun `.venv/Scripts/python.exe -m scripts.live_ai_check` from `backend/`.
+Continue feature work with email verification using the existing mail worker and auth
+forms. Password recovery and embedding preflight are reviewed and verified; their local
+verification is recorded above.
+
+Live RAG can resume after OpenAI API credits are added at
+[the API billing dashboard](https://platform.openai.com/settings/organization/billing/overview).
+Then run `.venv/Scripts/python.exe -m scripts.live_ai_check` from `backend/`.
 Both provider credentials are already available locally. Semantic retrieval,
 live document embeddings, grounded answers/citations, and RAG-grounded drafts
 are **not yet verified**.

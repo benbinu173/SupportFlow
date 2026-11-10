@@ -9,7 +9,15 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, PostgresDsn, RedisDsn, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    AnyHttpUrl,
+    Field,
+    PostgresDsn,
+    RedisDsn,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Repo root: config.py → core → app → backend → root. The .env lives there so a
@@ -134,6 +142,8 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    PASSWORD_RESET_EXPIRE_MINUTES: int = Field(default=30, ge=1, le=120)
+    PUBLIC_APP_URL: AnyHttpUrl = AnyHttpUrl("http://localhost:5173")
 
     # Length only. Modern guidance (NIST SP 800-63B) is to prefer length over
     # character-class rules, which push users toward predictable substitutions
@@ -155,6 +165,9 @@ class Settings(BaseSettings):
     # account-creation endpoint has no legitimate high-frequency use.
     RATE_LIMIT_LOGIN_PER_MINUTE: int = 10
     RATE_LIMIT_REGISTER_PER_HOUR: int = 5
+    RATE_LIMIT_PASSWORD_RESET_PER_HOUR: int = Field(default=5, ge=1)
+    RATE_LIMIT_PASSWORD_RESET_EMAIL_PER_HOUR: int = Field(default=3, ge=1)
+    RATE_LIMIT_PASSWORD_RESET_CONFIRM_PER_MINUTE: int = Field(default=10, ge=1)
 
     # Per *user*, not per address — the upload endpoint is authenticated, so identity
     # exists and is the precise thing to count (§45). 60 is one a minute sustained for
@@ -199,6 +212,8 @@ class Settings(BaseSettings):
     # enough that a port scanner opening ten thousand sockets and saying nothing goes
     # nowhere. See ADR-025.
     WS_AUTH_TIMEOUT_SECONDS: int = 10
+    # Active sockets must eventually observe a reset even on another API instance.
+    WS_SESSION_CHECK_INTERVAL_SECONDS: int = Field(default=30, ge=1, le=300)
 
     # How many events one connection may have queued before it is disconnected. The queue is
     # what stops a client that has stopped reading from delaying every other tenant's
@@ -408,6 +423,17 @@ class Settings(BaseSettings):
         # PyJWT warns below 32 bytes for HS256; treat it as an error instead.
         if len(v) < 32:
             raise ValueError("JWT_SECRET must be at least 32 characters")
+        return v
+
+    @field_validator("PUBLIC_APP_URL")
+    @classmethod
+    def _reset_links_use_a_trusted_origin(cls, v: AnyHttpUrl) -> AnyHttpUrl:
+        if v.username or v.password or v.query or v.fragment or v.path not in (None, "", "/"):
+            raise ValueError(
+                "PUBLIC_APP_URL must be an origin without credentials, path, query, or fragment"
+            )
+        if v.scheme != "https" and v.host not in {"localhost", "127.0.0.1", "[::1]"}:
+            raise ValueError("PUBLIC_APP_URL must use HTTPS except on local loopback")
         return v
 
     @field_validator(

@@ -1,4 +1,5 @@
 import { useSessionStore } from '@/store/auth'
+import type { components } from '@/types/api'
 import type { SessionUser } from '@/types/session'
 
 import { apiClient } from './client'
@@ -6,12 +7,12 @@ import { publicClient } from './public-client'
 import { refreshSession, type TokenResponse } from './session-refresh'
 
 /**
- * The five routes in `backend/app/api/auth.py`.
+ * The authentication routes in `backend/app/api/auth.py`.
  *
  * Note which client each one uses, because it is not arbitrary:
  *
- * - `login` and `register` go through `publicClient`. A wrong password is a 401,
- *   and a 401 through `apiClient` would trigger a refresh-and-retry against the
+ * - `login`, `register`, and password recovery go through `publicClient`.
+ *   A wrong password is a 401, and a 401 through `apiClient` would trigger a refresh-and-retry against the
  *   very endpoint that issues credentials.
  * - `logout` and `fetchCurrentUser` go through `apiClient`. Both act on behalf of
  *   a signed-in user, and logout in particular *requires* a valid access token —
@@ -52,6 +53,19 @@ export async function register(payload: RegisterPayload): Promise<TokenResponse>
   const { data } = await publicClient.post<TokenResponse>('/auth/register', payload)
 
   return data
+}
+
+type ForgotPasswordResponse = components['schemas']['ForgotPasswordResponse']
+type ResetPasswordPayload = components['schemas']['ResetPasswordRequest']
+
+export async function requestPasswordReset(email: string): Promise<ForgotPasswordResponse> {
+  const { data } = await publicClient.post<ForgotPasswordResponse>('/auth/forgot-password', { email })
+  return data
+}
+
+export async function resetPassword(payload: ResetPasswordPayload): Promise<void> {
+  await publicClient.post('/auth/reset-password', payload)
+  useSessionStore.getState().endSession()
 }
 
 /**

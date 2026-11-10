@@ -1,6 +1,6 @@
 """Authentication endpoints (spec §36).
 
-Five routes: register, login, refresh, logout, and the caller's own profile.
+Registration, login, password recovery, refresh, logout, and the caller's own profile.
 
 The refresh token never appears in a response body. It is set as an `HttpOnly` cookie
 scoped to this router's path, which is simultaneously the storage decision and the CSRF
@@ -22,14 +22,29 @@ from app.api.deps import (
     header_or_none,
     require_permission,
 )
-from app.api.rate_limits import limit_login, limit_register
+from app.api.rate_limits import (
+    limit_login,
+    limit_password_reset_confirm,
+    limit_password_reset_request,
+    limit_register,
+)
 from app.core.config import get_settings
 from app.core.exceptions import AuthenticationRequiredError
 from app.core.permissions import Permission
 from app.core.security import refresh_token_ttl_seconds
-from app.schemas.auth import LoginRequest, LogoutResponse, RegisterRequest, TokenResponse
+from app.core.tenancy import RequestOrigin
+from app.schemas.auth import (
+    ForgotPasswordRequest,
+    ForgotPasswordResponse,
+    LoginRequest,
+    LogoutResponse,
+    RegisterRequest,
+    ResetPasswordRequest,
+    ResetPasswordResponse,
+    TokenResponse,
+)
 from app.schemas.user import UserRead
-from app.services import auth_service
+from app.services import auth_service, password_reset_service
 
 logger = structlog.get_logger(__name__)
 
@@ -148,6 +163,37 @@ async def login(
     )
     _set_refresh_cookie(response, result.refresh_token)
     return TokenResponse(access_token=result.access_token, expires_in=result.expires_in)
+
+
+@router.post(
+    "/forgot-password",
+    response_model=ForgotPasswordResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Request password recovery by email",
+    dependencies=[Depends(limit_password_reset_request)],
+)
+async def forgot_password(payload: ForgotPasswordRequest, db: DbSession) -> ForgotPasswordResponse:
+    await password_reset_service.request_reset(db, payload.email)
+    return ForgotPasswordResponse()
+
+
+@router.post(
+    "/reset-password",
+    response_model=ResetPasswordResponse,
+    summary="Set a new password using a single-use email link",
+    dependencies=[Depends(limit_password_reset_confirm)],
+)
+async def reset_password(
+    payload: ResetPasswordRequest, request: Request, response: Response, db: DbSession
+) -> ResetPasswordResponse:
+    await password_reset_service.reset_password(
+        db,
+        payload.token,
+        payload.password,
+        origin=RequestOrigin(ip_address=client_ip(request), user_agent=_user_agent(request)),
+    )
+    _clear_refresh_cookie(response)
+    return ResetPasswordResponse()
 
 
 @router.post(

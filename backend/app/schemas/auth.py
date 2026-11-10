@@ -58,3 +58,20 @@ class LogoutResponse(BaseModel):
     """Acknowledges a logout that revoked a session."""
 
     detail: str = "Signed out."
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: Email
+
+
+class ForgotPasswordResponse(BaseModel):
+    detail: str = "If an active account matches that email, we'll send a password reset link."
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=2048)
+    password: Password
+
+
+class ResetPasswordResponse(BaseModel):
+    detail: str = "Password updated. Sign in with your new password."

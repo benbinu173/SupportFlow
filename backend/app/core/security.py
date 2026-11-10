@@ -15,6 +15,7 @@ plain values out, which is what makes all three testable without a fixture.
 """
 
 import hashlib
+import hmac
 import secrets
 import uuid
 from dataclasses import dataclass
@@ -115,6 +116,8 @@ def dummy_verify(password: str) -> None:
 _SUBJECT: Final = "sub"
 _ORGANIZATION: Final = "org"
 _ROLE: Final = "role"
+_VERSION: Final = "ver"
+_RESET_AUDIENCE: Final = "supportflow:password-reset"
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +133,7 @@ class AccessTokenClaims:
     user_id: uuid.UUID
     organization_id: uuid.UUID
     role: UserRole
+    token_version: int = 0
 
 
 def create_access_token(
@@ -138,6 +142,7 @@ def create_access_token(
     role: UserRole,
     *,
     expires_delta: timedelta | None = None,
+    token_version: int = 0,
 ) -> str:
     """Mint a signed access token.
 
@@ -155,6 +160,7 @@ def create_access_token(
         _SUBJECT: str(user_id),
         _ORGANIZATION: str(organization_id),
         _ROLE: role.value,
+        _VERSION: token_version,
         "iat": issued_at,
         "exp": expires_at,
     }
@@ -187,11 +193,78 @@ def decode_access_token(token: str) -> AccessTokenClaims:
             user_id=uuid.UUID(payload[_SUBJECT]),
             organization_id=uuid.UUID(payload[_ORGANIZATION]),
             role=UserRole(payload[_ROLE]),
+            token_version=_token_version(payload),
         )
     # ValueError covers the UUID and enum parses above, plus PyJWT's own subclassing;
     # listing the concrete types would be a list to keep in sync with a library.
     except (jwt.InvalidTokenError, ValueError, KeyError) as exc:
         raise AuthenticationRequiredError() from exc
+
+
+def _token_version(payload: dict[str, Any]) -> int:
+    # Older access tokens predate this claim and remain valid until their first reset.
+    value = payload.get(_VERSION, 0)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError("invalid token version")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class PasswordResetClaims:
+    user_id: uuid.UUID
+    organization_id: uuid.UUID
+    token_version: int
+
+
+def _password_reset_key() -> bytes:
+    """Domain separation prevents a recovery token from authenticating as an access token."""
+    return hmac.digest(get_settings().JWT_SECRET.encode(), _RESET_AUDIENCE.encode(), "sha256")
+
+
+def create_password_reset_token(
+    user_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    token_version: int,
+    *,
+    expires_at: datetime,
+) -> str:
+    """Create a short-lived link; its account version makes it single-use after reset."""
+    settings = get_settings()
+    return jwt.encode(
+        {
+            "sub": str(user_id),
+            "org": str(organization_id),
+            "ver": token_version,
+            "aud": _RESET_AUDIENCE,
+            "iat": datetime.now(UTC),
+            "exp": expires_at,
+            "jti": secrets.token_urlsafe(16),
+        },
+        _password_reset_key(),
+        algorithm=settings.JWT_ALGORITHM,
+    )
+
+
+def decode_password_reset_token(token: str) -> PasswordResetClaims:
+    from app.core.exceptions import InvalidResetTokenError
+
+    try:
+        payload = jwt.decode(
+            token,
+            _password_reset_key(),
+            algorithms=[get_settings().JWT_ALGORITHM],
+            audience=_RESET_AUDIENCE,
+            options={"require": ["exp", "sub", "org", "ver", "aud"]},
+        )
+        if not isinstance(payload["sub"], str) or not isinstance(payload["org"], str):
+            raise ValueError("invalid reset identity")
+        return PasswordResetClaims(
+            user_id=uuid.UUID(payload["sub"]),
+            organization_id=uuid.UUID(payload["org"]),
+            token_version=_token_version(payload),
+        )
+    except (jwt.InvalidTokenError, ValueError, KeyError) as exc:
+        raise InvalidResetTokenError() from exc
 
 
 # ---------------------------------------------------------------------------

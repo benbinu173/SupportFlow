@@ -105,6 +105,9 @@ async def authenticate_token(db: AsyncSession, token: str) -> User:
     if not user.is_active:
         raise InactiveUserError()
 
+    if claims.token_version != user.token_version:
+        raise AuthenticationRequiredError()
+
     if user.organization_id != claims.organization_id:
         # The token names a different tenant than the user actually belongs to. Not a
         # routine cross-tenant read — that returns 404 elsewhere. This is a token that
@@ -147,6 +150,7 @@ def tenant_context_for(user: User) -> TenantContext:
     """
     return TenantContext(
         user_id=user.id,
+        token_version=user.token_version,
         organization_id=user.organization_id,
         # From the row, not from `claims.role`. See the module docstring.
         role=user.role,

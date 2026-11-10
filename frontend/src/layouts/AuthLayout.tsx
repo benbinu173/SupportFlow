@@ -8,14 +8,15 @@ import { Enter } from '@/components/motion/Enter'
  * The panel copy follows the route, and the two screens promise different
  * things — one resumes a workspace, the other creates one — so this is a
  * decision rather than a default. Anything that is not registration is sign-in,
- * because those are the only two routes this layout hosts.
+ * while account recovery has its own explanation.
  */
 function panelFor(pathname: string): PanelVariant {
+  if (pathname === '/forgot-password' || pathname === '/reset-password') return 'recovery'
   return pathname.startsWith('/register') ? 'register' : 'login'
 }
 
 /**
- * The shell for sign-in and registration.
+ * The shell for sign-in, registration, and account recovery.
  *
  * An editorial split rather than a centred card: the form holds the left
  * column, and an inset `--color-surface-inverse` panel holds the right one. The

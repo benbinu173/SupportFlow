@@ -134,6 +134,7 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/2
       CELERY_RESULT_BACKEND: redis://redis:6379/2
       S3_ENDPOINT: http://minio:9000
+      PUBLIC_APP_URL: ${PUBLIC_APP_URL:-https://localhost}
     depends_on:
       postgres:
         condition: service_healthy
@@ -164,6 +165,7 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/2
       CELERY_RESULT_BACKEND: redis://redis:6379/2
       S3_ENDPOINT: http://minio:9000
+      PUBLIC_APP_URL: ${PUBLIC_APP_URL:-https://localhost}
     # `-Q` names every queue. A worker started without it consumes the default queue only, so
     # the other five fill up in Redis with no consumer and no error anywhere — the deployment
     # trap `tests/integration/test_celery_wiring.py` exists to catch in the development file,
