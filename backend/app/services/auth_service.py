@@ -27,6 +27,7 @@ from app.core.config import get_settings
 from app.core.exceptions import (
     AuthenticationRequiredError,
     ConflictError,
+    EmailNotVerifiedError,
     InactiveUserError,
     InvalidCredentialsError,
 )
@@ -48,7 +49,7 @@ from app.repositories.organization_repository import OrganizationRepository
 from app.repositories.refresh_token_repository import RefreshTokenRepository
 from app.repositories.user_repository import find_users_by_email_across_tenants
 from app.schemas.auth import LoginRequest, RegisterRequest
-from app.services import audit_service, sla_service
+from app.services import audit_service, email_verification_service, sla_service
 
 logger = structlog.get_logger(__name__)
 
@@ -110,8 +111,8 @@ async def register(
     *,
     user_agent: str | None = None,
     ip_address: str | None = None,
-) -> AuthResult:
-    """Create an organization and its first administrator, then sign them in.
+) -> User:
+    """Create an organization and its first administrator, then request verification.
 
     Both records are written in one transaction: an organization with no admin is
     unreachable — nobody could ever create its first user — so it must not be possible
@@ -139,7 +140,6 @@ async def register(
         # The first account in a new tenant is necessarily its administrator. There
         # is no way to register into an existing organization.
         role=UserRole.ADMIN,
-        last_login_at=datetime.now(UTC),
     )
     session.add(user)
 
@@ -181,16 +181,15 @@ async def register(
         origin=RequestOrigin(ip_address=ip_address, user_agent=user_agent),
     )
 
-    result, token_row = _issue_tokens(user, user_agent=user_agent, ip_address=ip_address)
-    session.add(token_row)
     await session.commit()
+    email_verification_service.enqueue_verification(user)
 
     logger.info(
         "organization_registered",
         organization_id=str(organization.id),
         user_id=str(user.id),
     )
-    return result
+    return user
 
 
 # ---------------------------------------------------------------------------
@@ -216,10 +215,13 @@ async def login(
     because an unrelated organization suspended them would be wrong. Only if no active
     candidate matches does the deactivation become the reported reason.
     """
-    candidates = await find_users_by_email_across_tenants(session, payload.email, for_update=True)
+    candidates = await find_users_by_email_across_tenants(
+        session, payload.email, for_update=True, organization_slug=payload.organization_slug
+    )
 
     matched: User | None = None
     inactive_match = False
+    unverified_match = False
     updated_hash: str | None = None
 
     for candidate in candidates:
@@ -228,6 +230,9 @@ async def login(
             continue
         if not candidate.is_active:
             inactive_match = True
+            continue
+        if candidate.email_verified_at is None:
+            unverified_match = True
             continue
         matched, updated_hash = candidate, new_hash
         break
@@ -238,6 +243,8 @@ async def login(
             # latency does not reveal that this address is unknown.
             dummy_verify(payload.password)
         logger.info("login_failed", reason="deactivated" if inactive_match else "credentials")
+        if unverified_match:
+            raise EmailNotVerifiedError()
         if inactive_match:
             raise InactiveUserError()
         raise InvalidCredentialsError()
@@ -333,6 +340,11 @@ async def refresh(
         await session.commit()
         logger.info("refresh_rejected_inactive_user", user_id=str(user.id))
         raise InactiveUserError()
+
+    if user.email_verified_at is None:
+        await tokens.revoke_all_for_user(user.id)
+        await session.commit()
+        raise EmailNotVerifiedError()
 
     result, replacement = _issue_tokens(user, user_agent=user_agent, ip_address=ip_address)
 

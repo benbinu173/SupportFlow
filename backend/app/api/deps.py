@@ -39,6 +39,7 @@ from sqlalchemy.orm import joinedload
 from app.core.database import get_db
 from app.core.exceptions import (
     AuthenticationRequiredError,
+    EmailNotVerifiedError,
     InactiveUserError,
     PermissionDeniedError,
     TenantAccessDeniedError,
@@ -124,6 +125,9 @@ async def authenticate_token(db: AsyncSession, token: str) -> User:
     if organization is None or organization.status is not OrganizationStatus.ACTIVE:
         logger.info("organization_not_active", organization_id=str(user.organization_id))
         raise TenantAccessDeniedError("This organization is not active.")
+
+    if user.email_verified_at is None:
+        raise EmailNotVerifiedError()
 
     return user
 

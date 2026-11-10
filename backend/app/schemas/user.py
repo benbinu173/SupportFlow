@@ -30,6 +30,7 @@ class UserRead(BaseModel):
     customer_id: uuid.UUID | None
     created_at: datetime
     last_login_at: datetime | None
+    email_verified_at: datetime | None
 
     # Deliberately absent: password_hash, organization_id. The organization is implied
     # by the caller's own token, and echoing it back would suggest it is theirs to set.

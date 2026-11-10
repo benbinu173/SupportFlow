@@ -32,6 +32,7 @@ from tests.conftest import (
     OrgSession,
     cookie_header,
     login,
+    verify_created_account,
 )
 
 pytestmark = pytest.mark.security
@@ -74,6 +75,7 @@ LOGGING_MODULES = (
     "app.services.audit_service",
     "app.services.auth_service",
     "app.services.customer_service",
+    "app.services.email_verification_service",
     "app.services.message_service",
     "app.services.ticket_service",
     "app.services.user_service",
@@ -86,6 +88,7 @@ LOGGING_MODULES = (
 EXPECTED_EVENTS = frozenset(
     {
         "organization_registered",
+        "email_verified",
         "login_succeeded",
         "login_failed",
         "refresh_token_rotated",
@@ -192,7 +195,10 @@ def _refresh(client: TestClient, token: str) -> Any:
 
 @pytest.fixture
 def exercised(
-    logs: LogRecorder, client: TestClient, register_org: Callable[..., OrgSession]
+    logs: LogRecorder,
+    client: TestClient,
+    register_org: Callable[..., OrgSession],
+    queued_verifications: list[list[Any]],
 ) -> dict[str, str]:
     """Drive a full session — success, failure, rotation, reuse, refusal, logout.
 
@@ -258,6 +264,7 @@ def exercised(
         },
     )
     assert portal.status_code == 201, portal.text
+    verify_created_account(client, queued_verifications, portal.json()["id"])
 
     # The portal account logging in as itself, which is the path a `customer_id`-linked
     # session actually travels — and the only way to obtain a token for it, since

@@ -78,6 +78,9 @@ PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
         # Registration must be reachable by definition — an unauthenticated visitor
         # creating their organization is the entry point. Rate limited by IP.
         ("POST", "/api/v1/auth/register"),
+        # The recipient proves ownership through the signed link, not a session.
+        ("POST", "/api/v1/auth/verify-email"),
+        ("POST", "/api/v1/auth/resend-verification"),
         # Login likewise: the credential being established is the one it would need.
         # Rate limited by IP, and the response is identical for a wrong password and an
         # unknown address.

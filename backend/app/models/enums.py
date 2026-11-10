@@ -144,6 +144,7 @@ class AuditAction(StrEnum):
     SLA_POLICY_UPDATED = "sla_policy_updated"
     ORGANIZATION_UPDATED = "organization_updated"
     PASSWORD_RESET = "password_reset"  # noqa: S105 -- audit action, not a credential.
+    EMAIL_VERIFIED = "email_verified"
 
 
 class NotificationType(StrEnum):

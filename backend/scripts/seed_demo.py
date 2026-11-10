@@ -624,9 +624,9 @@ async def _create_org_and_users(session: AsyncSession) -> TenantContext:
             password=PASSWORD,
         ),
     )
-    admin = result.user
+    admin = result
     check("the organization and its administrator exist", admin is not None)
-    check("registration returned a session", bool(result.access_token))
+    check("registration waits for verification", admin.email_verified_at is None)
     check("the registered tenant is the one we asked for", admin.email == ADMIN[1])
     check("the first account in a tenant is its administrator", admin.role is UserRole.ADMIN)
 
@@ -649,6 +649,15 @@ async def _create_org_and_users(session: AsyncSession) -> TenantContext:
             context,
             UserCreate(name=name, email=email, password=PASSWORD, role=UserRole.AGENT),
         )
+
+    # Canned demo identities are explicitly trusted by this local data seeder. This
+    # bypass is not exposed by registration, account creation, or their request schemas.
+    await session.execute(
+        update(User)
+        .where(User.organization_id == context.organization_id)
+        .values(email_verified_at=datetime.now(UTC))
+    )
+    await session.commit()
 
     staff = await session.scalar(
         select(func.count())

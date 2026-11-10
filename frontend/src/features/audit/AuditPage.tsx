@@ -29,6 +29,7 @@ const ACTION_LABELS: Record<AuditAction, string> = {
   user_role_updated: 'User role updated',
   user_deactivated: 'User deactivated',
   password_reset: 'Password reset',
+  email_verified: 'Email verified',
   ticket_created: 'Ticket created',
   ticket_assigned: 'Ticket assigned',
   ticket_priority_changed: 'Priority changed',

@@ -232,9 +232,33 @@ def _second_tenant(client: httpx.Client) -> Tenant | None:
     Returns `None` when it cannot be obtained at all — a rate-limited registration is reported as
     a skip by the caller, because it says nothing about the deployment.
     """
+    from scripts.mailbox_verification import finish_registration, verify_local_account
+
     section("A second tenant, for the isolation check")
 
     response = client.post(LOGIN, json={"email": SMOKE_EMAIL, "password": SMOKE_PASSWORD})
+    if (
+        response.status_code == 403
+        and response.json().get("error", {}).get("code") == "EMAIL_NOT_VERIFIED"
+    ):
+        try:
+            verified = verify_local_account(
+                SMOKE_EMAIL,
+                api_base=str(client.base_url).rstrip("/") + "/api/v1",
+                client=client,
+                workspace=SMOKE_ORG,
+            )
+            response = client.post(
+                LOGIN,
+                json={
+                    "email": SMOKE_EMAIL,
+                    "password": SMOKE_PASSWORD,
+                    "organization_slug": verified["organization_slug"],
+                },
+            )
+        except RuntimeError as exc:
+            skip("the smoke tenant is available", str(exc))
+            return None
     if response.status_code == 200:
         token, _ = _signed_in(response)
         if token is not None:
@@ -250,7 +274,15 @@ def _second_tenant(client: httpx.Client) -> Tenant | None:
             "password": SMOKE_PASSWORD,
         },
     )
-    token, why = _signed_in(created)
+    if created.status_code == 201:
+        try:
+            session = finish_registration(created, client=client)
+        except RuntimeError as exc:
+            skip("the smoke tenant is available", str(exc))
+            return None
+    else:
+        session = created
+    token, why = _signed_in(session)
     if token is None:
         skip("the smoke tenant is available", why)
         return None

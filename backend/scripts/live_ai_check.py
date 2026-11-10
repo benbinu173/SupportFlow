@@ -223,6 +223,8 @@ def wait_ready(context: ssl.SSLContext) -> None:
 
 
 def member(client: httpx.Client, owner: Account, customer: dict[str, Any]) -> Account:
+    from scripts.mailbox_verification import verify_local_account
+
     email = f"customer@{DOMAIN}"
     users = request(client, "GET", "/users", owner)
     user = next((row for row in users if row["email"] == email), None)
@@ -240,7 +242,17 @@ def member(client: httpx.Client, owner: Account, customer: dict[str, Any]) -> Ac
                 "customer_id": customer["id"],
             },
         )
-    login = request(client, "POST", "/auth/login", json={"email": email, "password": PASSWORD})
+    payload = {"email": email, "password": PASSWORD}
+    if user.get("email_verified_at") is None:
+        verified = verify_local_account(
+            email,
+            api_base="https://localhost/api/v1",
+            client=client,
+            mailpit_url="http://127.0.0.1:8026",
+            user_id=user["id"],
+        )
+        payload["organization_slug"] = verified["organization_slug"]
+    login = request(client, "POST", "/auth/login", json=payload)
     return Account(login["access_token"], user)
 
 

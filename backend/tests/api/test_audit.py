@@ -426,7 +426,7 @@ def test_the_date_range_is_half_open(client: TestClient, register_org: Any) -> N
     everything = _trail(org)
     boundary = everything[0]["created_at"]
 
-    assert _trail(org, created_after=boundary) == everything
+    assert _trail(org, created_after=boundary) == everything[:1]
     assert _trail(org, created_before=boundary) == everything[1:]
 
 

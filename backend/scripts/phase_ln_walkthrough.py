@@ -31,6 +31,7 @@ from sqlalchemy import text
 
 from app.core.database import engine
 from app.core.event_loop import run
+from scripts.mailbox_verification import finish_registration, verify_created_user
 
 BASE = "http://localhost:8000/api/v1"
 PASSWORD = "correct-horse-battery-staple"
@@ -113,6 +114,7 @@ class Tenant:
             timeout=30.0,
         )
         response.raise_for_status()
+        response = finish_registration(response)
         self.admin = Api(response.json()["access_token"], self.email)
         self.me: dict[str, Any] = self.admin.get("/auth/me").json()
 
@@ -132,6 +134,7 @@ class Tenant:
             },
         )
         created.raise_for_status()
+        verify_created_user(created)
 
         logged_in = httpx.post(
             f"{BASE}/auth/login", json={"email": email, "password": PASSWORD}, timeout=30.0

@@ -81,6 +81,7 @@ import httpx
 from pypdf import PdfReader
 
 from app.core.config import get_settings
+from scripts.mailbox_verification import finish_registration, verify_created_user
 
 BASE = "http://localhost:8000/api/v1"
 PASSWORD = "correct-horse-battery-staple"
@@ -269,6 +270,7 @@ class Tenant(Principal):
             timeout=30.0,
         )
         response.raise_for_status()
+        response = finish_registration(response)
         super().__init__(str(response.json()["access_token"]))
 
     # --- §22: registering a document ------------------------------------------------
@@ -332,6 +334,7 @@ class Tenant(Principal):
             },
         )
         created.raise_for_status()
+        verify_created_user(created)
         login = httpx.post(
             f"{BASE}/auth/login", json={"email": address, "password": PASSWORD}, timeout=30.0
         )

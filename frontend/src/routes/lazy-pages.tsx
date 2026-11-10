@@ -9,6 +9,7 @@ export const LoginPage = lazy(() => import('@/pages/auth/LoginPage').then((modul
 export const RegisterPage = lazy(() => import('@/pages/auth/RegisterPage').then((module) => ({ default: module.RegisterPage })))
 export const ForgotPasswordPage = lazy(() => import('@/pages/auth/ForgotPasswordPage').then((module) => ({ default: module.ForgotPasswordPage })))
 export const ResetPasswordPage = lazy(() => import('@/pages/auth/ResetPasswordPage').then((module) => ({ default: module.ResetPasswordPage })))
+export const VerifyEmailPage = lazy(() => import('@/pages/auth/VerifyEmailPage').then((module) => ({ default: module.VerifyEmailPage })))
 export const HomePage = lazy(() => import('@/pages/HomePage').then((module) => ({ default: module.HomePage })))
 export const TicketQueuePage = lazy(() => import('@/pages/tickets/TicketQueuePage').then((module) => ({ default: module.TicketQueuePage })))
 export const TicketDetailPage = lazy(() => import('@/features/tickets/TicketDetailPage').then((module) => ({ default: module.TicketDetailPage })))

@@ -1,6 +1,6 @@
 import { ArrowRight } from '@phosphor-icons/react'
 import { type FormEvent, useState } from 'react'
-import { Link, useLocation } from 'react-router-dom'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
 
 import { Enter } from '@/components/motion/Enter'
 import { Button } from '@/components/ui/Button'
@@ -11,11 +11,13 @@ import { PasswordInput } from '@/components/ui/PasswordInput'
 import { AuthAlert } from '@/features/auth/AuthAlert'
 import { useAuthenticate } from '@/features/auth/useAuthenticate'
 import { login } from '@/services/api/auth'
-import { fieldError } from '@/services/api/errors'
+import { ERROR_CODES, fieldError } from '@/services/api/errors'
 
 /** What `RequireAuth` stashes before it redirects here. */
 interface RedirectState {
   from?: string
+  email?: string
+  organizationSlug?: string
 }
 
 /**
@@ -34,10 +36,12 @@ interface RedirectState {
  */
 export function LoginPage() {
   const location = useLocation()
+  const navigate = useNavigate()
   const { authenticate, pending, error } = useAuthenticate()
 
-  const [email, setEmail] = useState('')
+  const [email, setEmail] = useState((location.state as RedirectState | null)?.email ?? '')
   const [password, setPassword] = useState('')
+  const [organizationSlug, setOrganizationSlug] = useState((location.state as RedirectState | null)?.organizationSlug)
 
   const returnTo = (location.state as RedirectState | null)?.from
   const fieldErrors = error?.fieldErrors ?? []
@@ -49,7 +53,11 @@ export function LoginPage() {
     // again while the first attempt is still in flight, and `pending` is what
     // disables the button. The handler returning a promise is fine — React
     // ignores a form handler's return value.
-    await authenticate(() => login({ email, password }), returnTo)
+    const payload = { email, password, ...(organizationSlug ? { organization_slug: organizationSlug } : {}) }
+    const failure = await authenticate(() => login(payload), returnTo)
+    if (failure?.code === ERROR_CODES.EMAIL_NOT_VERIFIED) {
+      navigate('/verify-email', { state: { email, from: returnTo } })
+    }
   }
 
   return (
@@ -79,6 +87,7 @@ export function LoginPage() {
                   value={email}
                   onChange={(event) => {
                     setEmail(event.target.value)
+                    setOrganizationSlug(undefined)
                   }}
                 />
               </Field>
@@ -141,6 +150,10 @@ export function LoginPage() {
           </form>
 
           <Enter delay={460} y={10}>
+            <p className="mb-3 text-center text-[0.8125rem] text-ink-muted">
+              Need to verify your email?{' '}
+              <Link to="/verify-email" className="rounded font-medium text-brand-text underline-offset-4 hover:underline">Resend link</Link>
+            </p>
             <p className="text-center text-[0.8125rem] text-ink-muted">
               No account yet?{' '}
               <Link

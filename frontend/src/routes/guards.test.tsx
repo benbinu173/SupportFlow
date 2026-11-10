@@ -34,6 +34,7 @@ function makeUser(role: UserRole): SessionUser {
     customer_id: role === 'customer' ? '00000000-0000-0000-0000-0000000000ff' : null,
     created_at: '2026-01-01T00:00:00Z',
     last_login_at: null,
+    email_verified_at: '2026-01-01T00:00:00Z',
   }
 }
 

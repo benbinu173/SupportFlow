@@ -29,7 +29,7 @@ from app.models.user import User
 from app.repositories.customer_repository import CustomerRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.user import UserCreate, UserRoleUpdate
-from app.services import audit_service
+from app.services import audit_service, email_verification_service
 
 logger = structlog.get_logger(__name__)
 
@@ -115,6 +115,8 @@ async def create_user(
         origin=origin,
     )
     await session.commit()
+
+    email_verification_service.enqueue_verification(user)
 
     logger.info(
         "user_created",

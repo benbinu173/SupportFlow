@@ -1,6 +1,6 @@
 """Authentication endpoints (spec §36).
 
-Registration, login, password recovery, refresh, logout, and the caller's own profile.
+Registration, email verification, login, recovery, refresh, logout, and the caller's profile.
 
 The refresh token never appears in a response body. It is set as an `HttpOnly` cookie
 scoped to this router's path, which is simultaneously the storage decision and the CSRF
@@ -27,6 +27,8 @@ from app.api.rate_limits import (
     limit_password_reset_confirm,
     limit_password_reset_request,
     limit_register,
+    limit_verification_confirm,
+    limit_verification_request,
 )
 from app.core.config import get_settings
 from app.core.exceptions import AuthenticationRequiredError
@@ -39,12 +41,17 @@ from app.schemas.auth import (
     LoginRequest,
     LogoutResponse,
     RegisterRequest,
+    RegistrationResponse,
+    ResendVerificationRequest,
+    ResendVerificationResponse,
     ResetPasswordRequest,
     ResetPasswordResponse,
     TokenResponse,
+    VerifyEmailRequest,
+    VerifyEmailResponse,
 )
 from app.schemas.user import UserRead
-from app.services import auth_service, password_reset_service
+from app.services import auth_service, email_verification_service, password_reset_service
 
 logger = structlog.get_logger(__name__)
 
@@ -126,26 +133,54 @@ def _user_agent(request: Request) -> str | None:
 
 @router.post(
     "/register",
-    response_model=TokenResponse,
+    response_model=RegistrationResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Create an organization and its first administrator",
     dependencies=[Depends(limit_register)],
 )
 async def register(
-    payload: RegisterRequest, request: Request, response: Response, db: DbSession
-) -> TokenResponse:
+    payload: RegisterRequest, request: Request, db: DbSession
+) -> RegistrationResponse:
     """Register a new tenant.
 
-    201 rather than 200: an organization and a user were created. Registration signs
-    the new administrator in directly — forcing a second round trip to `/login` with
-    credentials the client already holds would be ceremony, and it is not what any
-    SaaS signup does.
+    201 acknowledges the new organization and user. No session credential is issued
+    until the recipient confirms ownership through the email link and signs in.
     """
     result = await auth_service.register(
         db, payload, user_agent=_user_agent(request), ip_address=client_ip(request)
     )
-    _set_refresh_cookie(response, result.refresh_token)
-    return TokenResponse(access_token=result.access_token, expires_in=result.expires_in)
+    return RegistrationResponse(email=result.email)
+
+
+@router.post(
+    "/resend-verification",
+    response_model=ResendVerificationResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Request a new email verification link",
+    dependencies=[Depends(limit_verification_request)],
+)
+async def resend_verification(
+    payload: ResendVerificationRequest, db: DbSession
+) -> ResendVerificationResponse:
+    await email_verification_service.resend_verification(db, payload.email)
+    return ResendVerificationResponse()
+
+
+@router.post(
+    "/verify-email",
+    response_model=VerifyEmailResponse,
+    summary="Confirm email ownership using a single-use link",
+    dependencies=[Depends(limit_verification_confirm)],
+)
+async def verify_email(
+    payload: VerifyEmailRequest, request: Request, db: DbSession
+) -> VerifyEmailResponse:
+    user = await email_verification_service.verify_email(
+        db,
+        payload.token,
+        origin=RequestOrigin(ip_address=client_ip(request), user_agent=_user_agent(request)),
+    )
+    return VerifyEmailResponse(email=user.email, organization_slug=user.organization.slug)
 
 
 @router.post(

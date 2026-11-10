@@ -222,6 +222,51 @@ def test_upgrade_is_repeatable_after_a_downgrade(upgraded_database: tuple[str, E
 # The revision that adds `ix_messages_fts`, Phase N's index over the message body.
 MESSAGE_FTS_REVISION = "e672102955a8"
 
+
+def test_email_verification_migration_preserves_existing_access_but_not_new_accounts(
+    upgraded_database: tuple[str, Engine],
+) -> None:
+    db_url, engine = upgraded_database
+    config = _alembic_config(db_url)
+    command.downgrade(config, "d64f197a3c20")
+    organization_id = "00000000-0000-4000-8000-000000000101"
+    old_user = "00000000-0000-4000-8000-000000000102"
+    new_user = "00000000-0000-4000-8000-000000000103"
+    with engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO organizations (id, name, slug) VALUES (:id, 'Legacy', 'legacy')"),
+            {"id": organization_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, organization_id, name, email, password_hash, role) "
+                "VALUES (:id, :org, 'Owner', 'old@example.com', 'hash', 'admin')"
+            ),
+            {"id": old_user, "org": organization_id},
+        )
+    command.upgrade(config, "head")
+    with engine.begin() as connection:
+        assert (
+            connection.scalar(
+                text("SELECT email_verified_at FROM users WHERE id = :id"), {"id": old_user}
+            )
+            is not None
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, organization_id, name, email, password_hash, role) "
+                "VALUES (:id, :org, 'New owner', 'new@example.com', 'hash', 'admin')"
+            ),
+            {"id": new_user, "org": organization_id},
+        )
+        assert (
+            connection.scalar(
+                text("SELECT email_verified_at FROM users WHERE id = :id"), {"id": new_user}
+            )
+            is None
+        )
+
+
 # The revision that adds `notifications.emailed_at`, Phase P's delivery marker.
 EMAILED_AT_REVISION = "a49a5939bf77"
 

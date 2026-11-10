@@ -22,6 +22,9 @@ Knowledge usage analytics is implemented and verified locally: organization tota
 document embeddings and knowledge questions, with refreshes after committed usage.
 Password recovery is implemented and verified locally, with expiring workspace-specific email links,
 password confirmation, audit entries, and revocation of the account's earlier sessions.
+Password recovery and embedding preflight are committed as `fe8edbb`.
+Email verification is implemented for newly registered and administrator-created accounts,
+with explicit confirmation, generic resend, and sign-in restricted until confirmation.
 
 ## F18 scope
 
@@ -395,11 +398,68 @@ records the security and concurrency choices.
 Temporary verification API, worker, and preview processes are stopped. Development
 infrastructure and test history are retained; the real environment files were preserved.
 
+## Email verification
+
+Registration now returns `201 {email, detail}` without session credentials or a refresh
+cookie. Newly registered administrators and users created through `/users` receive
+workspace-named verification mail through the existing notifications worker. Unverified
+accounts cannot log in, refresh, authenticate protected HTTP requests, or open an
+authenticated WebSocket. Correct credentials receive `403 EMAIL_NOT_VERIFIED` and the
+sign-in screen offers a verification request.
+
+Public resend returns the same `202` confirmation for known, unknown, verified, disabled,
+and queue-failure cases. It sends at most five links across active workspaces, with
+separate address/email limits and a separate confirmation limit. The worker signs a
+purpose-separated credential bound to the user, organization, current email fingerprint,
+and original expiry; no usable credential is queued. Links expire after 60 minutes by
+default and use the validated public frontend origin.
+
+The browser opens `/verify-email`, removes the fragment, and confirms only after a click.
+It supports waiting, resend, invalid/expired/used links, success, and phone layouts. It
+captures a link arriving on the same waiting route and ignores responses for older links.
+Confirmation locks the account row, stamps `email_verified_at`, and audits `email_verified`;
+concurrent or sibling links cannot succeed twice. It does not start a session. Continue
+to sign in explicitly switches any existing browser account and supplies the confirmed
+email and workspace slug, avoiding cross-workspace ambiguity in that flow.
+
+Migration `e73a61b24f09` is applied to the retained development database. Existing users
+are backfilled to preserve access; this baseline does not claim a historical email
+confirmation. New users have no default verification. Example environments document the
+expiry and rate limits. Local walkthroughs and deployment/live checkers now
+complete generated accounts through Mailpit and require the notifications worker. Real
+environment files and infrastructure are retained.
+The demo seeder marks only its canned tenant's accounts verified as an explicit local
+trust exception; public registration and administrator-created accounts still require mail.
+
+[ADR-036](architecture-decisions.md#adr-036--new-accounts-confirm-email-before-a-session-is-issued)
+records the account, link, migration, and workspace-selection decisions.
+
+Verification completed:
+
+- All 125 cases in the affected audit/user API, tenant/log-security, and mailbox-helper
+  suites passed. The full 1,712-case backend run passed 1,700 and exposed four outdated
+  expectations plus eight fixture errors, all corrected and covered by this focused run.
+  Verification API/security, worker delivery, concurrency, and migration compatibility
+  passed in the full run. The complete suite was not repeated after the test-only fixes.
+- All 123 frontend component/service cases passed across 17 files in a complete run.
+- All 28 deterministic production-bundle browser workflows passed, including four
+  verification workflows and the existing recovery, role, knowledge, and session checks.
+- Four live browser cases passed against the real development API and Mailpit:
+  verification, password recovery, the manager/agent/customer workflow, and agent reopen.
+- Backend Ruff lint/format and strict mypy passed (150 source files). Frontend lint,
+  TypeScript, the realtime contract check, and the production build passed.
+- The retained development database is at `e73a61b24f09`; `alembic check` reports no drift.
+
+Desktop and phone verification screenshots were inspected. Sanitized verification
+records, screenshots, Mailpit messages, and test history are retained. Temporary API,
+worker, and preview processes are stopped; the real environment files were preserved.
+
 ## Next recommended step
 
-Continue feature work with email verification using the existing mail worker and auth
-forms. Password recovery and embedding preflight are reviewed and verified; their local
-verification is recorded above.
+Verify the updated authentication release on the local production stack through Caddy,
+including migration of existing users and delivered verification links. The Mailpit
+compose override and browser-check procedure are documented in the frontend README.
+Configure the actual public origin and SMTP delivery before deploying the release.
 
 Live RAG can resume after OpenAI API credits are added at
 [the API billing dashboard](https://platform.openai.com/settings/organization/billing/overview).

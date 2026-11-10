@@ -11,12 +11,13 @@ by an admin calling `POST /users`, and each of them then authenticates for real.
 
 import uuid
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import get_settings
-from tests.conftest import AUTH, PASSWORD, USERS, OrgSession, login
+from tests.conftest import AUTH, PASSWORD, USERS, OrgSession, login, verify_created_account
 
 pytestmark = pytest.mark.integration
 
@@ -93,6 +94,7 @@ def test_the_listing_never_exposes_a_password_hash(roles: dict[str, OrgSession])
             "id",
             "name",
             "email",
+            "email_verified_at",
             "role",
             "is_active",
             "customer_id",
@@ -155,6 +157,7 @@ def test_only_an_admin_may_create_users(roles: dict[str, OrgSession], role: str)
 
 def test_an_admin_creates_a_user_who_can_then_log_in(
     roles: dict[str, OrgSession],
+    queued_verifications: list[list[Any]],
 ) -> None:
     """The created account is real: it authenticates and resolves to the same identity.
 
@@ -166,6 +169,9 @@ def test_an_admin_creates_a_user_who_can_then_log_in(
     assert created.status_code == 201, created.text
     assert created.json()["role"] == "agent"
     assert created.json()["is_active"] is True
+    assert created.json()["email_verified_at"] is None
+
+    verify_created_account(roles["admin"].client, queued_verifications, created.json()["id"])
 
     session = login(roles["admin"].client, NEW_USER["email"])
 

@@ -26,10 +26,10 @@ pytestmark = pytest.mark.integration
 # ---------------------------------------------------------------------------
 
 
-def test_register_creates_an_organization_and_signs_the_admin_in(
+def test_a_registered_admin_can_sign_in_after_email_verification(
     register_org: Callable[..., OrgSession],
 ) -> None:
-    """Registration returns a usable session immediately — no second round trip."""
+    """The normal account helper completes verification before establishing a session."""
     org = register_org(organization_name="Globex")
 
     assert org.role == "admin"
@@ -192,9 +192,8 @@ def test_login_is_rate_limited(
     in Redis. The counting logic itself is covered by `tests/unit/test_rate_limit.py`
     against a stand-in client; this test is about the wiring.
     """
-    monkeypatch.setattr(get_settings(), "RATE_LIMIT_LOGIN_PER_MINUTE", 0, raising=False)
-
     org = register_org()
+    monkeypatch.setattr(get_settings(), "RATE_LIMIT_LOGIN_PER_MINUTE", 0, raising=False)
     response = org.client.post(f"{AUTH}/login", json={"email": org.email, "password": PASSWORD})
 
     assert response.status_code == 429

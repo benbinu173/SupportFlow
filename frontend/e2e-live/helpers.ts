@@ -33,13 +33,20 @@ export async function json<T>(response: Awaited<ReturnType<APIRequestContext['ge
 
 async function createTenant(request: APIRequestContext, config: ReturnType<typeof settings>) {
   const { apiURL, domain, production } = config
-  const login = await request.post(`${apiURL}/auth/login`, { data: { email: `admin@${domain}`, password } })
-  const token = await json<components['schemas']['TokenResponse']>(login.status() === 401 ? await request.post(`${apiURL}/auth/register`, {
-    data: {
-      organization_name: production ? 'Local production browser checks' : 'Local live browser checks',
-      name: 'Live Browser Admin', email: `admin@${domain}`, password,
-    },
-  }) : login)
+  const email = `admin@${domain}`
+  const workspace = production ? 'Local production browser checks' : 'Local live browser checks'
+  let login = await request.post(`${apiURL}/auth/login`, { data: { email, password } })
+  if (login.status() === 401) {
+    await json<components['schemas']['RegistrationResponse']>(await request.post(`${apiURL}/auth/register`, {
+      data: { organization_name: workspace, name: 'Live Browser Admin', email, password },
+    }))
+    const verified = await verifyTestAccount(request, config, email, workspace)
+    login = await request.post(`${apiURL}/auth/login`, { data: { email, password, organization_slug: verified.organization_slug } })
+  } else if (login.status() === 403 && (await login.json()).error?.code === 'EMAIL_NOT_VERIFIED') {
+    const verified = await verifyTestAccount(request, config, email, workspace)
+    login = await request.post(`${apiURL}/auth/login`, { data: { email, password, organization_slug: verified.organization_slug } })
+  }
+  const token = await json<components['schemas']['TokenResponse']>(login)
   const headers = { Authorization: `Bearer ${token.access_token}` }
   const admin = await json<User>(await request.get(`${apiURL}/auth/me`, { headers }))
   const customers = await json<components['schemas']['CustomerRead'][]>(await request.get(`${apiURL}/customers`, { headers }))
@@ -57,9 +64,41 @@ async function createTenant(request: APIRequestContext, config: ReturnType<typeo
         customer_id: role === 'customer' ? customer.id : null,
       },
     }))
+    if (user.email_verified_at === null) {
+      await verifyTestAccount(request, config, user.email, workspace)
+    }
     accounts[role] = { user, password }
   }
   return { accounts, admin: { user: admin, password }, headers, customer }
+}
+
+export async function verificationLink(
+  request: APIRequestContext, config: ReturnType<typeof settings>, email: string, workspace: string,
+): Promise<string> {
+  type Mail = { ID: string; Subject: string; To: Array<{ Address: string }> }
+  let link: string | undefined
+  await expect.poll(async () => {
+    const inbox = await json<{ messages: Mail[] }>(await request.get(`${config.mailpitURL}/api/v1/search`, { params: { query: `to:${email}` } }))
+    for (const mail of inbox.messages) {
+      if (!mail.Subject.includes('Verify your email') || !mail.Subject.endsWith(`— ${workspace}`) || !mail.To.some((recipient) => recipient.Address === email)) continue
+      const body = await json<{ Text: string }>(await request.get(`${config.mailpitURL}/api/v1/message/${mail.ID}`))
+      link = body.Text.match(/https?:\/\/[^\s]+\/verify-email#token=[^\s]+/)?.[0]
+      if (link) return true
+    }
+    return false
+  }, { timeout: 30_000, message: 'The email worker delivers the workspace verification link' }).toBe(true)
+  if (!link) throw new Error('The verification email did not include a link')
+  return link
+}
+
+export async function verifyTestAccount(
+  request: APIRequestContext, config: ReturnType<typeof settings>, email: string, workspace: string,
+): Promise<components['schemas']['VerifyEmailResponse']> {
+  await json(await request.post(`${config.apiURL}/auth/resend-verification`, { data: { email } }))
+  const link = await verificationLink(request, config, email, workspace)
+  const token = new URLSearchParams(new URL(link).hash.slice(1)).get('token')
+  if (!token) throw new Error('The verification link did not include a fragment credential')
+  return json<components['schemas']['VerifyEmailResponse']>(await request.post(`${config.apiURL}/auth/verify-email`, { data: { token } }))
 }
 
 export async function getTenant(request: APIRequestContext, testInfo: TestInfo) {

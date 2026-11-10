@@ -61,12 +61,44 @@ export interface paths {
          * Create an organization and its first administrator
          * @description Register a new tenant.
          *
-         *     201 rather than 200: an organization and a user were created. Registration signs
-         *     the new administrator in directly — forcing a second round trip to `/login` with
-         *     credentials the client already holds would be ceremony, and it is not what any
-         *     SaaS signup does.
+         *     201 acknowledges the new organization and user. No session credential is issued
+         *     until the recipient confirms ownership through the email link and signs in.
          */
         post: operations["register_api_v1_auth_register_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/resend-verification": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Request a new email verification link */
+        post: operations["resend_verification_api_v1_auth_resend_verification_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/verify-email": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Confirm email ownership using a single-use link */
+        post: operations["verify_email_api_v1_auth_verify_email_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1865,7 +1897,7 @@ export interface components {
          * @description Auditable actions, per the spec's list (§34).
          * @enum {string}
          */
-        AuditAction: "user_created" | "user_role_updated" | "user_deactivated" | "ticket_created" | "ticket_assigned" | "ticket_priority_changed" | "ticket_status_changed" | "ticket_resolved" | "ticket_reopened" | "knowledge_document_created" | "knowledge_document_deleted" | "ai_analysis_requested" | "ai_response_accepted" | "ai_response_regenerated" | "sla_policy_updated" | "organization_updated" | "password_reset";
+        AuditAction: "user_created" | "user_role_updated" | "user_deactivated" | "ticket_created" | "ticket_assigned" | "ticket_priority_changed" | "ticket_status_changed" | "ticket_resolved" | "ticket_reopened" | "knowledge_document_created" | "knowledge_document_deleted" | "ai_analysis_requested" | "ai_response_accepted" | "ai_response_regenerated" | "sla_policy_updated" | "organization_updated" | "password_reset" | "email_verified";
         /**
          * AuditLogRead
          * @description One audit entry as the API presents it.
@@ -2213,6 +2245,8 @@ export interface components {
              * Format: email
              */
             email: string;
+            /** Organization Slug */
+            organization_slug?: string | null;
             /** Password */
             password: string;
         };
@@ -2378,6 +2412,35 @@ export interface components {
             email: string;
             /** Password */
             password: string;
+        };
+        /**
+         * RegistrationResponse
+         * @description Account creation is complete; authentication follows email verification.
+         */
+        RegistrationResponse: {
+            /** Email */
+            email: string;
+            /**
+             * Detail
+             * @default Check your email to verify your account before signing in.
+             */
+            detail: string;
+        };
+        /** ResendVerificationRequest */
+        ResendVerificationRequest: {
+            /**
+             * Email
+             * Format: email
+             */
+            email: string;
+        };
+        /** ResendVerificationResponse */
+        ResendVerificationResponse: {
+            /**
+             * Detail
+             * @default If an active account still needs verification, we'll send a new email link.
+             */
+            detail: string;
         };
         /** ResetPasswordRequest */
         ResetPasswordRequest: {
@@ -2825,6 +2888,8 @@ export interface components {
             created_at: string;
             /** Last Login At */
             last_login_at: string | null;
+            /** Email Verified At */
+            email_verified_at: string | null;
         };
         /**
          * UserRole
@@ -2851,6 +2916,23 @@ export interface components {
             input?: unknown;
             /** Context */
             ctx?: Record<string, never>;
+        };
+        /** VerifyEmailRequest */
+        VerifyEmailRequest: {
+            /** Token */
+            token: string;
+        };
+        /** VerifyEmailResponse */
+        VerifyEmailResponse: {
+            /** Email */
+            email: string;
+            /** Organization Slug */
+            organization_slug: string;
+            /**
+             * Detail
+             * @default Email verified. You can now sign in.
+             */
+            detail: string;
         };
         /**
          * VolumePoint
@@ -2933,7 +3015,73 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TokenResponse"];
+                    "application/json": components["schemas"]["RegistrationResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    resend_verification_api_v1_auth_resend_verification_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResendVerificationRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResendVerificationResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    verify_email_api_v1_auth_verify_email_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VerifyEmailRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VerifyEmailResponse"];
                 };
             };
             /** @description Validation Error */

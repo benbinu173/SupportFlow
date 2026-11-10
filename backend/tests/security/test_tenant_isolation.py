@@ -962,9 +962,9 @@ def test_a_tenant_s_audit_trail_contains_only_its_own_rows(
     scoping — there is no row for a filter to be forgotten on, only the query itself.
 
     **A fresh organization's trail is not empty, and that is by design**: registration is
-    itself an audited action, which is what the founding `USER_CREATED` row records. So
+    itself an audited action, followed by confirmation's `EMAIL_VERIFIED` row. So
     the claim cannot be "Southwind sees nothing" — Southwind sees exactly its own
-    registration and nothing else, and the distinction between those two is the whole of
+    registration and email confirmation, and the distinction between those two is the whole of
     this test. Asserting emptiness would have passed against a route that returned `[]`
     for everyone, including Northwind's admin.
     """
@@ -977,8 +977,8 @@ def test_a_tenant_s_audit_trail_contains_only_its_own_rows(
     southwind_rows = southwind.get(AUDIT, params={"limit": 100}).json()
 
     assert len(northwind_rows) > 1, "Northwind acted, so its trail is more than its own signup"
-    assert [row["action"] for row in southwind_rows] == ["user_created"], (
-        "Southwind has done nothing but register, and registering is one row"
+    assert [row["action"] for row in southwind_rows] == ["email_verified", "user_created"], (
+        "Southwind has only registered and verified its own email"
     )
     assert southwind_rows[0]["actor_user_id"] == southwind.user_id
 

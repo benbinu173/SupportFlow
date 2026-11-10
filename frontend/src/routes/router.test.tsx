@@ -225,6 +225,7 @@ describe('route table', () => {
       customer_id: null,
       created_at: '2026-01-01T00:00:00Z',
       last_login_at: null,
+      email_verified_at: '2026-01-01T00:00:00Z',
     }
 
     useSessionStore.setState({ status: 'authenticated', user: agent, accessToken: 'test-token' })
@@ -255,6 +256,7 @@ describe('route table', () => {
       '/register',
       '/forgot-password',
       '/reset-password',
+      '/verify-email',
       '/dashboard',
       '/analytics',
       '/sla',

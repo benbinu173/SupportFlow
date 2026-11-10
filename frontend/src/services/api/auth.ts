@@ -47,15 +47,22 @@ export async function login(payload: LoginPayload): Promise<TokenResponse> {
   return data
 }
 
-export async function register(payload: RegisterPayload): Promise<TokenResponse> {
-  // 201, not 200: an organization and a user were created. Registration also
-  // signs the new administrator in, so there is no second call to make.
-  const { data } = await publicClient.post<TokenResponse>('/auth/register', payload)
+export async function register(payload: RegisterPayload): Promise<components['schemas']['RegistrationResponse']> {
+  const { data } = await publicClient.post<components['schemas']['RegistrationResponse']>('/auth/register', payload)
 
   return data
 }
 
 type ForgotPasswordResponse = components['schemas']['ForgotPasswordResponse']
+
+export async function resendVerification(email: string): Promise<void> {
+  await publicClient.post('/auth/resend-verification', { email })
+}
+
+export async function verifyEmail(token: string): Promise<components['schemas']['VerifyEmailResponse']> {
+  const { data } = await publicClient.post<components['schemas']['VerifyEmailResponse']>('/auth/verify-email', { token })
+  return data
+}
 type ResetPasswordPayload = components['schemas']['ResetPasswordRequest']
 
 export async function requestPasswordReset(email: string): Promise<ForgotPasswordResponse> {

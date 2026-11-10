@@ -15,6 +15,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.enums import UserRole
+from app.models.organization import Organization
 from app.models.user import User
 from app.repositories.base import TenantScopedRepository
 
@@ -91,7 +92,11 @@ class UserRepository(TenantScopedRepository[User]):
 
 
 async def find_users_by_email_across_tenants(
-    session: AsyncSession, email: str, *, for_update: bool = False
+    session: AsyncSession,
+    email: str,
+    *,
+    for_update: bool = False,
+    organization_slug: str | None = None,
 ) -> Sequence[User]:
     """Every user with this email, in any organization. **Login only.**
 
@@ -110,9 +115,11 @@ async def find_users_by_email_across_tenants(
     unbounded number of Argon2 derivations per login attempt.
     """
     statement = select(User).where(User.email == email).order_by(User.created_at, User.id).limit(5)
+    if organization_slug is not None:
+        statement = statement.join(Organization).where(Organization.slug == organization_slug)
     if for_update:
         # Serialize password verification/rehashing with recovery, so a concurrent login
         # cannot overwrite the newly reset hash with an upgraded hash of the old password.
-        statement = statement.with_for_update()
+        statement = statement.with_for_update(of=User)
     result = await session.execute(statement)
     return result.scalars().all()

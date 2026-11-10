@@ -291,7 +291,7 @@ export function TeamPage() {
         {createOpen && <NewMemberForm customers={customersQuery.data ?? []} customersLoading={customersQuery.isPending} saving={createMutation.isPending} onSubmit={(payload) => createMutation.mutate(payload)} onCancel={() => setCreateOpen(false)} />}
       </Dialog>
 
-      <Dialog open={createdCredentials !== null} onClose={() => setCreatedCredentials(null)} title="Account is ready" description="Share these sign-in details with the new account holder through a secure channel.">
+      <Dialog open={createdCredentials !== null} onClose={() => setCreatedCredentials(null)} title="Account is ready" description="Share these sign-in details securely. The account holder must verify their email before signing in.">
         {createdCredentials && (
           <div className="flex flex-col gap-4">
             <p className="text-sm text-ink">{createdCredentials.member.name} · {ROLE_LABELS[createdCredentials.member.role]}</p>
@@ -310,7 +310,7 @@ export function TeamPage() {
             >
               Copy initial password
             </Button>
-            <p className="text-xs leading-relaxed text-ink-subtle">This password is shown only now. Store or share it securely; the app does not send invitations or reset links yet.</p>
+            <p className="text-xs leading-relaxed text-ink-subtle">This password is shown only now. Share it securely. A verification link goes to their email; they can request another from the sign-in screen.</p>
             <div className="flex justify-end">
               <Button leadingIcon={<Check aria-hidden="true" />} onClick={() => setCreatedCredentials(null)}>Done</Button>
             </div>

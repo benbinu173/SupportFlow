@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { expect, test, type Page } from '@playwright/test'
 
-import { getTenant, json, settings, signIn } from './helpers'
+import { getTenant, json, settings, signIn, verifyTestAccount } from './helpers'
 import type { components } from '../src/types/api'
 
 type User = components['schemas']['UserRead']
@@ -28,6 +28,7 @@ test('live recovery email resets the account and revokes previous sessions', asy
   const pages: Page[] = []
   const errors: string[] = []
   try {
+    await verifyTestAccount(request, config, user.email, config.production ? 'Local production browser checks' : 'Local live browser checks')
     const oldLogin = await request.post(`${config.apiURL}/auth/login`, {
       data: { email: user.email, password: oldPassword },
     })

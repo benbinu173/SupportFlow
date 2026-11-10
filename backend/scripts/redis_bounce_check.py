@@ -36,6 +36,8 @@ from typing import Any
 import httpx
 from websockets.sync.client import connect as socket_connect
 
+from scripts.mailbox_verification import finish_registration
+
 #: Resolved from this file rather than from the working directory, so the check runs the same
 #: way from `backend/` as it does from the repository root.
 COMPOSE_FILE = Path(__file__).resolve().parents[2] / "docker-compose.yml"
@@ -90,6 +92,7 @@ class Session:
             timeout=30.0,
         )
         response.raise_for_status()
+        response = finish_registration(response)
         self.token = str(response.json()["access_token"])
         self.headers = {"Authorization": f"Bearer {self.token}"}
 

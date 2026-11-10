@@ -124,6 +124,18 @@ def password_reset_email_rate_limit_key(email: str) -> str:
     return f"ratelimit:password-reset:email:{digest}"
 
 
+def email_verification_rate_limit_key(ip_address: str, *, confirmation: bool = False) -> str:
+    endpoint = "confirm" if confirmation else "request"
+    return f"ratelimit:email-verification:{endpoint}:{ip_address}"
+
+
+def email_verification_email_rate_limit_key(email: str) -> str:
+    from app.core.security import email_verification_fingerprint
+
+    digest = email_verification_fingerprint(email.casefold())
+    return f"ratelimit:email-verification:email:{digest}"
+
+
 def upload_rate_limit_key(user_id: uuid.UUID) -> str:
     """Redis key for the upload limiter, per *user*.
 

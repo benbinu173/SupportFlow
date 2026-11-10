@@ -143,6 +143,7 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     PASSWORD_RESET_EXPIRE_MINUTES: int = Field(default=30, ge=1, le=120)
+    EMAIL_VERIFICATION_EXPIRE_MINUTES: int = Field(default=60, ge=1, le=1440)
     PUBLIC_APP_URL: AnyHttpUrl = AnyHttpUrl("http://localhost:5173")
 
     # Length only. Modern guidance (NIST SP 800-63B) is to prefer length over
@@ -168,6 +169,9 @@ class Settings(BaseSettings):
     RATE_LIMIT_PASSWORD_RESET_PER_HOUR: int = Field(default=5, ge=1)
     RATE_LIMIT_PASSWORD_RESET_EMAIL_PER_HOUR: int = Field(default=3, ge=1)
     RATE_LIMIT_PASSWORD_RESET_CONFIRM_PER_MINUTE: int = Field(default=10, ge=1)
+    RATE_LIMIT_EMAIL_VERIFICATION_PER_HOUR: int = Field(default=5, ge=1)
+    RATE_LIMIT_EMAIL_VERIFICATION_EMAIL_PER_HOUR: int = Field(default=3, ge=1)
+    RATE_LIMIT_EMAIL_VERIFICATION_CONFIRM_PER_MINUTE: int = Field(default=10, ge=1)
 
     # Per *user*, not per address — the upload endpoint is authenticated, so identity
     # exists and is the precise thing to count (§45). 60 is one a minute sustained for
@@ -427,7 +431,7 @@ class Settings(BaseSettings):
 
     @field_validator("PUBLIC_APP_URL")
     @classmethod
-    def _reset_links_use_a_trusted_origin(cls, v: AnyHttpUrl) -> AnyHttpUrl:
+    def _email_links_use_a_trusted_origin(cls, v: AnyHttpUrl) -> AnyHttpUrl:
         if v.username or v.password or v.query or v.fragment or v.path not in (None, "", "/"):
             raise ValueError(
                 "PUBLIC_APP_URL must be an origin without credentials, path, query, or fragment"

@@ -18,7 +18,7 @@ const PASSWORD = 'a-long-workspace-password'
 const USER: SessionUser = {
   id: '00000000-0000-4000-8000-000000000001',
   name: 'Alex Chen', email: 'alex@example.test', role: 'agent', is_active: true,
-  customer_id: null, created_at: '2026-11-10T00:00:00Z', last_login_at: null,
+  customer_id: null, created_at: '2026-11-10T00:00:00Z', last_login_at: null, email_verified_at: '2026-11-10T00:00:00Z',
 }
 
 beforeAll(async () => {

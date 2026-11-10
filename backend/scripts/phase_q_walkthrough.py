@@ -76,6 +76,7 @@ from app.core.config import get_settings
 from app.core.database import engine
 from app.core.event_loop import run
 from app.workers import sla_tasks
+from scripts.mailbox_verification import finish_registration, verify_created_user
 
 BASE = "http://localhost:8000/api/v1"
 SLA = f"{BASE}/sla"
@@ -220,6 +221,7 @@ class Tenant:
             timeout=30.0,
         )
         response.raise_for_status()
+        response = finish_registration(response)
         self.admin = Api(response.json()["access_token"], self.email)
 
     def member(self, role: str, **extra: Any) -> Api:
@@ -238,6 +240,7 @@ class Tenant:
             },
         )
         created.raise_for_status()
+        verify_created_user(created)
 
         logged_in = httpx.post(
             f"{BASE}/auth/login", json={"email": email, "password": PASSWORD}, timeout=30.0

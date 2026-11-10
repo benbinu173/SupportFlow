@@ -22,6 +22,8 @@ Knowledge workflows also verify that returning to analytics refreshes usage afte
 successful and failed questions, and after source processing completes or fails.
 Password recovery checks cover the sign-in link, conditional email confirmation,
 fragment removal, password confirmation, successful reset, invalid links, and mobile layout.
+Email verification checks cover signup without a session, resend, explicit confirmation,
+fragment removal, reused/expired links, verification-driven sign-in, and phone layouts.
 
 HTTP responses and WebSocket frames use isolated, deterministic fixtures typed
 against the generated API schemas. These checks exercise the browser interface
@@ -46,7 +48,7 @@ If a parent terminal defines `DEBUG` as a non-boolean value, set it to `false`
 for the API and worker processes. This check does not require an AI provider key.
 The SMTP configuration must point to the local Mailpit service.
 Set `PUBLIC_APP_URL=http://127.0.0.1:4174` for the API and email worker so delivered
-recovery links open the preview used by this suite. Set these on the test processes;
+recovery and verification links open the preview used by this suite. Set these on the test processes;
 normal development can retain `http://localhost:5173`.
 
 The command builds the frontend and serves it at `http://127.0.0.1:4174`, using
@@ -65,6 +67,15 @@ afterward; existing users and mailbox messages are retained. Desktop/mobile scre
 and a sanitized verification record are saved. Credential-bearing traces are disabled
 for this check. To run only recovery, use
 `npm run test:e2e:live -- password-reset.spec.ts`.
+
+The verification check creates an unverified agent and proves sign-in is blocked before
+confirmation. It follows the delivered Mailpit link, checks that opening it alone does
+not verify the account, confirms explicitly, rejects replay, and signs in and reloads.
+Desktop/phone screenshots and a sanitized record are retained; credential-bearing traces
+are disabled. Run it with `npm run test:e2e:live -- email-verification.spec.ts`.
+Shared setup verifies newly generated accounts through Mailpit before logging in,
+including in the recovery and role workflows. The mailbox and worker are required even
+when only the role workflow is selected.
 
 The checks create and reuse a dedicated **Local live browser checks** tenant
 with accounts under `supportflow-live.example.com` and create fresh tickets per

@@ -118,6 +118,7 @@ _ORGANIZATION: Final = "org"
 _ROLE: Final = "role"
 _VERSION: Final = "ver"
 _RESET_AUDIENCE: Final = "supportflow:password-reset"
+_VERIFICATION_AUDIENCE: Final = "supportflow:email-verification"
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,6 +266,76 @@ def decode_password_reset_token(token: str) -> PasswordResetClaims:
         )
     except (jwt.InvalidTokenError, ValueError, KeyError) as exc:
         raise InvalidResetTokenError() from exc
+
+
+@dataclass(frozen=True, slots=True)
+class EmailVerificationClaims:
+    user_id: uuid.UUID
+    organization_id: uuid.UUID
+    email_hash: str
+
+
+def _email_verification_key() -> bytes:
+    return hmac.digest(
+        get_settings().JWT_SECRET.encode(), _VERIFICATION_AUDIENCE.encode(), "sha256"
+    )
+
+
+def email_verification_fingerprint(email: str) -> str:
+    """Bind a link and queued task to an address without copying that address to Redis."""
+    return hmac.digest(_email_verification_key(), email.encode(), "sha256").hex()
+
+
+def create_email_verification_token(
+    user_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    email_hash: str,
+    *,
+    expires_at: datetime,
+) -> str:
+    """This signature and audience are independent of access and recovery credentials."""
+    return jwt.encode(
+        {
+            "sub": str(user_id),
+            "org": str(organization_id),
+            "email_hash": email_hash,
+            "aud": _VERIFICATION_AUDIENCE,
+            "iat": datetime.now(UTC),
+            "exp": expires_at,
+            "jti": secrets.token_urlsafe(16),
+        },
+        _email_verification_key(),
+        algorithm=get_settings().JWT_ALGORITHM,
+    )
+
+
+def decode_email_verification_token(token: str) -> EmailVerificationClaims:
+    from app.core.exceptions import InvalidVerificationTokenError
+
+    try:
+        payload = jwt.decode(
+            token,
+            _email_verification_key(),
+            algorithms=[get_settings().JWT_ALGORITHM],
+            audience=_VERIFICATION_AUDIENCE,
+            options={"require": ["exp", "sub", "org", "email_hash", "aud"]},
+        )
+        if not isinstance(payload["sub"], str) or not isinstance(payload["org"], str):
+            raise ValueError("invalid verification identity")
+        email_hash = payload["email_hash"]
+        if (
+            not isinstance(email_hash, str)
+            or len(email_hash) != 64
+            or any(character not in "0123456789abcdef" for character in email_hash)
+        ):
+            raise ValueError("invalid verification address")
+        return EmailVerificationClaims(
+            user_id=uuid.UUID(payload["sub"]),
+            organization_id=uuid.UUID(payload["org"]),
+            email_hash=email_hash,
+        )
+    except (jwt.InvalidTokenError, ValueError, TypeError, OverflowError, KeyError) as exc:
+        raise InvalidVerificationTokenError() from exc
 
 
 # ---------------------------------------------------------------------------

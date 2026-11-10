@@ -1,11 +1,11 @@
-"""The email delivery task — the only thing the worker does today.
+"""SMTP delivery for notifications, password recovery, and email verification.
 
-One task, and it is deliberately the smallest useful one: load a notification by id,
-send it, record that it was sent. Everything about *which* notifications exist was
+Each task rechecks its database records before sending. Notification delivery loads a
+notification by id, sends it, and records delivery. Which notifications exist is
 decided in the API's transaction by `app/services/notification_service.py`; this module
 only carries one out of the process.
 
-**The task takes an id, never the content.** Two reasons, and the second is the one that
+**Notification tasks take an id, never the content.** Two reasons, and the second is the one that
 shapes the code. First, a message body copied into the broker is a second copy of a fact
 already stored, and the two diverge the moment either changes. Second, and more
 importantly, the broker is not durable in the way the database is — a Redis restart
@@ -13,6 +13,10 @@ without persistence loses queued messages, and a task carrying its own payload w
 mean those notifications were never delivered and nothing anywhere recorded the loss.
 Now the row is the record, `emailed_at IS NULL` is the query for "not delivered", and a
 lost message is a row somebody can find and re-queue (ADR-023).
+
+Recovery and verification tasks receive account identifiers and original expiry;
+verification also binds the queued task to the current email fingerprint. Their usable
+link credentials are generated only in the worker and never enter the broker.
 
 **One event loop per task, and therefore no connection pool.** `app/core/event_loop.run`
 builds a loop psycopg can drive (ADR-011) and a new one for every call. That is fine for
@@ -34,6 +38,7 @@ test suite therefore replaces the *enqueue* with a recorder rather than running 
 inline; the task body is exercised on its own, from a context that owns its loop.
 """
 
+import hmac
 import uuid
 from datetime import UTC, datetime
 
@@ -46,7 +51,11 @@ from sqlalchemy.pool import NullPool
 from app.core import event_loop
 from app.core.config import get_settings
 from app.core.mail import PermanentEmailError, TransientEmailError, send_email
-from app.core.security import create_password_reset_token
+from app.core.security import (
+    create_email_verification_token,
+    create_password_reset_token,
+    email_verification_fingerprint,
+)
 from app.models.enums import OrganizationStatus
 from app.models.notification import Notification
 from app.models.user import User
@@ -108,6 +117,69 @@ async def _deliver_password_reset(user_id: uuid.UUID, token_version: int, expiry
 
 
 _settings = get_settings()
+
+
+@celery_app.task(  # type: ignore[untyped-decorator]
+    name="app.workers.email_tasks.send_verification_email",
+    autoretry_for=(TransientEmailError,),
+    retry_backoff=60,
+    retry_jitter=True,
+    max_retries=5,
+)
+def send_verification_email(
+    user_id: str, organization_id: str, email_hash: str, expires_at: float
+) -> str:
+    return event_loop.run(
+        _deliver_verification(
+            uuid.UUID(user_id), uuid.UUID(organization_id), email_hash, expires_at
+        )
+    )
+
+
+async def _deliver_verification(
+    user_id: uuid.UUID, organization_id: uuid.UUID, email_hash: str, expiry: float
+) -> str:
+    expires_at = datetime.fromtimestamp(expiry, UTC)
+    if expires_at <= datetime.now(UTC):
+        return "expired"
+    async with _SessionFactory() as session:
+        result = await session.execute(
+            select(User)
+            .where(User.id == user_id, User.organization_id == organization_id)
+            .options(joinedload(User.organization))
+        )
+        user = result.scalar_one_or_none()
+        if (
+            user is None
+            or not user.is_active
+            or user.email_verified_at is not None
+            or user.organization.status != OrganizationStatus.ACTIVE
+            or not hmac.compare_digest(email_hash, email_verification_fingerprint(user.email))
+        ):
+            return "no-recipient"
+        token = create_email_verification_token(
+            user.id, user.organization_id, email_hash, expires_at=expires_at
+        )
+        settings = get_settings()
+        link = f"{str(settings.PUBLIC_APP_URL).rstrip('/')}/verify-email#token={token}"
+        send_email(
+            to=user.email,
+            subject=f"[{settings.PROJECT_NAME}] Verify your email — {user.organization.name}",
+            body=(
+                f"Confirm your email address for the {user.organization.name} workspace.\n\n"
+                f"Verify your email:\n{link}\n\n"
+                f"This link expires {expires_at:%d %b %Y at %H:%M UTC} and can be used once.\n"
+                "After verification, sign in with your password.\n"
+                "If you did not create or request this account, you can ignore this email."
+            ),
+        )
+        logger.info(
+            "verification_email_delivered",
+            user_id=str(user.id),
+            organization_id=str(user.organization_id),
+        )
+        return "delivered"
+
 
 # See the module docstring: no pool, because a pooled connection would belong to the loop
 # that opened it and the next task gets a different loop. `echo` is left off and not

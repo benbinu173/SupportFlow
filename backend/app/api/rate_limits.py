@@ -42,13 +42,15 @@ from app.core.config import get_settings
 from app.core.rate_limit import (
     RateLimiter,
     ai_rate_limit_key,
+    email_verification_email_rate_limit_key,
+    email_verification_rate_limit_key,
     login_rate_limit_key,
     password_reset_email_rate_limit_key,
     password_reset_rate_limit_key,
     register_rate_limit_key,
     upload_rate_limit_key,
 )
-from app.schemas.auth import ForgotPasswordRequest
+from app.schemas.auth import ForgotPasswordRequest, ResendVerificationRequest
 
 # One limiter for the process. It borrows the shared Redis client on first use, so there
 # is one client and one pool regardless of how many guards exist.
@@ -93,6 +95,28 @@ async def limit_password_reset_confirm(request: Request) -> None:
     await _limiter.enforce(
         password_reset_rate_limit_key(client_ip(request), confirmation=True),
         limit=get_settings().RATE_LIMIT_PASSWORD_RESET_CONFIRM_PER_MINUTE,
+        window_seconds=60,
+    )
+
+
+async def limit_verification_request(request: Request, payload: ResendVerificationRequest) -> None:
+    settings = get_settings()
+    await _limiter.enforce(
+        email_verification_rate_limit_key(client_ip(request)),
+        limit=settings.RATE_LIMIT_EMAIL_VERIFICATION_PER_HOUR,
+        window_seconds=3600,
+    )
+    await _limiter.enforce(
+        email_verification_email_rate_limit_key(payload.email),
+        limit=settings.RATE_LIMIT_EMAIL_VERIFICATION_EMAIL_PER_HOUR,
+        window_seconds=3600,
+    )
+
+
+async def limit_verification_confirm(request: Request) -> None:
+    await _limiter.enforce(
+        email_verification_rate_limit_key(client_ip(request), confirmation=True),
+        limit=get_settings().RATE_LIMIT_EMAIL_VERIFICATION_CONFIRM_PER_MINUTE,
         window_seconds=60,
     )
 

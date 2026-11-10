@@ -62,6 +62,9 @@ class User(UUIDPrimaryKeyMixin, OrganizationScopedMixin, TimestampMixin, Base):
     )
 
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # New accounts confirm ownership before authenticating. Legacy access is preserved
+    # by the migration, rather than a default that would silently verify new accounts.
+    email_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     # Set only for role=customer. SET NULL rather than CASCADE: removing a CRM
     # contact record should not silently delete the login account.

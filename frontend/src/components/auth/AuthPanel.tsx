@@ -4,7 +4,7 @@ import { cn } from '@/utils/cn'
 
 import { AuthPanelCards, AuthPanelGlow, type PanelCard } from './AuthPanelVisual'
 
-export type PanelVariant = 'login' | 'register' | 'recovery'
+export type PanelVariant = 'login' | 'register' | 'recovery' | 'verification'
 
 interface PanelCopy {
   eyebrow: string
@@ -36,6 +36,16 @@ interface PanelCopy {
  * `LoginPage.test.tsx` asserts by checking that nothing reaches web storage.
  */
 const PANEL_COPY: Record<PanelVariant, PanelCopy> = {
+  verification: {
+    eyebrow: 'Email verification',
+    headline: 'One last step. Then your workspace.',
+    body: 'Confirm your email address so you can sign in and get started with your team.',
+    footnote: 'Each email names its workspace. Verification links expire and can be used once. Your password stays the same.',
+    cards: [
+      { kind: 'prose', eyebrow: 'Your address', body: 'Open the link sent to your email and confirm that it belongs to you.' },
+      { kind: 'prose', eyebrow: 'Your workspace', body: 'Sign in with your password after verification to start working.' },
+    ],
+  },
   recovery: {
     eyebrow: 'Account recovery',
     headline: 'Get back to your workspace.',
@@ -135,7 +145,7 @@ export function AuthPanel({ variant, className }: { variant: PanelVariant; class
         {/* The cards sit in the optical centre, between the eyebrow and the
             headline, and take whatever height is left over. */}
         <div className="flex flex-1 items-center py-12">
-          <AuthPanelCards cards={copy.cards} x={parallax.x} y={parallax.y} overlap={variant !== 'recovery'} />
+          <AuthPanelCards cards={copy.cards} x={parallax.x} y={parallax.y} overlap={variant === 'login' || variant === 'register'} />
         </div>
 
         <div className="flex flex-col gap-4">

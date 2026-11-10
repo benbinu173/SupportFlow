@@ -16,8 +16,10 @@ Two families of fixture live here:
 import asyncio
 import itertools
 import os
+import uuid
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
@@ -53,6 +55,9 @@ os.environ.setdefault("RATE_LIMIT_REGISTER_PER_HOUR", "100000")
 os.environ.setdefault("RATE_LIMIT_PASSWORD_RESET_PER_HOUR", "100000")
 os.environ.setdefault("RATE_LIMIT_PASSWORD_RESET_EMAIL_PER_HOUR", "100000")
 os.environ.setdefault("RATE_LIMIT_PASSWORD_RESET_CONFIRM_PER_MINUTE", "100000")
+os.environ.setdefault("RATE_LIMIT_EMAIL_VERIFICATION_PER_HOUR", "100000")
+os.environ.setdefault("RATE_LIMIT_EMAIL_VERIFICATION_EMAIL_PER_HOUR", "100000")
+os.environ.setdefault("RATE_LIMIT_EMAIL_VERIFICATION_CONFIRM_PER_MINUTE", "100000")
 os.environ.setdefault("RATE_LIMIT_UPLOAD_PER_HOUR", "100000")
 # Phase U as well, for the same reason and with one more: `POST /tickets` now queues an
 # analysis, so every test that raises a ticket passes through the AI counter. Left at the
@@ -341,6 +346,20 @@ def truncate_tables(sync_engine: Engine) -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def queued_verifications(monkeypatch: pytest.MonkeyPatch) -> list[list[Any]]:
+    """Capture tasks without reaching a broker; helpers confirm through the real API."""
+    from app.workers.email_tasks import send_verification_email
+
+    queued: list[list[Any]] = []
+
+    def record(*, args: list[Any], **kwargs: Any) -> None:
+        queued.append(args)
+
+    monkeypatch.setattr(send_verification_email, "apply_async", record)
+    return queued
+
+
+@pytest.fixture(autouse=True)
 def queued_emails(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Record the notification ids delivery was queued for, and queue nothing.
 
@@ -456,6 +475,7 @@ class OrgSession:
     refresh_token: str | None = None
     _users_created: int = field(default=0, repr=False)
     _customers_created: int = field(default=0, repr=False)
+    _verification_requests: list[list[Any]] = field(default_factory=list, repr=False)
 
     @property
     def auth(self) -> dict[str, str]:
@@ -540,7 +560,16 @@ class OrgSession:
         response = self.post(USERS, json=body)
         assert response.status_code == 201, response.text
 
-        return login(self.client, address, password)
+        verified = verify_created_account(
+            self.client, self._verification_requests, response.json()["id"]
+        )
+        return login(
+            self.client,
+            address,
+            password,
+            verification_requests=self._verification_requests,
+            organization_slug=verified["organization_slug"],
+        )
 
     def add_customer(
         self,
@@ -615,9 +644,40 @@ def cookie_header(token: str) -> dict[str, str]:
     return {"Cookie": f"{get_settings().REFRESH_COOKIE_NAME}={token}"}
 
 
-def login(client: TestClient, email: str, password: str = PASSWORD) -> OrgSession:
+def verify_created_account(
+    client: TestClient, requests: list[list[Any]], user_id: str | None = None
+) -> dict[str, Any]:
+    """Stand in for the mailbox owner using captured task arguments, then POST the link."""
+    from app.core.security import create_email_verification_token
+
+    args = next(
+        (args for args in reversed(requests) if user_id is None or args[0] == user_id), None
+    )
+    assert args is not None, "The new account did not queue an email verification task"
+    token = create_email_verification_token(
+        uuid.UUID(args[0]),
+        uuid.UUID(args[1]),
+        args[2],
+        expires_at=datetime.fromtimestamp(args[3], UTC),
+    )
+    response = client.post(f"{AUTH}/verify-email", json={"token": token})
+    assert response.status_code == 200, response.text
+    return cast("dict[str, Any]", response.json())
+
+
+def login(
+    client: TestClient,
+    email: str,
+    password: str = PASSWORD,
+    *,
+    verification_requests: list[list[Any]] | None = None,
+    organization_slug: str | None = None,
+) -> OrgSession:
     """Authenticate over HTTP and return the resulting session."""
-    response = client.post(f"{AUTH}/login", json={"email": email, "password": password})
+    payload = {"email": email, "password": password}
+    if organization_slug is not None:
+        payload["organization_slug"] = organization_slug
+    response = client.post(f"{AUTH}/login", json=payload)
     assert response.status_code == 200, response.text
 
     body = response.json()
@@ -637,11 +697,14 @@ def login(client: TestClient, email: str, password: str = PASSWORD) -> OrgSessio
         role=me.json()["role"],
         access_token=body["access_token"],
         refresh_token=response.cookies.get(get_settings().REFRESH_COOKIE_NAME),
+        _verification_requests=verification_requests if verification_requests is not None else [],
     )
 
 
 @pytest.fixture
-def register_org(client: TestClient) -> Callable[..., OrgSession]:
+def register_org(
+    client: TestClient, queued_verifications: list[list[Any]]
+) -> Callable[..., OrgSession]:
     """Factory for registered organizations, each with its own admin session.
 
     A counter rather than a fixture parameter so a single test can register two
@@ -668,21 +731,14 @@ def register_org(client: TestClient) -> Callable[..., OrgSession]:
         )
         assert response.status_code == 201, response.text
 
-        body = response.json()
         client.cookies.clear()
-        refresh_token = response.cookies.get(get_settings().REFRESH_COOKIE_NAME)
-
-        me = client.get(f"{AUTH}/me", headers={"Authorization": f"Bearer {body['access_token']}"})
-        assert me.status_code == 200, me.text
-
-        return OrgSession(
-            client=client,
-            user_id=me.json()["id"],
-            email=email or f"admin{number}@example.com",
-            password=password,
-            role=me.json()["role"],
-            access_token=body["access_token"],
-            refresh_token=refresh_token,
+        verified = verify_created_account(client, queued_verifications)
+        return login(
+            client,
+            email or f"admin{number}@example.com",
+            password,
+            verification_requests=queued_verifications,
+            organization_slug=verified["organization_slug"],
         )
 
     return _register

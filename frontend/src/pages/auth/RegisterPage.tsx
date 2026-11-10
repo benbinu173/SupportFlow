@@ -1,6 +1,6 @@
 import { ArrowRight } from '@phosphor-icons/react'
 import { type FormEvent, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 
 import { Enter } from '@/components/motion/Enter'
 import { Button } from '@/components/ui/Button'
@@ -15,9 +15,8 @@ import {
   PASSWORD_MIN_LENGTH,
   passwordLengthProblem,
 } from '@/features/auth/password-policy'
-import { useAuthenticate } from '@/features/auth/useAuthenticate'
 import { register } from '@/services/api/auth'
-import { ApiError, fieldError } from '@/services/api/errors'
+import { ApiError, fieldError, toApiError } from '@/services/api/errors'
 
 /**
  * The registration form.
@@ -37,7 +36,9 @@ import { ApiError, fieldError } from '@/services/api/errors'
  * message that follows them.
  */
 export function RegisterPage() {
-  const { authenticate, pending, error } = useAuthenticate()
+  const navigate = useNavigate()
+  const [pending, setPending] = useState(false)
+  const [error, setError] = useState<ApiError | null>(null)
 
   const [organizationName, setOrganizationName] = useState('')
   const [name, setName] = useState('')
@@ -55,6 +56,7 @@ export function RegisterPage() {
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
+    if (pending) return
 
     const problem = passwordLengthProblem(password)
 
@@ -65,14 +67,21 @@ export function RegisterPage() {
 
     setLocalError(null)
 
-    await authenticate(() =>
-      register({
+    setPending(true)
+    setError(null)
+    try {
+      const result = await register({
         organization_name: organizationName,
         name,
         email,
         password,
-      }),
-    )
+      })
+      navigate('/verify-email', { replace: true, state: { email: result.email, requested: true } })
+    } catch (cause) {
+      setError(toApiError(cause))
+    } finally {
+      setPending(false)
+    }
   }
 
   return (

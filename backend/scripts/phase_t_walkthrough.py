@@ -77,6 +77,7 @@ from app.schemas.ai import (
     SuggestedReply,
 )
 from app.services import ai_service
+from scripts.mailbox_verification import finish_registration
 
 BASE = "http://localhost:8000/api/v1"
 PASSWORD = "correct-horse-battery-staple"
@@ -168,6 +169,7 @@ class Tenant:
             timeout=30.0,
         )
         response.raise_for_status()
+        response = finish_registration(response)
         self.token = str(response.json()["access_token"])
 
     @property

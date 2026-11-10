@@ -24,6 +24,9 @@ class LoginRequest(BaseModel):
     """Credentials submitted to the login endpoint."""
 
     email: Email
+    # A mailbox link identifies the intended workspace when the same email/password
+    # belongs to more than one. This narrows credential lookup; it is not authority.
+    organization_slug: str | None = Field(default=None, min_length=1, max_length=107)
 
     # A plain `str`, not the validated `Password` type, and that is deliberate.
     #
@@ -33,6 +36,13 @@ class LoginRequest(BaseModel):
     # for any account whose password predates a policy change. Login's job is to
     # compare against a stored hash, and a hash check needs no policy.
     password: str = Field(max_length=1024)
+
+
+class RegistrationResponse(BaseModel):
+    """Account creation is complete; authentication follows email verification."""
+
+    email: str
+    detail: str = "Check your email to verify your account before signing in."
 
 
 class TokenResponse(BaseModel):
@@ -75,3 +85,21 @@ class ResetPasswordRequest(BaseModel):
 
 class ResetPasswordResponse(BaseModel):
     detail: str = "Password updated. Sign in with your new password."
+
+
+class ResendVerificationRequest(BaseModel):
+    email: Email
+
+
+class ResendVerificationResponse(BaseModel):
+    detail: str = "If an active account still needs verification, we'll send a new email link."
+
+
+class VerifyEmailRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=2048)
+
+
+class VerifyEmailResponse(BaseModel):
+    email: str
+    organization_slug: str
+    detail: str = "Email verified. You can now sign in."

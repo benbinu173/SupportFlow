@@ -76,6 +76,10 @@ uvicorn app.main:app --reload
 cd frontend
 npm install
 npm run dev
+
+# 5. Worker (new terminal, from backend/ with the virtual environment active)
+# Required to deliver verification email before a newly created account can sign in.
+celery -A app.workers.celery_app worker --loglevel=info --pool=solo -Q notifications,sla,ai,knowledge,maintenance
 ```
 
 | Service | URL |
@@ -110,7 +114,9 @@ rather than falling back to something insecure.
 | `SLA_SWEEP_BATCH_SIZE` | Tickets per priority per sweep (default 500) |
 | `ABANDONED_CLAIM_AFTER_SECONDS` | How long a `processing` row may go untouched before the reaper fails it (default 900). Measured against the two-minute hard task limit — see [the abandoned-claim sweep](#the-abandoned-claim-sweep) |
 | `ABANDONED_CLAIM_SWEEP_INTERVAL_SECONDS` | How often beat runs that reaper (default 600). Coarser than the SLA sweep on purpose: nothing can be reaped before `ABANDONED_CLAIM_AFTER_SECONDS` has passed, so a finer interval only finds the same rows again |
-| `RATE_LIMIT_*` | Per-address login/registration limits and the per-user upload limit |
+| `RATE_LIMIT_*` | Per-address login/registration limits, separate address/email limits for recovery and verification, and per-user upload/AI limits |
+| `PUBLIC_APP_URL` | Trusted frontend origin used by verification and password-recovery emails; configure it in both API and worker |
+| `EMAIL_VERIFICATION_EXPIRE_MINUTES` | Verification-link lifetime from the request (default 60); new accounts require email confirmation before sign-in |
 | `JWT_SECRET` | Access-token signing; minimum 32 characters (required) |
 | `CORS_ORIGINS` | Comma-separated allowlist. No wildcard — the refresh cookie needs credentials |
 | `AI_API_KEY` | Generation provider credential (optional — an installation that does not want AI runs without one, and the first call is what says so). Its shape follows the provider: `sk-ant-...` for Anthropic, `gsk_...` for Groq |
@@ -143,7 +149,8 @@ celery -A app.workers.celery_app worker --loglevel=info --pool=solo -Q notificat
 celery -A app.workers.celery_app beat --loglevel=info -s /tmp/celerybeat-schedule
 
 # End-to-end against a running server, including the parts TestClient cannot show
-# (real multipart, real streaming, real headers). Needs the API on :8000.
+# (real multipart, real streaming, real headers). Generated accounts need the API on
+# :8000, the notifications worker, and Mailpit on :8025 to confirm their email.
 python scripts/phase_ln_walkthrough.py
 
 # The same, for notifications: needs the API on :8000, the worker above, and Mailpit.
@@ -160,12 +167,12 @@ python scripts/phase_q_walkthrough.py
 # handshake, an internal note, another tenant's event, and a worker-dispatched alert.
 python scripts/phase_r_walkthrough.py
 
-# And for analytics: only the API. Nine tickets built through the API, aged in SQL, and
+# And for analytics: the API plus account-verification mail. Nine tickets built through the API, aged in SQL, and
 # every endpoint checked against numbers derived from that fixture and the tenant's own
 # policies — plus a cache hit proved by an entry's TTL counting down rather than resetting.
 python scripts/phase_s_walkthrough.py
 
-# And for the AI foundation: only the API, and a real key in .env. Four live calls across
+# And for the AI foundation: the API, account-verification mail, and a real key in .env. Four live calls across
 # §17's four operations, one deliberate permanent failure with a wrong key, and the spend
 # read back out of /analytics/overview. An empty AI_API_KEY skips with a message.
 python scripts/phase_t_walkthrough.py
@@ -230,12 +237,14 @@ Notes:
 ## Authentication
 
 Email and password, with Argon2id hashing (ADR-001) and short-lived JWT access tokens
-(ADR-002). Seven endpoints, all under `/api/v1/auth`:
+(ADR-002). Nine endpoints, all under `/api/v1/auth`:
 
 | Endpoint | Auth | Purpose |
 |---|---|---|
-| `POST /register` | public | Creates an organization **and** its first administrator |
-| `POST /login` | public | Returns an access token; sets the refresh cookie |
+| `POST /register` | public | Creates an organization and its unverified administrator; queues verification email |
+| `POST /resend-verification` | public | Accepts an email and queues workspace-specific verification links |
+| `POST /verify-email` | verification link | Confirms the account's email; returns its email and workspace slug |
+| `POST /login` | public | Signs in a verified account; returns an access token and sets the refresh cookie |
 | `POST /forgot-password` | public | Accepts an email and queues workspace-specific recovery links |
 | `POST /reset-password` | reset link | Changes the password and ends the account's previous sessions |
 | `POST /refresh` | cookie | Rotates the refresh token; returns a new access token |
@@ -286,10 +295,48 @@ The resetting browser ends its session and clears private cached data. Sign in w
 new password to continue. [ADR-035](docs/architecture-decisions.md#adr-035--password-recovery-uses-account-versions-and-workspace-specific-email-links)
 records the credential and concurrency choices.
 
+**Email verification** is required for every newly registered or administrator-created
+account. Registration returns `201 {email, detail}` without an access token or refresh
+cookie. The browser opens `/verify-email` and offers resend. Correct credentials for an
+unverified account receive `403 EMAIL_NOT_VERIFIED`; refresh, protected HTTP requests,
+and WebSocket authentication also refuse unverified accounts.
+
+`POST /resend-verification` returns the same `202` confirmation for known, unknown,
+verified, disabled, and queue-failure cases. Up to five active, unverified accounts
+matching the normalized email across active organizations receive separate emails
+naming their workspace. Requests have independent address and hashed-email limits;
+confirmation has its own address limit.
+
+The notifications worker creates a signed credential bound to the account, organization,
+and current email fingerprint, with a separate signing purpose from sessions and password
+recovery. Links use `PUBLIC_APP_URL` and expire after `EMAIL_VERIFICATION_EXPIRE_MINUTES`
+(default 60), measured from the original request. The email opens
+`/verify-email#token=...`; the page removes the fragment and keeps the credential in memory.
+Confirmation requires an explicit click. One successful confirmation locks the account
+row, stamps `email_verified_at`, and records `email_verified` in one transaction. All
+links for that account then become unusable. Invalid, expired, and used links receive
+`400 INVALID_VERIFICATION_TOKEN` and offer another request.
+
+Confirmation does not start a session. The recipient continues to sign-in with the
+confirmed email and workspace slug. Login accepts an optional `organization_slug` to
+narrow the credential lookup when workspaces share an email and password. An existing
+browser session is preserved until the recipient explicitly continues to sign-in.
+Reloading the confirmation screen requires opening the email link again.
+
+Migration `e73a61b24f09` backfills existing users to preserve their access; that timestamp
+is a compatibility baseline rather than evidence of a historical email confirmation.
+New rows have no verification default. [ADR-036](docs/architecture-decisions.md#adr-036--new-accounts-confirm-email-before-a-session-is-issued)
+records the link and migration choices. Local walkthroughs and checkers confirm generated
+accounts through Mailpit; they require the notifications worker and mailbox service.
+Local production checkers use the Mailpit compose override described in the
+[frontend README](frontend/README.md#production-stack-browser-checks).
+The demo seeder explicitly trusts its canned local identities and stamps them as verified
+in the database; this does not expose a verification bypass through the API.
+
 ### The token is an identifier, not an authority
 
 On every request the dependency verifies the signature, loads the user, refuses if the
-user is inactive, and then **uses the role from the database row** — not the claim in
+user is inactive or unverified, and then **uses the role from the database row** — not the claim in
 the token. A token whose `org` disagrees with the user's current `organization_id` is
 refused with `TENANT_ACCESS_DENIED`.
 
@@ -300,7 +347,13 @@ The practical effect: a demotion, a promotion, a deactivation, or a password res
 # A complete session, against a running server
 curl -sX POST localhost:8000/api/v1/auth/register -H 'content-type: application/json' \
   -d '{"organization_name":"Acme","name":"Ada","email":"ada@acme.com","password":"correct-horse-battery-staple"}'
-# → 201 {"access_token":"eyJ...","token_type":"bearer","expires_in":900}  + Set-Cookie: sf_refresh=...
+# → 201 {"email":"ada@acme.com","detail":"Check your email to verify your account before signing in."}
+
+# Open the delivered email in Mailpit at localhost:8025 and click Verify email.
+# Then sign in; use the returned access token and refresh cookie for the next calls.
+curl -sX POST localhost:8000/api/v1/auth/login -H 'content-type: application/json' \
+  -d '{"email":"ada@acme.com","password":"correct-horse-battery-staple","organization_slug":"acme"}'
+# → 200 {"access_token":"eyJ...","token_type":"bearer","expires_in":900}  + Set-Cookie: sf_refresh=...
 
 curl -s localhost:8000/api/v1/auth/me -H "Authorization: Bearer $TOKEN"
 curl -sX POST localhost:8000/api/v1/auth/refresh -b "sf_refresh=$REFRESH"
@@ -2361,20 +2414,19 @@ than an application one — and it is the one grep-shaped gap in the row above.
   specific cloud.
 - On Windows, the API must be started with
   `--loop app.core.event_loop:loop_factory` (`make api` includes it). See ADR-011.
-- **Login cannot disambiguate two accounts that share an email *and* a password.**
-  Email is unique per organization, so the credential is resolved without a tenant in
-  the request. Distinct passwords resolve unambiguously; identical ones return one of
-  the two, deterministically. The fix is to take the tenant from the request host (a
-  subdomain per organization), which a JSON API alone cannot express. Asserted rather
-  than hidden — see
+- **Login without a workspace slug remains ambiguous for accounts sharing an email and password.**
+  `organization_slug` narrows the credential lookup, and verification-driven sign-in
+  supplies it. The ordinary sign-in form does not offer a workspace selector;
+  identical credentials without a slug still resolve deterministically. See
   [tests/security/test_tenant_isolation.py](backend/tests/security/test_tenant_isolation.py).
 - **Login and registration limits share a bucket behind a NAT.** Password recovery
   also has a per-email limit; uploads and AI calls are limited per user. See ADR-014.
 - **No "log out everywhere" endpoint.** `/auth/logout` revokes one session; whole-family
   revocation exists for reuse detection. ADR-003 anticipates an all-sessions endpoint
   if it is wanted.
-- **Email verification is not implemented.** Password recovery uses the existing
-  SMTP worker and Mailpit path.
+- **New accounts depend on verification-email delivery before sign-in.** The
+  notifications worker, SMTP provider, and `PUBLIC_APP_URL` must be configured.
+  Public resend remains available after a queue outage; existing migrated users keep access.
 - **Ticket lists return every matching row for an admin.** Pagination caps the page, not
   the total, and `GET /tickets` has no `count()`. This matches `/users` and is the
   documented behaviour rather than an oversight — a total can be added later as a

@@ -11,6 +11,7 @@ import { Enter } from '@/components/motion/Enter'
  * while account recovery has its own explanation.
  */
 function panelFor(pathname: string): PanelVariant {
+  if (pathname === '/verify-email') return 'verification'
   if (pathname === '/forgot-password' || pathname === '/reset-password') return 'recovery'
   return pathname.startsWith('/register') ? 'register' : 'login'
 }

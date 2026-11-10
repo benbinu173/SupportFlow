@@ -44,12 +44,7 @@ const ADMIN: SessionUser = {
   customer_id: null,
   created_at: '2026-01-01T00:00:00Z',
   last_login_at: null,
-}
-
-const TOKEN = {
-  access_token: 'issued-access-token',
-  token_type: 'bearer',
-  expires_in: 900,
+  email_verified_at: null,
 }
 
 const FORM = {
@@ -100,21 +95,24 @@ beforeEach(() => {
 
   useSessionStore.setState({ status: 'anonymous', user: null, accessToken: null })
 
-  api.register.mockResolvedValue(TOKEN)
+  api.register.mockResolvedValue({ email: FORM.email, detail: 'Check your email before signing in.' })
   api.fetchCurrentUser.mockResolvedValue(ADMIN)
 })
 
 describe('creating a workspace', () => {
-  it('sends the tenant name under the name the API expects, then lands the new admin home', async () => {
+  it('creates the workspace, then waits for email verification without starting a session', async () => {
     const memoryRouter = renderRegister()
 
     await fillAndSubmit()
 
     expect(
-      await screen.findByRole('heading', { level: 1, name: 'Welcome back, Dana' })
+      await screen.findByRole('heading', { level: 1, name: 'Check your email' })
     ).toBeVisible()
 
-    expect(memoryRouter.state.location.pathname).toBe('/dashboard')
+    expect(memoryRouter.state.location.pathname).toBe('/verify-email')
+    expect(screen.getByRole('textbox', { name: 'Email' })).toHaveValue(FORM.email)
+    expect(useSessionStore.getState().status).toBe('anonymous')
+    expect(api.fetchCurrentUser).not.toHaveBeenCalled()
 
     // `organization_name`, not `organizationName` and not `organization`. The
     // server field is snake case and the client sends the server's spelling

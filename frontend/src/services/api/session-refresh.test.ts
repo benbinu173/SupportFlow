@@ -33,6 +33,7 @@ function signedIn() {
       customer_id: null,
       created_at: '2026-01-01T00:00:00Z',
       last_login_at: null,
+      email_verified_at: '2026-01-01T00:00:00Z',
     },
   })
 }

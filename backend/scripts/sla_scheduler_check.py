@@ -127,6 +127,8 @@ def request(
 
 
 def admin(client: httpx.Client, email: str, organization: str) -> Account:
+    from scripts.mailbox_verification import finish_registration, verify_local_account
+
     response = client.post("/api/v1/auth/login", json={"email": email, "password": PASSWORD})
     if response.status_code == 401:
         response = client.post(
@@ -138,6 +140,27 @@ def admin(client: httpx.Client, email: str, organization: str) -> Account:
                 "password": PASSWORD,
             },
         )
+    if response.status_code == 201:
+        response = finish_registration(response, client=client, mailpit_url=MAILPIT)
+    elif (
+        response.status_code == 403
+        and response.json().get("error", {}).get("code") == "EMAIL_NOT_VERIFIED"
+    ):
+        verified = verify_local_account(
+            email,
+            api_base=f"{BASE}/api/v1",
+            client=client,
+            mailpit_url=MAILPIT,
+            workspace=organization,
+        )
+        response = client.post(
+            "/api/v1/auth/login",
+            json={
+                "email": email,
+                "password": PASSWORD,
+                "organization_slug": verified["organization_slug"],
+            },
+        )
     if not response.is_success:
         raise RuntimeError(f"Test tenant login/registration: HTTP {response.status_code}")
     token = response.json()["access_token"]
@@ -147,6 +170,8 @@ def admin(client: httpx.Client, email: str, organization: str) -> Account:
 
 
 def member(client: httpx.Client, owner: Account, role: str, name: str) -> Account:
+    from scripts.mailbox_verification import verify_local_account
+
     email = f"{name}@{DOMAIN}"
     users = request(client, "GET", "/users", owner)
     user = next((user for user in users if user["email"] == email), None)
@@ -163,7 +188,13 @@ def member(client: httpx.Client, owner: Account, role: str, name: str) -> Accoun
                 "role": role,
             },
         )
-    token = request(client, "POST", "/auth/login", json={"email": email, "password": PASSWORD})
+    payload = {"email": email, "password": PASSWORD}
+    if user.get("email_verified_at") is None:
+        verified = verify_local_account(
+            email, api_base=f"{BASE}/api/v1", client=client, mailpit_url=MAILPIT, user_id=user["id"]
+        )
+        payload["organization_slug"] = verified["organization_slug"]
+    token = request(client, "POST", "/auth/login", json=payload)
     return Account(token["access_token"], user)
 
 

@@ -50,6 +50,8 @@ class ErrorCode(StrEnum):
     AUTHENTICATION_REQUIRED = "AUTHENTICATION_REQUIRED"
     INVALID_CREDENTIALS = "INVALID_CREDENTIALS"
     INVALID_RESET_TOKEN = "INVALID_RESET_TOKEN"  # noqa: S105 -- error code, not a credential.
+    INVALID_VERIFICATION_TOKEN = "INVALID_VERIFICATION_TOKEN"  # noqa: S105
+    EMAIL_NOT_VERIFIED = "EMAIL_NOT_VERIFIED"
     FORBIDDEN = "FORBIDDEN"
     TENANT_ACCESS_DENIED = "TENANT_ACCESS_DENIED"
 
@@ -178,6 +180,22 @@ class InactiveUserError(AppError):
     code = ErrorCode.FORBIDDEN
     status_code = status.HTTP_403_FORBIDDEN
     message = "This account is inactive."
+
+
+class InvalidVerificationTokenError(AppError):
+    """Every unusable verification link has the same public response."""
+
+    code = ErrorCode.INVALID_VERIFICATION_TOKEN
+    status_code = status.HTTP_400_BAD_REQUEST
+    message = "This verification link is invalid or has expired. Request a new one."
+
+
+class EmailNotVerifiedError(AppError):
+    """Credentials match, but email ownership has not been confirmed."""
+
+    code = ErrorCode.EMAIL_NOT_VERIFIED
+    status_code = status.HTTP_403_FORBIDDEN
+    message = "Verify your email before signing in."
 
 
 # ---------------------------------------------------------------------------

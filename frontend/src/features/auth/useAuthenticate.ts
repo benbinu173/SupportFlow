@@ -8,12 +8,9 @@ import type { TokenResponse } from '@/services/api/session-refresh'
 import { useSessionStore } from '@/store/auth'
 
 /**
- * The half of signing in that login and registration share.
+ * Exchange credentials, load the current profile, and navigate to the role's home.
  *
- * They look like different screens and are the same transaction: call an
- * endpoint that returns a token, learn who the token belongs to, record the
- * session, and go where that role belongs. Only the call in the middle differs,
- * which is why it is the argument.
+ * Registration waits for email verification before this session flow can begin.
  *
  * `fetchCurrentUser` rather than trusting a user object from the login response:
  * `/auth/login` returns a token and nothing else (`schemas/auth.py` — the
@@ -62,6 +59,7 @@ export function useAuthenticate() {
         // an agent landing on the marketing page after signing in has been
         // signed in and then sent somewhere that is not their work.
         navigate(returnTo ?? HOME_BY_ROLE[user.role], { replace: true })
+        return null
       } catch (cause) {
         // Undo the token recorded above. It belongs to a session that never
         // materialised, and leaving it would put a live credential in a store
@@ -75,7 +73,9 @@ export function useAuthenticate() {
         // Rendered on the form rather than thrown onward: an authentication
         // failure is a thing this screen exists to report, and an error
         // boundary would replace the form the user needs to correct.
-        setError(toApiError(cause))
+        const failure = toApiError(cause)
+        setError(failure)
+        return failure
       } finally {
         setPending(false)
       }

@@ -25,6 +25,7 @@ function account(role: Role, id: string, name: string): User {
     customer_id: role === 'customer' ? customerId : null,
     created_at: now,
     last_login_at: null,
+    email_verified_at: now,
   }
 }
 
@@ -248,7 +249,7 @@ class WorkflowApi {
         const payload = body as components['schemas']['UserCreate']
         const user: User = {
           id: this.nextId(), name: payload.name, email: payload.email, role: payload.role,
-          customer_id: payload.customer_id ?? null, is_active: true, created_at: now, last_login_at: null,
+          customer_id: payload.customer_id ?? null, is_active: true, created_at: now, last_login_at: null, email_verified_at: null,
         }
         this.users.push(user)
         return reply(user, 201)

@@ -4410,4 +4410,56 @@ live browser check follows a real Mailpit email, verifies old sessions and a reu
 are refused, and signs in with the new password. It disables credential-bearing traces
 and retains a sanitized verification record.
 
+## ADR-036 — New accounts confirm email before a session is issued
+
+**Status:** Accepted, 2026-11-10.
+
+**Context.** Registration and administrator-created accounts previously allowed sign-in
+without evidence that the account owner controlled the address. Verification must work
+before authentication, select the intended workspace when an email belongs to several
+organizations, and avoid usable credentials in the broker, server request URLs, or logs.
+
+**Decision.** New users have nullable `email_verified_at` with no default. Registration
+commits the organization and administrator, queues verification, and returns only email
+and confirmation copy. Login, refresh, protected HTTP requests, and WebSocket
+authentication refuse unverified users. Password recovery does not implicitly verify them.
+
+The notifications task receives user and organization IDs, an HMAC fingerprint of the
+current email, and the original expiry. It rechecks active account/organization state
+before generating a JWT for the separately derived `supportflow:email-verification`
+signing purpose and audience. `PUBLIC_APP_URL` supplies the trusted frontend origin.
+The default lifetime is 60 minutes from the request. Public resends return the same
+`202` response for every account state and queue failure, send at most five workspace-named
+emails, and use independent address and hashed-email limits. Confirmation has its own limit.
+
+The browser removes the emailed URL fragment and keeps its credential only in memory.
+Opening the link does not consume it; the recipient explicitly confirms. Confirmation
+holds the user row lock, checks account, tenant, and email binding, stamps verification,
+and records an `email_verified` audit event in one transaction. The stamp consumes every
+sibling link, so concurrent confirmations can succeed only once. Verification does not
+issue a session or change a password. A successful response includes email and workspace
+slug for the next sign-in. Login accepts an optional `organization_slug` that narrows
+credential lookup while preserving database-based tenant and role authorization.
+
+An existing browser session is preserved while viewing or confirming another account's
+link. Switching accounts requires the explicit Continue to sign in action, which ends
+the current session and clears private cached data. A link arriving on the waiting route
+is captured even when the page remains mounted; older request responses cannot replace it.
+
+**Consequences.** Migration `e73a61b24f09` backfills existing accounts to preserve access.
+Their timestamp is a compatibility baseline, not historical proof of email ownership;
+new users must confirm. The migration adds the audit enum label, which remains on
+downgrade so historical audit records remain readable. Resending preserves older links
+until one is consumed. Reloading the confirmation page requires reopening the email.
+Account creation remains committed after a queue outage, with public resend available.
+SMTP and the notifications worker are now prerequisites for new-account sign-in.
+
+Local walkthroughs and smoke checkers verify generated accounts through Mailpit
+and the real API without printing or saving link credentials. Local production setup
+uses the Mailpit compose override; remote checkers require an already verified account.
+The local demo seeder explicitly marks its canned identities verified in the database;
+that trust exception is not exposed by account-creation or verification endpoints.
+The ordinary sign-in form still lacks a workspace selector, so identical credentials
+without an explicit slug retain the previous deterministic ambiguity.
+
 
