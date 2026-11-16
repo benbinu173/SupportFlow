@@ -38,6 +38,7 @@ dist/
 dist-ssr/
 .vite/
 *.local
+*.local.*
 npm-debug.log*
 coverage/
 

@@ -139,6 +139,7 @@ os.environ["AI_MODEL"] = "claude-sonnet-5"
 # money. `tests/unit/test_config.py` unsets these where it asserts the defaults.
 os.environ["EMBEDDING_PROVIDER"] = "openai"
 os.environ["EMBEDDING_MODEL"] = "text-embedding-3-small"
+os.environ["KNOWLEDGE_ENABLED"] = "true"
 
 # Imported after the environment is populated, which is why this block sits below
 # the statements above. Ruff's E402 allows `os.environ` setup before imports

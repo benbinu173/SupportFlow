@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     DEBUG: bool = False
     API_V1_PREFIX: str = "/api/v1"
     PROJECT_NAME: str = "SupportFlow"
+    # RAG is deferred to v2. Enable explicitly when its provider is verified.
+    KNOWLEDGE_ENABLED: bool = False
 
     # The floor for what reaches the log stream. A `Literal` rather than a free string so a
     # typo is a startup error naming the variable, instead of a `logging` call that silently

@@ -13,6 +13,7 @@ import {
 import type { ReactNode } from 'react'
 
 import { can, PERMISSIONS, type Permission, type UserRole } from '@/features/auth/permissions'
+import { KNOWLEDGE_ENABLED } from '@/features/knowledge/config'
 
 export interface NavItem {
   to: string
@@ -130,7 +131,8 @@ export function navigationFor(role: UserRole): NavSection[] {
     .map((section) => ({
       ...section,
       items: section.items.filter(
-        (item) => item.permission === undefined || can(role, item.permission),
+        (item) => (item.to !== '/knowledge' || KNOWLEDGE_ENABLED) &&
+          (item.permission === undefined || can(role, item.permission)),
       ),
     }))
     .filter((section) => section.items.length > 0)

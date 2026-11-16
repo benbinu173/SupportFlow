@@ -52,8 +52,8 @@ const PRINCIPLES = [
   },
   {
     icon: <BookOpen weight="light" />,
-    title: 'Answers cite, or they refuse.',
-    body: 'A knowledge-base answer arrives with the documents behind it, quoted and scored by relevance. Ask something the corpus cannot support and it says so, rather than answering anyway.',
+    title: 'The conversation stays together.',
+    body: 'Replies, attachments, and status changes stay with the request. Staff can add private notes while customers follow the public conversation in their own portal.',
   },
   {
     icon: <Lock weight="light" />,
@@ -112,7 +112,7 @@ export function LandingPage() {
           <Reveal delay={0.12}>
             <p className="max-w-xl text-base text-pretty text-ink-muted sm:text-lg">
               Tickets, SLAs, and an assistant that drafts but never sends. Every suggestion
-              carries its label, every answer carries its sources, and every status change
+              carries its label, every conversation keeps its history, and every status change
               follows a rule you can read.
             </p>
           </Reveal>

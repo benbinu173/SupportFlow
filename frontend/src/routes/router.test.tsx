@@ -260,7 +260,6 @@ describe('route table', () => {
       '/dashboard',
       '/analytics',
       '/sla',
-      '/knowledge',
       '/audit',
       '/tickets',
       '/customers',

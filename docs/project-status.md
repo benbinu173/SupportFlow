@@ -1,6 +1,6 @@
 # Project checkpoint
 
-Updated: 2026-11-10.
+Updated: 2026-11-16.
 
 ## Current milestone
 
@@ -25,6 +25,20 @@ password confirmation, audit entries, and revocation of the account's earlier se
 Password recovery and embedding preflight are committed as `fe8edbb`.
 Email verification is implemented for newly registered and administrator-created accounts,
 with explicit confirmation, generic resend, and sign-in restricted until confirmation.
+The updated authentication release is now verified on the local production stack through
+Caddy, including the actual schema upgrade, existing-user access, and delivered email links.
+Release decision on 2026-11-12: proceed with public-deployment preparation for v1 and defer
+live knowledge-base/RAG verification and release to v2. Further embedding checks are on hold.
+Deployment constraint added on 2026-11-12: strict zero hosting budget and no payment card.
+The earlier paid managed-service proposal is superseded; only card-free free plans are in scope.
+The owner selected one Render origin for the frontend, API, and WebSockets on 2026-11-13.
+The free preview profile is implemented and verified locally under its 512 MiB limit.
+Neon Free Postgres and Render Free Key Value are provisioned in Singapore. The preview
+image has passed migration/schema checks on an isolated Neon branch and verified TLS
+against both branch endpoints. Supabase's placeholder MCP URL is corrected and its
+new OAuth sign-in is complete; the extension must restart to load its tools.
+SMTP2GO's sender is verified and SMTP TLS/authentication has passed from the preview
+image. Storage and the public web deployment remain outstanding.
 
 ## F18 scope
 
@@ -454,14 +468,181 @@ Desktop and phone verification screenshots were inspected. Sanitized verificatio
 records, screenshots, Mailpit messages, and test history are retained. Temporary API,
 worker, and preview processes are stopped; the real environment files were preserved.
 
+## Production authentication release verification
+
+On 2026-11-12, rebuilt and started the production images with the local Mailpit override.
+All application HTTP and browser traffic used `https://localhost` through Caddy; realtime
+used WSS. Existing production volumes and the real environment files were preserved.
+
+The retained production database started at `51815e0bbd16`. The one-shot migration service
+applied password recovery (`d64f197a3c20`) and email verification (`e73a61b24f09`) before the
+API and worker started. Independent PostgreSQL snapshots confirmed that all **18 existing
+users, 7 organizations, and 72 tickets** remained present, with user identity, role, active
+state, and customer links preserved. Existing users received the compatibility verification
+baseline; new accounts still have no verification default. Both authentication audit labels
+are present. `alembic check` reported no schema drift.
+
+Verification completed:
+
+- **All 7 production browser workflows passed**, using the deployed frontend and real API,
+  PostgreSQL, Redis, Celery worker, Caddy, and SMTP delivery to Mailpit.
+- A new-workspace signup returned `201 {email, detail}` with no session credentials or
+  refresh cookie. Its original delivered email named the new workspace and linked to
+  `https://localhost/verify-email`. Opening the link left sign-in blocked; clicking to
+  confirm enabled workspace-specific sign-in, reload, and WSS. Sign-out cleared the cookie,
+  and reopening the used link showed the request-new-link screen.
+- An administrator-created account was blocked before confirmation, received its requested
+  verification mail, confirmed explicitly on the deployed phone layout, rejected replay,
+  and signed in successfully after verification.
+- Password recovery followed its unaltered delivered HTTPS link. Reset logged out the other
+  browser, rejected old access tokens, refresh cookies, the old password, and reused links.
+  New-password sign-in and reload remained valid even after a retry with an old cookie.
+- The existing administrator, role workflows, customer privacy, ticket lifecycle,
+  realtime updates, and notification emails also passed. Production cookie flags,
+  rotation, CSP, saved theme bootstrap, lazy screens, deep links, and sign-out were checked.
+- **23 deployment smoke checks passed with TLS verification enabled**, including HTTPS and
+  WSS certificate/hostname validation using Caddy's public local CA, existing demo-account
+  access, readiness, security headers, and two-sided tenant isolation.
+- PostgreSQL readback found six email-verification and two password-reset audit entries
+  across the initial and final runs. The generated recovery accounts advanced to credential
+  version 1, with all earlier-version refresh rows revoked. Generated recovery and
+  administrator-created verification accounts were deactivated by the checks.
+- Frontend lint and TypeScript checking passed. The Docker frontend production build passed.
+
+The first browser run exceeded the normal ten-login-per-minute limit as authentication
+coverage expanded. The live helpers now honor the real `429 Retry-After` response before
+retrying API and browser sign-in; authentication cases allow time for those windows.
+The final run passed under the original production limits. No application authentication
+behavior or production rate-limit settings were changed.
+
+Desktop and phone screenshots were inspected. Sanitized Playwright records and screenshots
+are retained under `frontend/playwright-report/production` and
+`frontend/test-results/production`. The database/environment verification record is saved in
+the gitignored `backend/.production-auth-report.local`, with the pre-upgrade snapshot in
+`backend/.production-auth-baseline.local`. Two uniquely named signup workspaces and generated
+test history remain available for inspection.
+
+The normal production compose configuration was restored, the temporary Mailpit container
+removed, and the updated services left running. The repeated migration completed with no
+new upgrade to apply. This verifies captured SMTP delivery and trust in the local Caddy CA;
+the actual public frontend origin and external SMTP provider still need deployment setup.
+
+## Free v1 preview verification
+
+`render.yaml` and `docker/Dockerfile.preview` prepare one Free Render web service for
+the frontend, loopback API, a single prefork worker slot, and beat. nginx routes HTTP
+and WebSockets on one origin, retaining CSP, the external theme bootstrap, and SPA
+deep links. Startup serializes migrations with a PostgreSQL advisory lock; a Redis
+lease prevents overlapping preview schedulers from dispatching concurrently.
+
+Knowledge navigation, its route, and its screen chunk are omitted from v1 builds.
+Backend knowledge endpoints return `503` before data/provider access by default.
+The retained implementation requires both `KNOWLEDGE_ENABLED=true` and frontend
+`VITE_KNOWLEDGE_ENABLED=true` to restore it for v2 after live verification.
+
+Verification completed on 2026-11-13:
+
+- All **7 live preview browser workflows passed** against the isolated image, real
+  PostgreSQL/Redis, its bundled prefork worker, Caddy HTTPS/WSS, and Mailpit. These
+  cover signup/verification/replay, password reset and earlier-session revocation,
+  secure cookies and rotation, CSP/theme/lazy screens, role privacy, realtime, and
+  ticket lifecycle. Preview history and storage are separate from production.
+- Container memory peaked at **467.4 MiB under a hard 512 MiB limit** during this
+  workload, with zero OOM events or kills. This is measured demo verification,
+  not a capacity guarantee for concurrent public signups or real AI-provider calls.
+- **11 local lifecycle/memory checks passed**: a second scheduler waited without
+  taking the active lease, the owner renewed it, lease loss stopped the original
+  scheduler and its supervised container, the replacement took over, graceful
+  shutdown released the lease, and the preview restarted healthy with a new lease.
+- All **123 frontend component/service tests** passed across 17 files. Frontend
+  lint, TypeScript checking, and the realtime contract check passed.
+- The deterministic production-bundle browser suite passed **25 cases**, including
+  hidden knowledge navigation and direct-URL refusal; the four deferred knowledge
+  cases were skipped explicitly.
+- All **46 backend configuration/knowledge-release cases** passed. Ruff lint/format
+  and strict mypy passed for application and operator scripts (146 source files).
+
+The live helpers use already-delivered creation emails for new setup accounts;
+only the explicit resend workflow and recovery of retained pending accounts request
+fresh links. Login helpers honor the normal `429 Retry-After` policy. Verification
+and recovery traces stay disabled to avoid recording credentials.
+
+Browser reports/screenshots remain in gitignored `frontend/playwright-report/preview`
+and `frontend/test-results/preview`. Sanitized lifecycle/memory evidence is in
+`backend/.preview-report.local`, with the repeat checker in
+`backend/.preview-check.local.py`. The preview is healthy at `https://localhost:8443`;
+production services, real environment files, and retained volumes are preserved.
+
 ## Next recommended step
 
-Verify the updated authentication release on the local production stack through Caddy,
-including migration of existing users and delivered verification links. The Mailpit
-compose override and browser-check procedure are documented in the frontend README.
-Configure the actual public origin and SMTP delivery before deploying the release.
+Authenticated Render and Neon account reads work. The owner confirmed Render's
+**My Workspace** (`tea-cundai9opnds73d530i0`) for this demo in the earlier session.
+Reuse the resources already provisioned there; do not create replacement projects:
 
-Live RAG can resume after OpenAI API credits are added at
+- Neon **supportflow-demo**, project `cold-term-95520688`, PostgreSQL 17, Free,
+  `aws-ap-southeast-1`, fixed 0.25 CU. The launch branch is **production**
+  (`br-icy-leaf-a1rznszb`) and its database is **supportflow**.
+- Neon **release-check-2026-11-13** (`br-shiny-base-a1g0y1q3`) is the isolated
+  migration-check branch. Startup migrations and `alembic check` passed through
+  revision `e73a61b24f09`, with both extensions installed and zero users.
+- Render **supportflow-demo-redis**, `red-dbra2ctbedkc73d0g5k0`, Free,
+  Singapore, `noeviction`, persistence off, is available. Render CLI sign-in was
+  renewed on 2026-11-16 and its exact internal connection URL retrieved.
+
+The preview image's Neon check passed on 2026-11-13 with `sslmode=verify-full`,
+`sslrootcert=system`, and the installed system CA bundle. Its report is in the
+gitignored `backend/.neon-container-report.local`. A new read-only check on
+2026-11-16 confirmed the launch database's verified TLS and availability of
+`vector` 0.8.7 and `pg_trgm` 1.6. The launch database intentionally has no app
+tables yet: the baseline Alembic migration installs extensions before creating
+the schema. This read did not migrate or seed it. Sanitized evidence is in
+`backend/.neon-readiness-report.local`.
+
+Supabase's configured URL contained the literal `YOUR_PROJECT_REF`, which also
+disabled account tools. It is now `https://mcp.supabase.com/mcp?read_only=true` in
+the user's Codex configuration. Read-only mode is preserved. The owner completed
+the corrected connection's OAuth sign-in on 2026-11-16. **Restart the Codex IDE
+extension** to load its tools, then inspect the actual organization and projects.
+No SupportFlow Supabase project/bucket or S3 credentials have been verified.
+The current OAuth grant requests read access; provision missing storage in the
+Supabase Dashboard unless the owner explicitly authorizes a write connection.
+
+The owner completed SMTP2GO's single-sender verification and saved `SMTP_FROM`,
+`SMTP_USERNAME`, and `SMTP_PASSWORD` in the gitignored `.env.render.local`.
+The actual preview image authenticated to `mail.smtp2go.com:2525` over verified
+TLS 1.3 on 2026-11-16. This was an authentication check with no message sent;
+public Render port access and delivered inbox links remain deployment checks.
+Sanitized evidence is in `backend/.smtp-readiness-report.local`.
+
+Neon's direct TLS URL, the generated JWT secret, and the existing Groq credential
+are also saved in `.env.render.local`. The exact Render Redis cache and Celery
+URLs have been merged into that file after the owner's SMTP edits were saved.
+The cache selects database 0 and Celery broker/results select database 2.
+A private copy of those three settings remains in `.env.render.redis.local`.
+All credential files are excluded from both Git and the Docker build context.
+
+Follow [deployment-free-demo.md](deployment-free-demo.md): finish the missing
+storage/email setup, publish the verified source, and create the Free Render web
+service using `docker/Dockerfile.preview` and `/health/ready`. Use its actual
+assigned HTTPS subdomain for `PUBLIC_APP_URL` and `CORS_ORIGINS`. No SupportFlow
+Render web service or public deployment exists yet. CI validates and builds the
+preview profile as well as the normal production profile.
+
+Render idle sleep pauses background work, and its free Redis can lose queued work
+on restart. Verify SMTP2GO STARTTLS on port 2525, external inbox delivery, private
+Supabase storage, Neon TLS/extensions, real client-IP forwarding, public HTTPS/WSS,
+generation access, wake-up, and database/attachment recovery before opening the demo.
+The earlier [deployment-render-vercel.md](deployment-render-vercel.md) is a paid-hosting
+reference. The current plan uses one Render origin and requires no Vercel project.
+
+The retained production configuration still uses `https://localhost`, has no external
+SMTP configuration, and has no generation or embedding credential enabled. The free
+preview also uses captured local mail and empty provider keys. Live Groq generation
+was verified earlier with temporary settings; the actual public deployment still
+needs its own provider and external-service verification.
+
+Live RAG is deferred to v2 by the user's release decision. Its remaining verification can
+resume later, once OpenAI API credits are available at
 [the API billing dashboard](https://platform.openai.com/settings/organization/billing/overview).
 Then run `.venv/Scripts/python.exe -m scripts.live_ai_check` from `backend/`.
 Both provider credentials are already available locally. Semantic retrieval,

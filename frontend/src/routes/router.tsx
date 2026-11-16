@@ -95,10 +95,10 @@ export const router = createBrowserRouter([
                 element: <RequirePermission permission={PERMISSIONS.SLA_VIEW} />,
                 children: [{ path: '/sla', element: <SlaPage /> }],
               },
-              {
+              ...(KnowledgePage ? [{
                 element: <RequirePermission permission={PERMISSIONS.KB_LIST} />,
                 children: [{ path: '/knowledge', element: <KnowledgePage /> }],
-              },
+              }] : []),
               {
                 element: <RequirePermission permission={PERMISSIONS.AUDIT_VIEW} />,
                 children: [{ path: '/audit', element: <AuditPage /> }],

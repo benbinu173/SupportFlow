@@ -34,11 +34,12 @@ search by `limit_ai` because it calls a provider on the spot (§45, §53).
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 
 from app.api.deps import Context, DbSession, Origin, require_permission
 from app.api.rate_limits import limit_ai, limit_upload
 from app.core import cache
+from app.core.config import get_settings
 from app.core.exceptions import AIServiceError
 from app.core.permissions import Permission
 from app.schemas.knowledge import (
@@ -49,7 +50,15 @@ from app.schemas.knowledge import (
 )
 from app.services import knowledge_service
 
-router = APIRouter()
+
+def require_knowledge_enabled() -> None:
+    if not get_settings().KNOWLEDGE_ENABLED:
+        raise HTTPException(
+            status_code=503, detail="Knowledge base is unavailable in this release."
+        )
+
+
+router = APIRouter(dependencies=[Depends(require_knowledge_enabled)])
 
 
 @router.post(

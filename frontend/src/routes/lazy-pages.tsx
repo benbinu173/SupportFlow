@@ -21,6 +21,10 @@ export const TeamPage = lazy(() => import('@/features/team/TeamPage').then((modu
 export const NotificationsPage = lazy(() => import('@/features/notifications/NotificationsPage').then((module) => ({ default: module.NotificationsPage })))
 export const AnalyticsPage = lazy(() => import('@/features/analytics/AnalyticsPage').then((module) => ({ default: module.AnalyticsPage })))
 export const SlaPage = lazy(() => import('@/features/sla/SlaPage').then((module) => ({ default: module.SlaPage })))
-export const KnowledgePage = lazy(() => import('@/features/knowledge/KnowledgePage').then((module) => ({ default: module.KnowledgePage })))
+// This optional split point is removed entirely from the v1 production build.
+// oxlint-disable-next-line react/only-export-components
+export const KnowledgePage = import.meta.env.VITE_KNOWLEDGE_ENABLED === 'true'
+  ? lazy(() => import('@/features/knowledge/KnowledgePage').then((module) => ({ default: module.KnowledgePage })))
+  : null
 export const AuditPage = lazy(() => import('@/features/audit/AuditPage').then((module) => ({ default: module.AuditPage })))
 export const PreferencesPage = lazy(() => import('@/features/profile/PreferencesPage').then((module) => ({ default: module.PreferencesPage })))

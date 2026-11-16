@@ -5,8 +5,15 @@
 A multi-tenant customer support and helpdesk platform. Support teams work tickets
 through a validated lifecycle, assisted by AI for classification, sentiment,
 summarization, and draft replies — with a human always in the loop before anything
-reaches a customer. Each organization keeps a private knowledge base that grounds AI
-answers in its own documented policy rather than model invention.
+reaches a customer. The retained knowledge-base implementation retrieves each
+organization's own policy documents; it is deferred to v2 and disabled by default
+until live embeddings and grounded retrieval have been verified.
+
+**Current v1 release:** a card-free demo on one Render origin for the app, API, and
+WebSockets. The preview passed seven live browser workflows locally under a 512 MiB
+limit; public hosting and external-service checks are still pending. Follow
+[the free demo runbook](docs/deployment-free-demo.md) and
+[the latest checkpoint](docs/project-status.md).
 
 **Status: Phases A–Z complete.** Auth, RBAC, multi-tenancy, the ticket lifecycle, attachments,
 audit logging, search, notifications, SLAs, real-time fan-out, analytics, the AI layer, the
@@ -52,6 +59,8 @@ python-jose, opaque refresh tokens over JWTs — are justified in
 | [docs/data-model.md](docs/data-model.md) | ERD, table reference, index strategy, schema-level business rules |
 | [docs/architecture-decisions.md](docs/architecture-decisions.md) | Every deviation from the specification, with reasoning and cost |
 | [docs/project-status.md](docs/project-status.md) | Current frontend checkpoint, verification, and recommended next step |
+| [docs/deployment-render-vercel.md](docs/deployment-render-vercel.md) | Paid managed-hosting reference; current free-only planning is in the project checkpoint |
+| [docs/deployment-free-demo.md](docs/deployment-free-demo.md) | Current single-origin, card-free Render demo setup and local preview checks |
 
 ## Local setup
 

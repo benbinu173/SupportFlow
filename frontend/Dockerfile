@@ -29,8 +29,10 @@ COPY . .
 # changes. `vite.config.ts` reads these through `import.meta.env`.
 ARG VITE_API_BASE_URL=""
 ARG VITE_WS_URL=""
+ARG VITE_KNOWLEDGE_ENABLED="false"
 ENV VITE_API_BASE_URL=$VITE_API_BASE_URL \
-    VITE_WS_URL=$VITE_WS_URL
+    VITE_WS_URL=$VITE_WS_URL \
+    VITE_KNOWLEDGE_ENABLED=$VITE_KNOWLEDGE_ENABLED
 
 RUN npm run build
 

@@ -89,12 +89,26 @@ both ignored by Git. The deterministic F18 suite continues to run with
 
 ## Production stack browser checks
 
-`npm run test:e2e:production` runs the live role workflows against the local
+`npm run test:e2e:production` runs authentication and live role workflows against the local
 Docker production stack at `https://localhost`. It starts no Vite server:
 browser traffic and test setup/readback use Caddy's HTTPS origin, and realtime
 connections use WSS. A separate admin workflow checks secure HttpOnly refresh
 cookies, rotation on reload, a lazy-loaded preferences screen, CSP errors,
 deep-link session restoration, and sign-out.
+
+Authentication checks cover new-workspace signup without a session, its delivered
+verification link, explicit confirmation, workspace-specific sign-in, sign-out, and
+replay refusal. Administrator-created accounts cover verification resend and phone layouts.
+Password recovery follows a delivered reset link and verifies old-session revocation,
+replay refusal, and continued access with the new password. These tests disable traces
+that could retain link credentials and save sanitized records and screenshots instead.
+
+The expanded suite can exceed the normal ten-login-per-minute limit. Live API and browser
+sign-in helpers honor `429 Retry-After` before retrying, and authentication cases allow
+three minutes for those real rate-limit windows. Production limits remain enforced.
+New test accounts use the verification email already sent by account creation;
+setup requests a fresh link only for a retained unverified account. The dedicated
+resend workflow still verifies the public resend form and delivered confirmation.
 
 From the project root, start the stack with the local mail-capture override:
 
@@ -109,6 +123,9 @@ exposes its inspection API only at `127.0.0.1:8026`. It changes neither the
 production env file nor the database volumes. Use it only for local verification.
 The suite creates/reuses **Local production browser checks**, with accounts
 under `supportflow-production-browser.example.com`, and retains test tickets.
+Signup checks additionally retain a uniquely named **Local production signup** workspace
+per run. Generated recovery and administrator-created verification accounts are deactivated;
+their history and the signup workspaces remain available for inspection.
 
 Chromium accepts Caddy's local certificate with `ignoreHTTPSErrors`; certificate
 chain and hostname validation remain a separate `deploy_smoke --verify-tls`
@@ -120,6 +137,22 @@ stack and remove the temporary Mailpit container after verification:
 ```powershell
 docker compose --env-file .env.production -f docker-compose.prod.yml up -d --remove-orphans
 ```
+
+## Free demo preview checks
+
+`npm run test:e2e:preview` runs the same authentication and role workflows against
+the isolated preview image at `https://localhost:8443`, with Mailpit on
+`127.0.0.1:8027`. Start it from the repository root with
+`docker compose -f docker-compose.preview.yml up -d --build`. The application
+container has a hard 512 MiB memory limit and a single prefork worker slot. See
+[the free demo runbook](../docs/deployment-free-demo.md) for deployment and limits.
+
+v1 builds hide knowledge navigation and omit its route and screen module.
+The deterministic browser suite skips its four deferred knowledge cases and checks
+that direct knowledge URLs show the not-found screen. To exercise the retained v2
+cases, set `VITE_KNOWLEDGE_ENABLED=true` before running `npm run test:e2e`; the
+backend separately requires `KNOWLEDGE_ENABLED=true`. Enable these only after
+the deferred provider verification. The normal v1 build defaults to both disabled.
 
 ## Route loading and bundle size
 

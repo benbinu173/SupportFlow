@@ -1,6 +1,7 @@
 import { accounts, expect, now, test } from './fixtures'
 
 test.describe('knowledge usage analytics', () => {
+  test.skip(process.env.VITE_KNOWLEDGE_ENABLED !== 'true', 'Knowledge is deferred to v2')
   for (const outcome of ['answer', 'failure'] as const) {
     test(`a knowledge ${outcome} refreshes previously viewed analytics`, async ({ page, api }) => {
       api.knowledgeDocuments.push({

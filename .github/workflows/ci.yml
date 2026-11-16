@@ -220,9 +220,19 @@ jobs:
           print(f'Result backend: {app.backend.__class__.__name__}')
           PY
 
+      - name: Build free demo preview image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile.preview
+          push: false
+          cache-from: type=gha,scope=preview
+          cache-to: type=gha,mode=max,scope=preview
+
       - name: Validate compose configuration
         run: |
           cp .env.example .env
           # Satisfy the >=32 char minimum so config validation passes.
           sed -i 's/^JWT_SECRET=$/JWT_SECRET=ci-only-secret-value-at-least-32-chars/' .env
           docker compose config --quiet
+          docker compose -f docker-compose.preview.yml config --quiet

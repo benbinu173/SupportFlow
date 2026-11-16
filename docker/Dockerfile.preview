@@ -1,0 +1,35 @@
+# One public origin and one 512 MiB web container for the free demo.
+FROM node:22-slim AS frontend
+WORKDIR /build
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --include=optional
+COPY frontend/ ./
+ENV VITE_API_BASE_URL="" VITE_KNOWLEDGE_ENABLED="false"
+RUN npm run build
+
+FROM python:3.14-slim AS dependencies
+ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+COPY backend/pyproject.toml /tmp/build/pyproject.toml
+RUN pip install /tmp/build
+
+FROM python:3.14-slim AS preview
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PORT=10000 \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nginx curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 1000 appuser
+COPY --from=dependencies /usr/local /usr/local
+WORKDIR /app
+COPY --chown=appuser:appuser backend/app ./app
+COPY --chown=appuser:appuser backend/alembic ./alembic
+COPY --chown=appuser:appuser backend/alembic.ini ./
+COPY --chown=appuser:appuser backend/scripts ./scripts
+COPY docker/preview-nginx.conf /app/preview-nginx.conf
+COPY frontend/nginx-headers.conf /app/frontend-headers.conf
+COPY --from=frontend /build/dist /app/public
+USER appuser
+EXPOSE 10000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${PORT}/health/ready" || exit 1
+CMD ["python", "-m", "scripts.run_preview"]

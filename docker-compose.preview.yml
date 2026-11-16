@@ -1,0 +1,91 @@
+# Isolated local verification of the Render image at its 512 MiB memory limit.
+# Contains disposable local credentials, never external service credentials.
+name: supportflow-preview
+services:
+  preview:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.preview
+    image: supportflow-preview:local
+    mem_limit: 512m
+    environment:
+      ENVIRONMENT: production
+      DEBUG: "false"
+      KNOWLEDGE_ENABLED: "false"
+      DATABASE_URL: postgresql+psycopg://preview:preview@postgres:5432/preview
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/2
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      JWT_SECRET: local-preview-only-secret-at-least-32-characters
+      PUBLIC_APP_URL: https://localhost:8443
+      CORS_ORIGINS: https://localhost:8443
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: preview-minio
+      S3_SECRET_KEY: local-preview-minio-password
+      S3_BUCKET: supportflow-attachments
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+      SMTP_FROM: support@supportflow.local
+      AI_PROVIDER: groq
+      AI_MODEL: openai/gpt-oss-120b
+      AI_API_KEY: ""
+      EMBEDDING_API_KEY: ""
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: preview
+      POSTGRES_PASSWORD: preview
+      POSTGRES_DB: preview
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U preview -d preview"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  redis:
+    image: redis:8-alpine
+    command: [redis-server, --maxmemory, 25mb, --maxmemory-policy, noeviction, --save, "", --appendonly, "no", --dir, /tmp]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  minio:
+    image: bitnamilegacy/minio:2025.7.23-debian-12-r5
+    environment:
+      MINIO_ROOT_USER: preview-minio
+      MINIO_ROOT_PASSWORD: local-preview-minio-password
+    volumes:
+      - minio_data:/bitnami/minio/data
+    healthcheck:
+      test: [CMD, mc, ready, local]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "127.0.0.1:8027:8025"
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "127.0.0.1:8443:8443"
+    volumes:
+      - ./docker/preview-Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      - preview
+volumes:
+  postgres_data:
+  minio_data:
+  caddy_data:
