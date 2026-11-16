@@ -8,9 +8,12 @@ The public service is live at
 [supportflow-demo-9xgg.onrender.com](https://supportflow-demo-9xgg.onrender.com), Render
 service `srv-dbtdqerbc2fs73dsidl0` in the owner's confirmed **My Workspace**
 (`tea-cundai9opnds73d530i0`). Database, Redis, and private storage are provisioned.
-The owner registered successfully, but verification-email delivery is blocked by
-SMTP2GO's sender policy. Brevo Free setup is in progress. Public authenticated
-workflows and realtime remain release checks; see [project-status.md](project-status.md).
+The owner's registration is retained. On 2026-11-16, the owner confirmed receipt of
+the Brevo verification email, explicit verification, and successful public sign-in.
+A read-only launch database check confirms the account is verified. The signed-in
+dashboard reports `Live`; automated session, event, role/privacy, attachment, and
+recovery workflows remain release checks. See
+[project-status.md](project-status.md).
 
 ## Prepared source
 
@@ -66,7 +69,7 @@ external-service results are recorded below and in `project-status.md`.
 | PostgreSQL | Neon Free | PostgreSQL 17, direct TLS connection URL, `vector` and `pg_trgm` extensions |
 | Redis | Render Free Key Value | Same Singapore region, internal URL, `noeviction`; database 0 for cache and 2 for Celery |
 | Files | Supabase Free Storage | Private `supportflow-attachments` bucket; S3 endpoint, region, server-only S3 access keys |
-| Email | Brevo Free (setup in progress) | Verify the sender by emailed code, `smtp-relay.brevo.com:2525`, STARTTLS, SMTP Login/key; free-email senders use its temporary address replacement |
+| Email | Brevo Free | Verified sender, `smtp-relay.brevo.com:2525`, STARTTLS, SMTP Login/key; free-email senders use its temporary address replacement |
 | AI generation | Existing Groq free access | `AI_PROVIDER=groq`, `AI_MODEL=openai/gpt-oss-120b`; use the existing private generation credential |
 
 Neon and Redis are already provisioned and authenticated account reads verified:
@@ -97,7 +100,33 @@ The SMTP2GO TLS/authentication probe passed on port 2525, but actual public send
 failed with `550 From header sender domain not verified`. A successful SMTP login
 does not verify the From domain. The owner cannot manage the original domain's DNS,
 and SMTP2GO also excludes Gmail single senders. Reuse the other existing resources
-and finish Brevo's sender/transactional setup; choose only card-free Free plans.
+and Brevo Free; choose only card-free Free plans.
+
+Brevo's exact SMTP Login and active key now pass the preview image's TLSv1.3
+authentication probe with certificate verification. The owner authorized the test
+connection and Render's outgoing IP ranges after Brevo returned `525` for an
+unauthorized IP. The six SMTP settings were merged into the existing service;
+all 20 non-SMTP environment values were verified unchanged. Deployment
+`dep-dbtgifmtlv9c73famfeg` became live with healthy PostgreSQL and Redis checks.
+A fresh request for the retained registration returned `202`; its public Celery
+task completed with `delivered` and logged `verification_email_delivered`.
+That establishes SMTP relay acceptance, while actual inbox delivery remains pending.
+The owner's subsequent `SMTP_FROM` correction is live in deployment
+`dep-dbtgous9v7es73ajiqqg`, with public dependency readiness verified again.
+Public resend then returned `429`; its normal cooldown ends at 14:49 UTC
+(20:19 IST) on 2026-11-16. At the owner's request, an administrative retry ran the
+standard verification worker handler from the preview image after privately
+checking that its SMTP, JWT, database, and public origin matched Render. It returned
+`delivered` at 14:09 UTC. The owner still needs to confirm the emailed link, and the
+public resend limit retains its normal cooldown. Current-sender public worker
+delivery and inbox arrival remain separate checks. Sanitized evidence is in
+gitignored `backend/.public-email-current-report.local` and
+`backend/.operator-verification-retry-report.local`.
+The owner's next requested retry at 14:41 UTC also returned `delivered` through the
+standard worker handler. The saved Gmail sender already matched Render, and no
+environment change or deployment was needed. Public HTTPS/dependency readiness
+passed again. The owner then confirmed inbox arrival, explicit verification, and
+successful sign-in; a read-only launch check confirms the registration is verified.
 
 Render documents [512 MB and 0.1 CPU for free web services](https://render.com/docs/compute-plans).
 It [sleeps after 15 idle minutes](https://render.com/docs/free), suspending the bundled
@@ -134,7 +163,19 @@ uses `smtp-relay.brevo.com`, the SMTP Login, and an SMTP key as the password.
 Use STARTTLS on port 2525 because Render Free blocks outbound 25, 465, and 587.
 [Transactional activation](https://help.brevo.com/hc/en-us/articles/115000188150-Troubleshooting-Issues-with-Brevo-SMTP)
 can require a support ticket from the owner's Brevo account. Activation, Render
-outbound sending, and actual inbox delivery still need verification.
+outbound sending, and actual inbox delivery are separate checks. Authentication and
+the public worker's SMTP submission now pass. The owner confirmed actual Gmail
+arrival and successful verification/sign-in on 2026-11-16.
+
+Copy the exact Login field from Brevo's SMTP tab. When SMTP IP blocking is active,
+authorize the service's outgoing ranges under **Settings → Security → Authorized
+IPs**. The current service reports `74.220.52.0/24` and `74.220.60.0/24`; obtain the
+current list from Render's **Connect → Outbound** tab or its
+[outbound IP API](https://api-docs.render.com/reference/retrieve-service-outbound-ips).
+Brevo's [Authorized IPs page](https://help.brevo.com/hc/en-us/articles/5740111683858-Authorize-and-block-IP-addresses-for-API-and-SMTP-security)
+accepts these CIDR entries. `SMTP_FROM` selects the sender; verification recipients
+come from each registered account's email address. Check Brevo's transactional logs
+when the worker submitted a message but the inbox is still empty.
 
 ## Provision and deploy
 

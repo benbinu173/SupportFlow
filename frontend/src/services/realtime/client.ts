@@ -10,6 +10,7 @@ type StatusListener = (status: RealtimeStatus) => void
 
 const MAX_RETRY_DELAY_MS = 30_000
 const INITIAL_RETRY_DELAY_MS = 500
+const AUTHENTICATION_TIMEOUT_MS = 15_000
 
 /** Build the socket address from the same API origin used by the HTTP client. */
 export function realtimeUrl(apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? ''): string {
@@ -28,6 +29,7 @@ export class RealtimeClient {
   private readonly url: string
   private socket: WebSocket | null = null
   private retryTimer: ReturnType<typeof setTimeout> | null = null
+  private authenticationTimer: ReturnType<typeof setTimeout> | null = null
   private stopped = true
   private retryAttempt = 0
   private refreshedForAuthFailure = false
@@ -50,6 +52,7 @@ export class RealtimeClient {
     this.stopped = true
     if (this.retryTimer !== null) clearTimeout(this.retryTimer)
     this.retryTimer = null
+    this.clearAuthenticationTimer()
     const socket = this.socket
     this.socket = null
     if (socket && socket.readyState < WebSocket.CLOSING) socket.close(1000, 'Session ended')
@@ -58,6 +61,7 @@ export class RealtimeClient {
 
   private connect(): void {
     if (this.stopped) return
+    this.clearAuthenticationTimer()
     this.setStatus(this.retryAttempt === 0 ? 'connecting' : 'reconnecting')
 
     let socket: WebSocket
@@ -89,6 +93,7 @@ export class RealtimeClient {
       }
 
       if (payload && typeof payload === 'object' && 'type' in payload && payload.type === 'authenticated') {
+        this.clearAuthenticationTimer()
         if (this.hasConnected) void this.queryClient.invalidateQueries()
         this.hasConnected = true
         this.retryAttempt = 0
@@ -101,7 +106,9 @@ export class RealtimeClient {
     }
 
     socket.onclose = (event) => {
-      if (this.socket === socket) this.socket = null
+      if (this.socket !== socket) return
+      this.socket = null
+      this.clearAuthenticationTimer()
       if (this.stopped) return
 
       if (event.code === 4401) {
@@ -113,6 +120,15 @@ export class RealtimeClient {
         this.scheduleRetry()
       }
     }
+
+    // A missing acknowledgement must eventually trigger session recovery.
+    this.authenticationTimer = setTimeout(() => {
+      if (this.stopped || this.socket !== socket) return
+      this.clearAuthenticationTimer()
+      this.socket = null
+      if (socket.readyState < WebSocket.CLOSING) socket.close(1000, 'Authentication timed out')
+      this.refreshAndRetry()
+    }, AUTHENTICATION_TIMEOUT_MS)
   }
 
   private refreshAndRetry(): void {
@@ -129,9 +145,15 @@ export class RealtimeClient {
         this.connect()
       })
       .catch(() => {
+        if (this.stopped) return
         // refreshSession owns the session transition and the user-facing message.
         this.setStatus('offline')
       })
+  }
+
+  private clearAuthenticationTimer(): void {
+    if (this.authenticationTimer !== null) clearTimeout(this.authenticationTimer)
+    this.authenticationTimer = null
   }
 
   private scheduleRetry(): void {

@@ -40,11 +40,12 @@ Key Value are ready in Singapore. Launch migrations are applied, verified Neon T
 passes, and the private Supabase bucket passes the actual application's S3 adapter
 checks. Public HTTPS, readiness, security headers, assets, anonymous access controls,
 CORS, desktop/mobile auth screens, and disabled knowledge checks pass.
-The owner registered, but SMTP2GO rejected verification messages because the sender
-domain is not authenticated. Gmail is also excluded by its sender policy; the owner
-cannot manage the original domain's DNS. Brevo Free setup is in progress using its
-documented temporary sender-address replacement. Actual inbox delivery, verified
-sign-in, authenticated public workflows, and realtime remain outstanding.
+Brevo Free passes TLS authentication and worker submission using its documented
+temporary sender replacement. The owner confirmed actual inbox delivery, explicit
+email verification, and successful public sign-in on 2026-11-16. A read-only launch
+database check confirms the retained registration is verified. The signed-in
+dashboard reports `Live`, confirming its public WebSocket authenticated. Automated
+public session, role/privacy, attachment, event, and recovery checks remain outstanding.
 
 ## F18 scope
 
@@ -633,8 +634,17 @@ The tenth public group remains unresolved: WSS opens, its auth frame reaches the
 backend, and the backend logs refusal code 4401, but neither Chromium nor Python
 receives the close frame within 15 seconds. The same image closes correctly through
 local nginx and directly through Uvicorn. A public ping/pong succeeds. Authenticated
-public realtime is not yet verified; the browser also lacks an auth-acknowledgement
+public realtime is not yet verified. The deployed browser has no authentication
 deadline, so a missing close/ack can leave its connection status pending.
+
+The pending frontend correction bounds both connection opening and authentication
+to 15 seconds, attempts one session refresh, then goes offline if the replacement
+also stalls. It ignores late close events from replaced sockets and cancels its
+deadline when the session stops. All seven timeout cases, frontend lint, TypeScript,
+and the realtime contract check pass locally. Three production-bundle browser
+checks also pass for restored sessions/sign-out, realtime reply/status updates,
+and reconnecting after missed changes. This correction is not yet deployed;
+the public proxy's missing refusal close frame remains a separate platform issue.
 
 ## Next required work
 
@@ -647,15 +657,42 @@ recommendation was incorrect.
 [Brevo Free](https://help.brevo.com/hc/en-us/articles/208589409-About-Brevo-s-pricing-plans)
 allows 300 emails/day without a payment card. Its
 [documented temporary replacement](https://help.brevo.com/hc/en-us/articles/14925263522578-Comply-with-Gmail-Yahoo-and-Microsoft-s-requirements-for-email-senders)
-uses a Brevo sending address for free-email senders. The owner is being guided through
-sender verification and SMTP Login/key setup; transactional activation may require a
-support request from their account. Brevo credentials and sending are not yet verified.
+uses a Brevo sending address for free-email senders. The owner confirmed sender and
+key activation. Correcting the exact SMTP Login changed authentication failures
+from `535` to `525`; authorizing the local test IP and Render's two outgoing CIDRs
+resolved IP blocking. The preview image now verifies TLSv1.3 and authenticates.
+The SMTP-only Render update preserved all 20 other environment values, and
+deployment `dep-dbtgifmtlv9c73famfeg` became live with PostgreSQL and Redis ready.
+The existing registration's fresh verification task completed with `delivered`
+and logged `verification_email_delivered` at 13:49 UTC on 2026-11-16. The relay
+accepted the message, but initially the owner reported no inbox arrival. The account
+was still unverified and observed public sign-in attempts returned `403`. A subsequent saved
+sender correction is now live in deployment `dep-dbtgous9v7es73ajiqqg`, with public
+dependency readiness verified. Public resend returned `429` and permits another
+request at 14:49 UTC (20:19 IST) on 2026-11-16. At the owner's request, the standard
+verification worker handler was run as an administrative retry from the preview
+image after privately matching SMTP, JWT, database, and origin settings to Render.
+It returned `delivered` at 14:09 UTC. The emailed link still requires the owner's
+confirmation, and the public resend limit retains its normal cooldown.
+On the owner's next retry request at 14:41 UTC, the saved Gmail sender and all six
+SMTP settings already matched Render, so no environment update or deployment was
+needed. The same worker handler submitted another verification email and returned
+`delivered`; its recipient lookup was read-only and verification/rate-limit state
+was preserved. Public HTTPS readiness passed again with PostgreSQL and Redis ready.
+The owner subsequently confirmed inbox arrival, email verification, and successful
+sign-in. The read-only launch check at 15:17 UTC finds one verified registration
+and no account eligible for another verification resend. The owner's signed-in
+dashboard reports `Live`. Email setup is complete; do not send another verification
+email for this account.
+Current-sender public worker delivery and actual inbox arrival remain separate
+checks. Sanitized evidence is in gitignored
+`backend/.public-email-current-report.local` and
+`backend/.operator-verification-retry-report.local`.
 Keep all credentials in gitignored `.env.render.local`, apply only SMTP settings to
 the existing Render service, and preserve its JWT secret and other connections.
 
-After sending works, request a fresh verification email for the existing registration,
-confirm inbox arrival, explicitly verify, and sign in. Then verify public sessions,
-recovery/replay/revocation, role and tenant privacy, ticket lifecycle, attachments,
+Continue with automated public sessions, recovery/replay/revocation, role and tenant
+privacy, ticket lifecycle, attachments,
 realtime, SLA/notification email, Groq generation, idle wake-up, and recovery checks.
 Do not bypass email verification to finish this check. Render's idle sleep pauses its
 bundled worker and scheduler; free Redis can lose queued work on restart.
