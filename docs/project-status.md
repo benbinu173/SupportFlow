@@ -44,8 +44,11 @@ Brevo Free passes TLS authentication and worker submission using its documented
 temporary sender replacement. The owner confirmed actual inbox delivery, explicit
 email verification, and successful public sign-in on 2026-11-16. A read-only launch
 database check confirms the retained registration is verified. The signed-in
-dashboard reports `Live`, confirming its public WebSocket authenticated. Automated
-public session, role/privacy, attachment, event, and recovery checks remain outstanding.
+dashboard reports `Live`, confirming its public WebSocket authenticated. All 14
+automated public workflow checks now pass, including sessions, role/privacy,
+ticket lifecycle, realtime recovery, and actual Supabase file downloads. Public
+Groq generation and automatic SLA warnings/breaches also pass. Password recovery,
+SLA inbox confirmation, and idle sleep/wake are the remaining public checks.
 
 ## F18 scope
 
@@ -591,7 +594,8 @@ Reuse the provisioned resources in the owner's confirmed Render **My Workspace**
   The assigned origin is `https://supportflow-demo-9xgg.onrender.com`.
 - Neon **supportflow-demo**, project `cold-term-95520688`: Free PostgreSQL 17,
   Singapore, production branch `br-icy-leaf-a1rznszb`, database **supportflow**.
-  Launch revision `e73a61b24f09` and all 16 application tables are installed.
+  Launch revision `e73a61b24f09` and all 16 public tables are installed: 15
+  application tables plus Alembic metadata.
   Client TLS uses `sslmode=verify-full&sslrootcert=system`; `vector` 0.8.7 and
   `pg_trgm` 1.6 are available. The migration-check branch
   `br-shiny-base-a1g0y1q3` remains separate from launch and retained local data.
@@ -599,8 +603,9 @@ Reuse the provisioned resources in the owner's confirmed Render **My Workspace**
   `noeviction`, persistence off. Cache uses database 0, Celery broker/results 2.
 - Supabase Free: the owner created a private **supportflow-attachments** bucket.
   The preview image's actual adapter passed upload, download, streaming, anonymous
-  access refusal, and probe deletion. Public authenticated attachment workflows
-  still need verification. Supabase's MCP connection remains read-only; setup was
+  access refusal, and probe deletion. Public browser upload/download, exact byte
+  comparisons, internal-file privacy, and tenant isolation now pass. Supabase's
+  MCP connection remains read-only; setup was
   completed in the Dashboard without changing its access grant.
 
 The first public container crashed because worker task modules selected the absent
@@ -630,81 +635,92 @@ mobile signup/theme/viewport, and absence of JavaScript/CSP/asset errors. Measur
 public memory stayed below 386 MiB of 512 MiB during the earlier checks.
 Sanitized evidence is in gitignored `frontend/.public-smoke-report.local`.
 
-The tenth public group remains unresolved: WSS opens, its auth frame reaches the
-backend, and the backend logs refusal code 4401, but neither Chromium nor Python
-receives the close frame within 15 seconds. The same image closes correctly through
-local nginx and directly through Uvicorn. A public ping/pong succeeds. Authenticated
-public realtime is not yet verified. The deployed browser has no authentication
-deadline, so a missing close/ack can leave its connection status pending.
+The public platform still drops some invalid-authentication WebSocket close frames.
+Successful password-authenticated WSS works for all four roles. Commit `c98ba6e`
+deployed a 15-second opening/authentication deadline, one session-refresh attempt,
+timer cancellation, and protection against stale socket close events. All seven
+targeted cases, three relevant browser cases, and full CI passed. The public
+workflow dropped the first real server acknowledgement and verified successful
+recovery through a second genuine server connection.
 
-The pending frontend correction bounds both connection opening and authentication
-to 15 seconds, attempts one session refresh, then goes offline if the replacement
-also stalls. It ignores late close events from replaced sockets and cancels its
-deadline when the session stops. All seven timeout cases, frontend lint, TypeScript,
-and the realtime contract check pass locally. Three production-bundle browser
-checks also pass for restored sessions/sign-out, realtime reply/status updates,
-and reconnecting after missed changes. This correction is not yet deployed;
-the public proxy's missing refusal close frame remains a separate platform issue.
+Public browser upload exposed a separate bug: a fixed JSON header caused Axios
+to serialize FormData as `{"file":{}}`, and the API correctly returned `422`.
+Commit `a89d5d0` lets Axios select the body type. Its multipart regression failed
+before the fix; all 12 API-client/interceptor cases, lint, TypeScript checking,
+and a production-bundle upload/download browser case passed afterward.
+[Full CI passed](https://github.com/benbinu173/SupportFlow/actions/runs/43905152466).
+Deployment `dep-dbtirirl550s73dddnu0` became live at 16:24 UTC on 2026-11-16,
+serving `assets/index-Bk0Rqa1X.js` with healthy PostgreSQL and Redis checks.
+
+The deployed application passed **14 public workflow groups** using five normally
+verified test accounts in **SupportFlow Public Checks** and **SupportFlow Public
+Isolation**. Checks include normal login, four-role browser WSS, Secure/HttpOnly/
+SameSite cookie rotation, lazy screens and CSP, assignment notifications, two-way
+replies, private notes/files, byte-exact Supabase upload/API/browser downloads,
+anonymous and tenant access refusal, invalid uploads, resolve/close/reopen,
+disabled knowledge, bounded realtime recovery, and sign-out. No verification
+bypass was used. Sanitized evidence is in `frontend/.public-workflow-report.local`.
+
+Public Groq calls through the normal AI endpoints completed classification,
+sentiment, summary, and suggested reply with `openai/gpt-oss-120b`. PostgreSQL
+readback confirms results, token usage, and the usage ledger. A second unchanged
+summary was served from the stored result with a cached usage row. The draft
+stayed private until the agent reviewed and edited it in the actual browser.
+Customer AI operations were refused. No embedding or knowledge-answer usage rows
+exist. Evidence is in `frontend/.public-ai-report.local` and
+`backend/.public-ai-database-report.local`.
+
+The automatic public scheduler recorded both warnings and both breaches on a
+naturally aging test ticket. The manager received all four notifications without
+a browser reload; manager and agent each have four persisted notification rows.
+All eight have `emailed_at` set after successful SMTP submission. Only the test
+workspace's urgent policy was shortened, then restored to its original values.
+The test ticket is closed. Evidence is in `frontend/.public-sla-report.local` and
+`backend/.public-sla-database-report.local`; actual inbox confirmation is pending.
+
+A consistent, certificate-verified, read-only PostgreSQL snapshot was exported at
+15:49 UTC and restored into an isolated temporary database. All 16 table counts
+and revision `e73a61b24f09` matched. Stock PostgreSQL could not replay Neon's
+`pg_attver` column options; the local SQL copy omitted only 175 matched option
+statements, leaving COPY data unchanged. The original custom archive is retained
+in `backend/.public-backups.local/launch-20261116T154913Z.dump`. The temporary
+restore container was removed. Evidence is in `backend/.public-backup-report.local`.
+
+The measured public workload stayed below Render's 512 MiB limit, peaking at
+**499.0 MiB** during authentication, with CPU usage below 0.075 cores in the
+sampled windows. Redis peaked at **3.6 MiB of 25 MiB**. These measurements cover
+the controlled demo workload and leave little memory room at the authentication
+peak. The source database is about 9.3 MiB; Neon account reads confirm the Free
+plan. The three generated tickets are closed and their history/files retained.
 
 ## Next required work
 
-The owner's public registration succeeded. Its verification email reached Celery
-but SMTP2GO returned `550 From header sender domain not verified`. SMTP authentication
-alone did not establish sender authorization. The owner cannot change the original
-domain's DNS, and SMTP2GO rejects Gmail single senders too. The earlier Gmail
-recommendation was incorrect.
+Brevo setup is complete. The owner confirmed actual Gmail arrival, explicit
+verification, successful sign-in, and a `Live` dashboard. Preserve the verified
+sender, port 2525/STARTTLS, authorized Render outgoing ranges, JWT secret, and
+other saved connections in `.env.render.local`.
 
-[Brevo Free](https://help.brevo.com/hc/en-us/articles/208589409-About-Brevo-s-pricing-plans)
-allows 300 emails/day without a payment card. Its
-[documented temporary replacement](https://help.brevo.com/hc/en-us/articles/14925263522578-Comply-with-Gmail-Yahoo-and-Microsoft-s-requirements-for-email-senders)
-uses a Brevo sending address for free-email senders. The owner confirmed sender and
-key activation. Correcting the exact SMTP Login changed authentication failures
-from `535` to `525`; authorizing the local test IP and Render's two outgoing CIDRs
-resolved IP blocking. The preview image now verifies TLSv1.3 and authenticates.
-The SMTP-only Render update preserved all 20 other environment values, and
-deployment `dep-dbtgifmtlv9c73famfeg` became live with PostgreSQL and Redis ready.
-The existing registration's fresh verification task completed with `delivered`
-and logged `verification_email_delivered` at 13:49 UTC on 2026-11-16. The relay
-accepted the message, but initially the owner reported no inbox arrival. The account
-was still unverified and observed public sign-in attempts returned `403`. A subsequent saved
-sender correction is now live in deployment `dep-dbtgous9v7es73ajiqqg`, with public
-dependency readiness verified. Public resend returned `429` and permits another
-request at 14:49 UTC (20:19 IST) on 2026-11-16. At the owner's request, the standard
-verification worker handler was run as an administrative retry from the preview
-image after privately matching SMTP, JWT, database, and origin settings to Render.
-It returned `delivered` at 14:09 UTC. The emailed link still requires the owner's
-confirmation, and the public resend limit retains its normal cooldown.
-On the owner's next retry request at 14:41 UTC, the saved Gmail sender and all six
-SMTP settings already matched Render, so no environment update or deployment was
-needed. The same worker handler submitted another verification email and returned
-`delivered`; its recipient lookup was read-only and verification/rate-limit state
-was preserved. Public HTTPS readiness passed again with PostgreSQL and Redis ready.
-The owner subsequently confirmed inbox arrival, email verification, and successful
-sign-in. The read-only launch check at 15:17 UTC finds one verified registration
-and no account eligible for another verification resend. The owner's signed-in
-dashboard reports `Live`. Email setup is complete; do not send another verification
-email for this account.
-Current-sender public worker delivery and actual inbox arrival remain separate
-checks. Sanitized evidence is in gitignored
-`backend/.public-email-current-report.local` and
-`backend/.operator-verification-retry-report.local`.
-Keep all credentials in gitignored `.env.render.local`, apply only SMTP settings to
-the existing Render service, and preserve its JWT secret and other connections.
+Remaining public checks:
 
-Continue with automated public sessions, recovery/replay/revocation, role and tenant
-privacy, ticket lifecycle, attachments,
-realtime, SLA/notification email, Groq generation, idle wake-up, and recovery checks.
-Do not bypass email verification to finish this check. Render's idle sleep pauses its
-bundled worker and scheduler; free Redis can lose queued work on restart.
+1. Complete recovery through the real emailed link for the isolated test
+   administrator; verify refresh replay refusal, earlier-session revocation,
+   new-password login, and harmless retries of pre-reset cookies.
+2. Confirm actual SLA warning and breach inbox arrival. SMTP acceptance for all
+   eight manager/agent notification rows is already verified.
+3. Observe automatic idle sleep, then verify session, ticket, and file survival
+   on wake-up. Close all browser tabs for the public service during this period.
+   A redeploy alone does not establish idle sleep/wake.
+
+Operator reports, generated check credentials, saved browser sessions, mailbox
+links, and backup archives remain gitignored and excluded from Docker builds.
+Render's idle sleep pauses its bundled worker and scheduler; free Redis can lose
+queued work on restart. Continue using only card-free Free plans.
 
 The deployment procedure is in [deployment-free-demo.md](deployment-free-demo.md).
 The earlier [deployment-render-vercel.md](deployment-render-vercel.md) remains a paid
 hosting reference. Retained local production data and volumes are preserved.
 
-Live RAG is deferred to v2 by the user's release decision. Its remaining verification can
-resume later, once OpenAI API credits are available at
-[the API billing dashboard](https://platform.openai.com/settings/organization/billing/overview).
-Then run `.venv/Scripts/python.exe -m scripts.live_ai_check` from `backend/`.
-Both provider credentials are already available locally. Semantic retrieval,
-live document embeddings, grounded answers/citations, and RAG-grounded drafts
-are **not yet verified**.
+Live RAG remains deferred to v2 by the user's release decision. Keep knowledge
+disabled and make no further embedding calls during v1 verification. Semantic
+retrieval, live document embeddings, grounded answers/citations, and RAG-grounded
+drafts remain **not yet verified**.

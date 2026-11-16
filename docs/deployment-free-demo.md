@@ -11,8 +11,14 @@ service `srv-dbtdqerbc2fs73dsidl0` in the owner's confirmed **My Workspace**
 The owner's registration is retained. On 2026-11-16, the owner confirmed receipt of
 the Brevo verification email, explicit verification, and successful public sign-in.
 A read-only launch database check confirms the account is verified. The signed-in
-dashboard reports `Live`; automated session, event, role/privacy, attachment, and
-recovery workflows remain release checks. See
+dashboard reports `Live`. All 14 automated public workflow groups now pass,
+including secure sessions, ticket lifecycle, realtime recovery, role/tenant
+privacy, and actual Supabase browser upload/download. Public Groq generation,
+automatic SLA warnings/breaches, and an isolated PostgreSQL backup restore also
+pass. Password recovery, SLA inbox confirmation, and idle sleep/wake remain.
+Deployment `dep-dbtirirl550s73dddnu0` serves commit `a89d5d0` after
+[successful CI](https://github.com/benbinu173/SupportFlow/actions/runs/43905152466).
+See
 [project-status.md](project-status.md).
 
 ## Prepared source
@@ -78,7 +84,8 @@ Neon and Redis are already provisioned and authenticated account reads verified:
   Singapore (`aws-ap-southeast-1`). Use the **production** branch
   (`br-icy-leaf-a1rznszb`) and database **supportflow** for launch. Its direct TLS
   URL is saved in `.env.render.local`. Launch migrations have installed revision
-  `e73a61b24f09` and all 16 application tables; the owner's registration is retained.
+  `e73a61b24f09` and all 16 public tables (15 application tables plus Alembic
+  metadata); the owner's registration is retained.
 - The isolated **release-check-2026-11-13** branch (`br-shiny-base-a1g0y1q3`)
   passed startup migrations and `alembic check` at revision `e73a61b24f09`.
   The actual preview image verified the Neon certificate using the system CA
@@ -102,31 +109,16 @@ does not verify the From domain. The owner cannot manage the original domain's D
 and SMTP2GO also excludes Gmail single senders. Reuse the other existing resources
 and Brevo Free; choose only card-free Free plans.
 
-Brevo's exact SMTP Login and active key now pass the preview image's TLSv1.3
-authentication probe with certificate verification. The owner authorized the test
-connection and Render's outgoing IP ranges after Brevo returned `525` for an
-unauthorized IP. The six SMTP settings were merged into the existing service;
-all 20 non-SMTP environment values were verified unchanged. Deployment
-`dep-dbtgifmtlv9c73famfeg` became live with healthy PostgreSQL and Redis checks.
-A fresh request for the retained registration returned `202`; its public Celery
-task completed with `delivered` and logged `verification_email_delivered`.
-That establishes SMTP relay acceptance, while actual inbox delivery remains pending.
-The owner's subsequent `SMTP_FROM` correction is live in deployment
-`dep-dbtgous9v7es73ajiqqg`, with public dependency readiness verified again.
-Public resend then returned `429`; its normal cooldown ends at 14:49 UTC
-(20:19 IST) on 2026-11-16. At the owner's request, an administrative retry ran the
-standard verification worker handler from the preview image after privately
-checking that its SMTP, JWT, database, and public origin matched Render. It returned
-`delivered` at 14:09 UTC. The owner still needs to confirm the emailed link, and the
-public resend limit retains its normal cooldown. Current-sender public worker
-delivery and inbox arrival remain separate checks. Sanitized evidence is in
-gitignored `backend/.public-email-current-report.local` and
-`backend/.operator-verification-retry-report.local`.
-The owner's next requested retry at 14:41 UTC also returned `delivered` through the
-standard worker handler. The saved Gmail sender already matched Render, and no
-environment change or deployment was needed. Public HTTPS/dependency readiness
-passed again. The owner then confirmed inbox arrival, explicit verification, and
-successful sign-in; a read-only launch check confirms the registration is verified.
+Brevo's exact SMTP Login and active key pass certificate-verified TLSv1.3
+authentication. The verified Gmail sender and authorized Render outgoing ranges
+are deployed with port 2525/STARTTLS. The SMTP-only update preserved the other
+20 service environment values. The owner confirmed actual inbox arrival,
+explicit verification, and public sign-in; a read-only launch check confirms the
+registration is verified. Five additional check accounts were verified normally
+through their emailed links. Eight automatic SLA notification rows have successful
+SMTP submission timestamps; actual SLA inbox confirmation remains separate.
+Sanitized evidence is in gitignored `backend/.public-email-current-report.local`
+and `backend/.public-sla-database-report.local`.
 
 Render documents [512 MB and 0.1 CPU for free web services](https://render.com/docs/compute-plans).
 It [sleeps after 15 idle minutes](https://render.com/docs/free), suspending the bundled
@@ -147,8 +139,8 @@ Render Free Postgres is unsuitable for this demo because it expires after 30 day
 [Supabase Free Storage](https://supabase.com/pricing) has storage/egress limits and can
 pause an inactive free project. Its [S3 keys bypass storage RLS](https://supabase.com/docs/guides/storage/s3/authentication)
 and must stay in backend secrets. Application tenant authorization still protects
-uploads/downloads. The actual Supabase adapter check passes; authenticated public
-upload/download and tenant isolation remain application-level release checks.
+uploads/downloads. Authenticated public browser upload, API/browser download,
+exact byte comparison, internal-file privacy, and tenant isolation now pass.
 
 [Brevo Free](https://help.brevo.com/hc/en-us/articles/208589409-About-Brevo-s-pricing-plans)
 includes 300 emails/day indefinitely without a credit card. Its
@@ -211,7 +203,7 @@ when the worker submitted a message but the inbox is still empty.
    Preserve Redis authentication and query parameters when changing the URL's
    database path. Keep `EMBEDDING_API_KEY` empty and knowledge disabled. The source
    blueprint names the generation provider/model that passed earlier live checks;
-   that does not verify today's public provider access or quota. Override the
+   public generation through the normal AI endpoints now also passes. Override the
    blueprint's original SMTP2GO host with `SMTP_HOST=smtp-relay.brevo.com`, keep
    `SMTP_PORT=2525` and `SMTP_STARTTLS=true`, and merge SMTP changes into the existing
    service instead of replacing all environment variables.
