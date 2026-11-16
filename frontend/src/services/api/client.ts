@@ -13,11 +13,12 @@ import { installInterceptors } from './interceptors'
  * refreshing and replaying once. `public-client.ts` is the sibling without them,
  * for the requests that must not trigger a refresh: login, registration, and
  * refresh itself.
+ * Axios chooses JSON for object bodies and the browser's multipart boundary
+ * for FormData. A fixed JSON header would serialize uploaded files as JSON.
  */
 export const apiClient = axios.create({
   baseURL: `${import.meta.env.VITE_API_BASE_URL ?? ''}/api/v1`,
   withCredentials: true,
-  headers: { 'Content-Type': 'application/json' },
   timeout: 15_000,
 })
 

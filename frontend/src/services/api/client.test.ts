@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { AxiosHeaders, type AxiosAdapter } from 'axios'
 
 /**
  * The shared client's configuration, which is the whole of this module.
@@ -65,11 +66,34 @@ describe('apiClient', () => {
     expect(client.defaults.timeout).toBe(15_000)
   }, COLD_IMPORT_TIMEOUT)
 
-  it('sends JSON by default', async () => {
+  it('serializes an ordinary request body as JSON', async () => {
     vi.stubEnv('VITE_API_BASE_URL', '')
 
     const client = await loadClient()
+    const adapter: AxiosAdapter = vi.fn(async (config) => ({
+      data: null, status: 200, statusText: 'OK', headers: new AxiosHeaders(), config,
+    }))
 
-    expect(client.defaults.headers['Content-Type']).toBe('application/json')
+    const response = await client.post('/tickets', { subject: 'Delivery update' }, { adapter })
+
+    expect(response.config.data).toBe(JSON.stringify({ subject: 'Delivery update' }))
+    expect(response.config.headers.getContentType()).toBe('application/json')
+  }, COLD_IMPORT_TIMEOUT)
+
+  it('preserves the file in a multipart request instead of serializing it as JSON', async () => {
+    vi.stubEnv('VITE_API_BASE_URL', '')
+
+    const client = await loadClient()
+    const form = new FormData()
+    const file = new File(['Delivery confirmed.'], 'delivery.txt', { type: 'text/plain' })
+    form.append('file', file)
+    const adapter: AxiosAdapter = vi.fn(async (config) => ({
+      data: null, status: 201, statusText: 'Created', headers: new AxiosHeaders(), config,
+    }))
+
+    const response = await client.post('/tickets/t1/attachments', form, { adapter })
+
+    expect(response.config.data).toBe(form)
+    expect((response.config.data as FormData).get('file')).toBe(file)
   }, COLD_IMPORT_TIMEOUT)
 })
