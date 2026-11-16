@@ -396,7 +396,7 @@ class Settings(BaseSettings):
         Written as `postgresql://` in .env because that is what psql, pg_dump, and
         docker compose all understand. SQLAlchemy would map that bare scheme to the
         default DBAPI — psycopg2, which is not installed — so psycopg 3 is named
-        here instead. Shared by the app engine and by Alembic so the two cannot
+        here instead. Shared by the API, workers, and Alembic so they cannot
         disagree about which driver they are using.
         """
         dsn = str(self.DATABASE_URL)

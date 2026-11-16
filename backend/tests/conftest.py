@@ -274,7 +274,7 @@ async def db_engine() -> AsyncIterator[AsyncEngine]:
     the kind of thing that works until someone renames a directory. Leaving an empty
     schema behind in a database whose name ends in `_test` costs nothing.
     """
-    engine = create_async_engine(str(get_settings().DATABASE_URL))
+    engine = create_async_engine(get_settings().sqlalchemy_dsn)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield engine

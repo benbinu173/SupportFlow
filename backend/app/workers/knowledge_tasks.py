@@ -46,7 +46,7 @@ _settings = get_settings()
 # pooled psycopg connection belongs to the loop that opened it — the second task to run would be
 # handed a connection from a loop that has closed. `echo` stays off, because a statement log
 # carries query parameters and the parameters here are document text.
-_engine = create_async_engine(str(_settings.DATABASE_URL), poolclass=NullPool)
+_engine = create_async_engine(_settings.sqlalchemy_dsn, poolclass=NullPool)
 
 _SessionFactory = async_sessionmaker(
     _engine,

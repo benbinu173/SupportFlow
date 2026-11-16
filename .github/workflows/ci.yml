@@ -226,8 +226,13 @@ jobs:
           context: .
           file: ./docker/Dockerfile.preview
           push: false
+          load: true
+          tags: supportflow-preview:ci
           cache-from: type=gha,scope=preview
           cache-to: type=gha,mode=max,scope=preview
+
+      - name: Check free demo worker startup
+        run: docker run --rm --entrypoint python supportflow-preview:ci -m scripts.check_worker_runtime
 
       - name: Validate compose configuration
         run: |

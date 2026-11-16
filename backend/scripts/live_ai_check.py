@@ -65,7 +65,7 @@ from datetime import datetime
 from sqlalchemy import create_engine, text
 from app.core.config import get_settings
 p = json.load(sys.stdin)
-engine = create_engine(str(get_settings().DATABASE_URL))
+engine = create_engine(get_settings().sqlalchemy_dsn)
 with engine.connect() as connection:
     org = connection.execute(text('SELECT organization_id FROM users WHERE id = :id'),
                              {'id': uuid.UUID(p['owner_id'])}).scalar_one()

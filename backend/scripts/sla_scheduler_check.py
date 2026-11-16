@@ -48,7 +48,7 @@ from sqlalchemy import bindparam, create_engine, text
 from app.core.config import get_settings
 
 payload = json.load(sys.stdin)
-engine = create_engine(str(get_settings().DATABASE_URL))
+engine = create_engine(get_settings().sqlalchemy_dsn)
 with engine.connect() as connection:
     organization_id = connection.execute(
         text('SELECT organization_id FROM users WHERE id = :id AND email = :email'),
