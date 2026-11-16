@@ -4,11 +4,19 @@ Updated: 2026-11-16. The owner selected a single Render URL for the frontend, AP
 and WebSockets. Hosting must cost zero and require no payment card. RAG is deferred
 to v2. This is a small demo with free-plan availability limits.
 
+The public service is live at
+[supportflow-demo-9xgg.onrender.com](https://supportflow-demo-9xgg.onrender.com), Render
+service `srv-dbtdqerbc2fs73dsidl0` in the owner's confirmed **My Workspace**
+(`tea-cundai9opnds73d530i0`). Database, Redis, and private storage are provisioned.
+The owner registered successfully, but verification-email delivery is blocked by
+SMTP2GO's sender policy. Brevo Free setup is in progress. Public authenticated
+workflows and realtime remain release checks; see [project-status.md](project-status.md).
+
 ## Prepared source
 
 - `render.yaml` declares one **Free** Docker web service in Singapore. Automatic
-  deployments are off. The platform assigns its actual `*.onrender.com` hostname;
-  `supportflow-demo.onrender.com` is a suggested name, subject to availability.
+  deployments are off. The current assigned hostname is
+  `supportflow-demo-9xgg.onrender.com`; reuse this existing service.
 - `docker/Dockerfile.preview` builds the React bundle and runs nginx, one Uvicorn
   process, one Celery prefork worker slot, and beat in that web container. The
   worker consumes notifications, SLA, AI, and maintenance. Hard task timeouts
@@ -21,6 +29,9 @@ to v2. This is a small demo with free-plan availability limits.
   public TLS. Frontend requests use relative URLs, and email links use the exact
   `PUBLIC_APP_URL`. The existing Secure, HttpOnly, SameSite=Lax refresh policy fits
   this single origin. The API listens only on loopback inside the container.
+  Uvicorn trusts loopback, Render's private ingress range, and Cloudflare's published
+  proxy ranges, selecting the rightmost untrusted client from `X-Forwarded-For`.
+  Review the published ranges if Render changes its ingress routing.
 - CSP, the external theme bootstrap, deep-link fallback, document revalidation,
   and immutable hashed assets are retained. Root `.dockerignore` excludes local
   environments, credentials, virtual environments, and browser reports.
@@ -45,16 +56,17 @@ Frontend lint, TypeScript, realtime contract, all 123 component tests, and 25
 deterministic browser workflows passed; four deferred knowledge cases were skipped.
 The backend's 46 configuration/knowledge-release cases, Ruff, and strict mypy passed.
 The built preview omits the knowledge screen, and its API refuses knowledge operations.
-This verifies local dependencies and Mailpit, not Neon, Supabase, SMTP2GO, or public TLS.
+Those 2026-11-13 checks verify local dependencies and Mailpit. Separate public and
+external-service results are recorded below and in `project-status.md`.
 
 ## External free services
 
-| Component | Candidate | Configuration |
+| Component | Service | Configuration |
 |---|---|---|
 | PostgreSQL | Neon Free | PostgreSQL 17, direct TLS connection URL, `vector` and `pg_trgm` extensions |
 | Redis | Render Free Key Value | Same Singapore region, internal URL, `noeviction`; database 0 for cache and 2 for Celery |
 | Files | Supabase Free Storage | Private `supportflow-attachments` bucket; S3 endpoint, region, server-only S3 access keys |
-| Email | SMTP2GO Free | Verify a single sender address you own, `mail.smtp2go.com:2525`, STARTTLS, SMTP user/password |
+| Email | Brevo Free (setup in progress) | Verify the sender by emailed code, `smtp-relay.brevo.com:2525`, STARTTLS, SMTP Login/key; free-email senders use its temporary address replacement |
 | AI generation | Existing Groq free access | `AI_PROVIDER=groq`, `AI_MODEL=openai/gpt-oss-120b`; use the existing private generation credential |
 
 Neon and Redis are already provisioned and authenticated account reads verified:
@@ -62,7 +74,8 @@ Neon and Redis are already provisioned and authenticated account reads verified:
 - Neon **supportflow-demo**, project `cold-term-95520688`, Free, PostgreSQL 17,
   Singapore (`aws-ap-southeast-1`). Use the **production** branch
   (`br-icy-leaf-a1rznszb`) and database **supportflow** for launch. Its direct TLS
-  URL is saved in `.env.render.local`. The launch database is deliberately empty.
+  URL is saved in `.env.render.local`. Launch migrations have installed revision
+  `e73a61b24f09` and all 16 application tables; the owner's registration is retained.
 - The isolated **release-check-2026-11-13** branch (`br-shiny-base-a1g0y1q3`)
   passed startup migrations and `alembic check` at revision `e73a61b24f09`.
   The actual preview image verified the Neon certificate using the system CA
@@ -74,21 +87,17 @@ Neon and Redis are already provisioned and authenticated account reads verified:
   database 0/2 variants are saved privately in `.env.render.local`, with a copy
   in `.env.render.redis.local`.
 
-The owner verified an SMTP2GO single sender and saved the SMTP credentials privately
-in `.env.render.local`. The preview image passed SMTP authentication on port 2525
-over verified TLS 1.3 on 2026-11-16. No email was sent by that probe; Render outbound
-access and external inbox delivery still need public-host verification.
+The owner's Supabase Free project and private bucket are provisioned. On 2026-11-16,
+the preview image's actual S3 adapter passed upload, download, streaming, anonymous
+access refusal, and probe deletion. Sanitized evidence is in the gitignored
+`backend/.storage-readiness-report.local`. Supabase setup was completed manually in
+its Dashboard; its MCP connection remains read-only.
 
-Reuse these resources. Storage and the Render web service still need completion.
-Choose only Free plans requiring no payment card.
-
-The Render and Neon MCP tools work in this session. Supabase's URL had a literal
-`YOUR_PROJECT_REF`; it is corrected to `https://mcp.supabase.com/mcp?read_only=true`
-with a new completed OAuth sign-in. Restart the Codex IDE extension to load its
-tools and inspect the account. The connection remains read-only, so missing
-Supabase storage must be provisioned in its Dashboard unless a write connection
-is explicitly authorized. No SupportFlow storage project or bucket is verified.
-These are local MCP connections; plugin-directory installation state is separate.
+The SMTP2GO TLS/authentication probe passed on port 2525, but actual public sending
+failed with `550 From header sender domain not verified`. A successful SMTP login
+does not verify the From domain. The owner cannot manage the original domain's DNS,
+and SMTP2GO also excludes Gmail single senders. Reuse the other existing resources
+and finish Brevo's sender/transactional setup; choose only card-free Free plans.
 
 Render documents [512 MB and 0.1 CPU for free web services](https://render.com/docs/compute-plans).
 It [sleeps after 15 idle minutes](https://render.com/docs/free), suspending the bundled
@@ -109,32 +118,39 @@ Render Free Postgres is unsuitable for this demo because it expires after 30 day
 [Supabase Free Storage](https://supabase.com/pricing) has storage/egress limits and can
 pause an inactive free project. Its [S3 keys bypass storage RLS](https://supabase.com/docs/guides/storage/s3/authentication)
 and must stay in backend secrets. Application tenant authorization still protects
-uploads/downloads. The local MinIO check does not verify Supabase compatibility.
+uploads/downloads. The actual Supabase adapter check passes; authenticated public
+upload/download and tenant isolation remain application-level release checks.
 
-[SMTP2GO Free](https://www.smtp2go.com/pricing/) advertises no credit card requirement.
-Its [free plan](https://support.smtp2go.com/hc/en-gb/articles/223087947-Free-Plan) allows
-1,000 emails monthly and 200 daily, including up to five verified domains or single
-senders. A verified single address avoids buying a domain. Its
-[SMTP settings](https://support.smtp2go.com/hc/en-gb/articles/223087627-SMTP-Settings)
-support STARTTLS on port 2525; Render blocks outbound ports 25, 465, and 587.
-Actual port access and inbox delivery require a public-host check.
+[Brevo Free](https://help.brevo.com/hc/en-us/articles/208589409-About-Brevo-s-pricing-plans)
+includes 300 emails/day indefinitely without a credit card. Its
+[sender setup](https://help.brevo.com/hc/en-us/articles/208836149-Create-a-new-sender-From-name-and-From-email)
+verifies an address with an emailed six-digit code. Brevo documents a
+[temporary sender replacement](https://help.brevo.com/hc/en-us/articles/14925263522578-Comply-with-Gmail-Yahoo-and-Microsoft-s-requirements-for-email-senders)
+for free-email addresses: transactional messages use a Brevo `t-sender-sib.com`
+address. This supports basic delivery without DNS access but is a temporary demo
+workaround, not a guarantee of inbox placement or a permanent branded sender.
+Its [SMTP relay](https://help.brevo.com/hc/en-us/articles/7924908994450-Send-transactional-emails-using-Brevo-SMTP)
+uses `smtp-relay.brevo.com`, the SMTP Login, and an SMTP key as the password.
+Use STARTTLS on port 2525 because Render Free blocks outbound 25, 465, and 587.
+[Transactional activation](https://help.brevo.com/hc/en-us/articles/115000188150-Troubleshooting-Issues-with-Brevo-SMTP)
+can require a support ticket from the owner's Brevo account. Activation, Render
+outbound sending, and actual inbox delivery still need verification.
 
 ## Provision and deploy
 
 1. Reuse the existing free Neon database and Render Key Value instance listed above.
-   Complete the private Supabase storage bucket and verified SMTP2GO sender.
+   Reuse the verified private Supabase bucket and complete Brevo's sender setup.
    Keep the launch database separate from retained local production demo/test data;
-   startup runs the first schema migration. Do not reset or import the local database.
-   The owner's verified SMTP credentials and the exact Redis database 0/2 settings
-   are already saved privately in `.env.render.local`.
-2. Commit and push the verified source to the intended GitHub branch before importing
-   the Render Blueprint. Local edits and commits ahead of the remote are unavailable
-   to Render. Publishing source is still a separate operator action.
-3. In Render, import `render.yaml` or create a Free Docker web service manually with
-   repository-root context and Dockerfile `docker/Dockerfile.preview`. Use
-   `/health/ready` as the health path. Free services have no pre-deploy command or
-   interactive shell; the image's startup performs migrations.
-4. Fill the `sync: false` environment values in Render. Never paste credentials
+   startup applies any pending schema migrations. Do not reset or import the local
+   database. Exact Redis database 0/2 settings and the current provider credentials
+   are saved privately in `.env.render.local`; replace only SMTP settings for Brevo.
+2. Commit and push verified source to `main` before manually deploying the existing
+   Render service. Automatic deployments are off. Local edits are unavailable to
+   Render; documentation-only updates require no service deployment.
+3. Keep the existing Free Docker service's repository-root build context,
+   `docker/Dockerfile.preview`, and `/health/ready` health path. Free services have
+   no pre-deploy command or interactive shell; the image's startup performs migrations.
+4. Maintain the environment values on that existing service. Never paste credentials
    into committed files, frontend build variables, reports, or chat. `JWT_SECRET`
    is generated by Render and must remain stable on subsequent deployments.
 
@@ -146,14 +162,18 @@ Actual port access and inbox delivery require a public-host check.
    | `PUBLIC_APP_URL`, `CORS_ORIGINS` | Exact assigned HTTPS Render origin, no path |
    | `S3_ENDPOINT`, `S3_REGION` | Values copied from Supabase's S3 settings |
    | `S3_ACCESS_KEY`, `S3_SECRET_KEY` | Supabase server-only S3 credentials |
-   | `SMTP_FROM` | Verified single sender address |
-   | `SMTP_USERNAME`, `SMTP_PASSWORD` | SMTP credentials, not the website account password |
+   | `SMTP_HOST`, `SMTP_PORT`, `SMTP_STARTTLS` | `smtp-relay.brevo.com`, `2525`, `true` |
+   | `SMTP_FROM` | Exact sender address verified by Brevo's email code |
+   | `SMTP_USERNAME`, `SMTP_PASSWORD` | Brevo SMTP Login and SMTP key |
    | `AI_API_KEY` | Existing Groq credential if retaining AI generation in v1 |
 
    Preserve Redis authentication and query parameters when changing the URL's
    database path. Keep `EMBEDDING_API_KEY` empty and knowledge disabled. The source
    blueprint names the generation provider/model that passed earlier live checks;
-   that does not verify today's public provider access or quota.
+   that does not verify today's public provider access or quota. Override the
+   blueprint's original SMTP2GO host with `SMTP_HOST=smtp-relay.brevo.com`, keep
+   `SMTP_PORT=2525` and `SMTP_STARTTLS=true`, and merge SMTP changes into the existing
+   service instead of replacing all environment variables.
 5. Deploy manually. Confirm migration completion, all worker queues, singleton
    scheduler startup, and `/health/ready`. Check platform memory and CPU graphs.
    The local 512 MiB limit check is a measured demo workload, not a capacity guarantee

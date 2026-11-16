@@ -33,12 +33,18 @@ Deployment constraint added on 2026-11-12: strict zero hosting budget and no pay
 The earlier paid managed-service proposal is superseded; only card-free free plans are in scope.
 The owner selected one Render origin for the frontend, API, and WebSockets on 2026-11-13.
 The free preview profile is implemented and verified locally under its 512 MiB limit.
-Neon Free Postgres and Render Free Key Value are provisioned in Singapore. The preview
-image has passed migration/schema checks on an isolated Neon branch and verified TLS
-against both branch endpoints. Supabase's placeholder MCP URL is corrected and its
-new OAuth sign-in is complete; the extension must restart to load its tools.
-SMTP2GO's sender is verified and SMTP TLS/authentication has passed from the preview
-image. Storage and the public web deployment remain outstanding.
+The Free Render service is live at
+[supportflow-demo-9xgg.onrender.com](https://supportflow-demo-9xgg.onrender.com), with
+the frontend, API, and WebSockets on one origin. Neon Free Postgres and Render Free
+Key Value are ready in Singapore. Launch migrations are applied, verified Neon TLS
+passes, and the private Supabase bucket passes the actual application's S3 adapter
+checks. Public HTTPS, readiness, security headers, assets, anonymous access controls,
+CORS, desktop/mobile auth screens, and disabled knowledge checks pass.
+The owner registered, but SMTP2GO rejected verification messages because the sender
+domain is not authenticated. Gmail is also excluded by its sender policy; the owner
+cannot manage the original domain's DNS. Brevo Free setup is in progress using its
+documented temporary sender-address replacement. Actual inbox delivery, verified
+sign-in, authenticated public workflows, and realtime remain outstanding.
 
 ## F18 scope
 
@@ -570,76 +576,93 @@ and recovery traces stay disabled to avoid recording credentials.
 Browser reports/screenshots remain in gitignored `frontend/playwright-report/preview`
 and `frontend/test-results/preview`. Sanitized lifecycle/memory evidence is in
 `backend/.preview-report.local`, with the repeat checker in
-`backend/.preview-check.local.py`. The preview is healthy at `https://localhost:8443`;
-production services, real environment files, and retained volumes are preserved.
+`backend/.preview-check.local.py`. When running, the isolated preview is reachable at
+`https://localhost:8443`; production services, real environment files, and retained
+volumes are preserved.
 
-## Next recommended step
+## Public free v1 deployment
 
-Authenticated Render and Neon account reads work. The owner confirmed Render's
-**My Workspace** (`tea-cundai9opnds73d530i0`) for this demo in the earlier session.
-Reuse the resources already provisioned there; do not create replacement projects:
+Reuse the provisioned resources in the owner's confirmed Render **My Workspace**
+(`tea-cundai9opnds73d530i0`):
 
-- Neon **supportflow-demo**, project `cold-term-95520688`, PostgreSQL 17, Free,
-  `aws-ap-southeast-1`, fixed 0.25 CU. The launch branch is **production**
-  (`br-icy-leaf-a1rznszb`) and its database is **supportflow**.
-- Neon **release-check-2026-11-13** (`br-shiny-base-a1g0y1q3`) is the isolated
-  migration-check branch. Startup migrations and `alembic check` passed through
-  revision `e73a61b24f09`, with both extensions installed and zero users.
-- Render **supportflow-demo-redis**, `red-dbra2ctbedkc73d0g5k0`, Free,
-  Singapore, `noeviction`, persistence off, is available. Render CLI sign-in was
-  renewed on 2026-11-16 and its exact internal connection URL retrieved.
+- Web service `srv-dbtdqerbc2fs73dsidl0`: Free, Singapore,
+  `docker/Dockerfile.preview`, `/health/ready`, automatic deployments off.
+  The assigned origin is `https://supportflow-demo-9xgg.onrender.com`.
+- Neon **supportflow-demo**, project `cold-term-95520688`: Free PostgreSQL 17,
+  Singapore, production branch `br-icy-leaf-a1rznszb`, database **supportflow**.
+  Launch revision `e73a61b24f09` and all 16 application tables are installed.
+  Client TLS uses `sslmode=verify-full&sslrootcert=system`; `vector` 0.8.7 and
+  `pg_trgm` 1.6 are available. The migration-check branch
+  `br-shiny-base-a1g0y1q3` remains separate from launch and retained local data.
+- Render **supportflow-demo-redis**, `red-dbra2ctbedkc73d0g5k0`: Free, Singapore,
+  `noeviction`, persistence off. Cache uses database 0, Celery broker/results 2.
+- Supabase Free: the owner created a private **supportflow-attachments** bucket.
+  The preview image's actual adapter passed upload, download, streaming, anonymous
+  access refusal, and probe deletion. Public authenticated attachment workflows
+  still need verification. Supabase's MCP connection remains read-only; setup was
+  completed in the Dashboard without changing its access grant.
 
-The preview image's Neon check passed on 2026-11-13 with `sslmode=verify-full`,
-`sslrootcert=system`, and the installed system CA bundle. Its report is in the
-gitignored `backend/.neon-container-report.local`. A new read-only check on
-2026-11-16 confirmed the launch database's verified TLS and availability of
-`vector` 0.8.7 and `pg_trgm` 1.6. The launch database intentionally has no app
-tables yet: the baseline Alembic migration installs extensions before creating
-the schema. This read did not migrate or seed it. Sanitized evidence is in
-`backend/.neon-readiness-report.local`.
+The first public container crashed because worker task modules selected the absent
+`psycopg2` driver from a driverless PostgreSQL URL. Commit `d3886e5` uses the existing
+psycopg SQLAlchemy DSN across worker modules and adds an image-level import check to
+CI. All 773 unit cases, lint, formatting, and mypy passed; its
+[full CI run](https://github.com/benbinu173/SupportFlow/actions/runs/43855045423)
+passed. Commit `328d352` first corrected Render's private ingress hops, with
+[all CI jobs passing](https://github.com/benbinu173/SupportFlow/actions/runs/43859225140).
 
-Supabase's configured URL contained the literal `YOUR_PROJECT_REF`, which also
-disabled account tools. It is now `https://mcp.supabase.com/mcp?read_only=true` in
-the user's Codex configuration. Read-only mode is preserved. The owner completed
-the corrected connection's OAuth sign-in on 2026-11-16. **Restart the Codex IDE
-extension** to load its tools, then inspect the actual organization and projects.
-No SupportFlow Supabase project/bucket or S3 credentials have been verified.
-The current OAuth grant requests read access; provision missing storage in the
-Supabase Dashboard unless the owner explicitly authorizes a write connection.
+Public forwarding probes then showed Cloudflare's public proxy addresses still
+being selected as clients. Commit `4159045` also trusts Cloudflare's published
+IPv4/IPv6 ranges. Eight regression cases failed before that correction; all 20
+HTTP/WebSocket cases and seven actual nginx forwarding checks now pass locally,
+along with Ruff, formatting, mypy, and the rebuilt image. Its public rollout and
+forwarding recheck completed on 2026-11-16: deployment
+`dep-dbtf0ajncjis73a321pg` is live, and three alternating normal/forged request pairs
+on one connection retain the same public client address, excluding Cloudflare and
+all supplied forged addresses. Sanitized evidence is in gitignored
+`backend/.public-forwarding-report.local`.
 
-The owner completed SMTP2GO's single-sender verification and saved `SMTP_FROM`,
-`SMTP_USERNAME`, and `SMTP_PASSWORD` in the gitignored `.env.render.local`.
-The actual preview image authenticated to `mail.smtp2go.com:2525` over verified
-TLS 1.3 on 2026-11-16. This was an authentication check with no message sent;
-public Render port access and delivered inbox links remain deployment checks.
-Sanitized evidence is in `backend/.smtp-readiness-report.local`.
+Public smoke verification on 2026-11-16 passed nine groups: trusted HTTPS health and
+dependency readiness, HTTP redirect, SPA deep links/security headers/theme script,
+hashed assets with immutable caching and no knowledge bundle, anonymous access
+refusal and disabled knowledge endpoints, CORS, desktop auth/marketing screens,
+mobile signup/theme/viewport, and absence of JavaScript/CSP/asset errors. Measured
+public memory stayed below 386 MiB of 512 MiB during the earlier checks.
+Sanitized evidence is in gitignored `frontend/.public-smoke-report.local`.
 
-Neon's direct TLS URL, the generated JWT secret, and the existing Groq credential
-are also saved in `.env.render.local`. The exact Render Redis cache and Celery
-URLs have been merged into that file after the owner's SMTP edits were saved.
-The cache selects database 0 and Celery broker/results select database 2.
-A private copy of those three settings remains in `.env.render.redis.local`.
-All credential files are excluded from both Git and the Docker build context.
+The tenth public group remains unresolved: WSS opens, its auth frame reaches the
+backend, and the backend logs refusal code 4401, but neither Chromium nor Python
+receives the close frame within 15 seconds. The same image closes correctly through
+local nginx and directly through Uvicorn. A public ping/pong succeeds. Authenticated
+public realtime is not yet verified; the browser also lacks an auth-acknowledgement
+deadline, so a missing close/ack can leave its connection status pending.
 
-Follow [deployment-free-demo.md](deployment-free-demo.md): finish the missing
-storage/email setup, publish the verified source, and create the Free Render web
-service using `docker/Dockerfile.preview` and `/health/ready`. Use its actual
-assigned HTTPS subdomain for `PUBLIC_APP_URL` and `CORS_ORIGINS`. No SupportFlow
-Render web service or public deployment exists yet. CI validates and builds the
-preview profile as well as the normal production profile.
+## Next required work
 
-Render idle sleep pauses background work, and its free Redis can lose queued work
-on restart. Verify SMTP2GO STARTTLS on port 2525, external inbox delivery, private
-Supabase storage, Neon TLS/extensions, real client-IP forwarding, public HTTPS/WSS,
-generation access, wake-up, and database/attachment recovery before opening the demo.
-The earlier [deployment-render-vercel.md](deployment-render-vercel.md) is a paid-hosting
-reference. The current plan uses one Render origin and requires no Vercel project.
+The owner's public registration succeeded. Its verification email reached Celery
+but SMTP2GO returned `550 From header sender domain not verified`. SMTP authentication
+alone did not establish sender authorization. The owner cannot change the original
+domain's DNS, and SMTP2GO rejects Gmail single senders too. The earlier Gmail
+recommendation was incorrect.
 
-The retained production configuration still uses `https://localhost`, has no external
-SMTP configuration, and has no generation or embedding credential enabled. The free
-preview also uses captured local mail and empty provider keys. Live Groq generation
-was verified earlier with temporary settings; the actual public deployment still
-needs its own provider and external-service verification.
+[Brevo Free](https://help.brevo.com/hc/en-us/articles/208589409-About-Brevo-s-pricing-plans)
+allows 300 emails/day without a payment card. Its
+[documented temporary replacement](https://help.brevo.com/hc/en-us/articles/14925263522578-Comply-with-Gmail-Yahoo-and-Microsoft-s-requirements-for-email-senders)
+uses a Brevo sending address for free-email senders. The owner is being guided through
+sender verification and SMTP Login/key setup; transactional activation may require a
+support request from their account. Brevo credentials and sending are not yet verified.
+Keep all credentials in gitignored `.env.render.local`, apply only SMTP settings to
+the existing Render service, and preserve its JWT secret and other connections.
+
+After sending works, request a fresh verification email for the existing registration,
+confirm inbox arrival, explicitly verify, and sign in. Then verify public sessions,
+recovery/replay/revocation, role and tenant privacy, ticket lifecycle, attachments,
+realtime, SLA/notification email, Groq generation, idle wake-up, and recovery checks.
+Do not bypass email verification to finish this check. Render's idle sleep pauses its
+bundled worker and scheduler; free Redis can lose queued work on restart.
+
+The deployment procedure is in [deployment-free-demo.md](deployment-free-demo.md).
+The earlier [deployment-render-vercel.md](deployment-render-vercel.md) remains a paid
+hosting reference. Retained local production data and volumes are preserved.
 
 Live RAG is deferred to v2 by the user's release decision. Its remaining verification can
 resume later, once OpenAI API credits are available at
