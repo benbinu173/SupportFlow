@@ -23,10 +23,33 @@ pytestmark = pytest.mark.unit
         ),
         (("127.0.0.1", 8000), "198.51.100.222, 203.0.113.44", ("203.0.113.44", 0)),
         (("127.0.0.1", 8000), "203.0.113.44", ("203.0.113.44", 0)),
+        (
+            ("127.0.0.1", 8000),
+            "198.51.100.222, 203.0.113.44, 104.16.1.1, 10.29.232.5",
+            ("203.0.113.44", 0),
+        ),
+        (
+            ("127.0.0.1", 8000),
+            "198.51.100.222, 2001:db8::44, 2606:4700::1111, 10.29.232.5",
+            ("2001:db8::44", 0),
+        ),
+        (
+            ("127.0.0.1", 8000),
+            "198.51.100.222, 203.0.113.44, 104.16.1.1, 172.64.1.1, 10.29.232.5",
+            ("203.0.113.44", 0),
+        ),
+        (
+            ("127.0.0.1", 8000),
+            "198.51.100.222, 203.0.113.44, 203.0.113.55, 104.16.1.1, 10.29.232.5",
+            ("203.0.113.55", 0),
+        ),
         (("198.51.100.99", 8000), "203.0.113.44, 10.29.232.5", ("198.51.100.99", 8000)),
     ],
 )
-async def test_forwarding_preserves_the_rightmost_untrusted_client(peer, forwarded, expected):
+@pytest.mark.parametrize("scope_type", ["http", "websocket"])
+async def test_forwarding_preserves_the_rightmost_untrusted_client(
+    peer, forwarded, expected, scope_type
+):
     observed = {}
 
     async def app(scope, receive, send):
@@ -34,7 +57,7 @@ async def test_forwarding_preserves_the_rightmost_untrusted_client(peer, forward
 
     middleware = ProxyHeadersMiddleware(app, trusted_hosts=PREVIEW_TRUSTED_PROXIES)
     scope = {
-        "type": "http",
+        "type": scope_type,
         "client": peer,
         "scheme": "http",
         "headers": [(b"x-forwarded-for", forwarded.encode())],
