@@ -19,6 +19,10 @@ STOP = threading.Event()
 SHUTDOWN_SECONDS = 20
 logger = logging.getLogger(__name__)
 
+# Render's HTTP ingress adds private proxy hops after the public client address.
+# The API is bound to loopback and receives this chain only through our nginx.
+PREVIEW_TRUSTED_PROXIES = "127.0.0.1,10.0.0.0/8"
+
 
 def request_stop(signum: int, frame: object) -> None:
     STOP.set()
@@ -92,7 +96,7 @@ def main() -> int:
             "--port",
             "8000",
             "--forwarded-allow-ips",
-            "127.0.0.1",
+            PREVIEW_TRUSTED_PROXIES,
         ],
         # One prefork slot preserves Celery's hard task timeouts. The solo and
         # threads pools would save memory but cannot terminate a stuck task.
