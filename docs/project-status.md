@@ -47,8 +47,9 @@ database check confirms the retained registration is verified. The signed-in
 dashboard reports `Live`, confirming its public WebSocket authenticated. All 14
 automated public workflow checks now pass, including sessions, role/privacy,
 ticket lifecycle, realtime recovery, and actual Supabase file downloads. Public
-Groq generation and automatic SLA warnings/breaches also pass. Password recovery,
-SLA inbox confirmation, and idle sleep/wake are the remaining public checks.
+Groq generation, emailed password recovery, and automatic SLA warnings/breaches
+also pass. The owner confirmed SLA inbox delivery. Genuine automatic idle sleep
+and all 12 public wake checks pass, completing public v1 deployment verification.
 
 ## F18 scope
 
@@ -675,8 +676,37 @@ naturally aging test ticket. The manager received all four notifications without
 a browser reload; manager and agent each have four persisted notification rows.
 All eight have `emailed_at` set after successful SMTP submission. Only the test
 workspace's urgent policy was shortened, then restored to its original values.
-The test ticket is closed. Evidence is in `frontend/.public-sla-report.local` and
-`backend/.public-sla-database-report.local`; actual inbox confirmation is pending.
+The owner confirmed that warning and breach emails arrived for both the manager
+and agent accounts. The test ticket is closed. Evidence is in
+`frontend/.public-sla-report.local` and `backend/.public-sla-database-report.local`.
+
+Public password recovery passed all **16 checks** through a fresh, unaltered
+Brevo email link for the isolated test administrator. The reset page removed
+the token fragment, updated the password, and signed out an earlier live browser.
+Old access tokens, refresh cookies, the previous password, and the reused reset
+link were refused. Normal new-password sign-in and secure-cookie rotation passed;
+old-cookie retries did not invalidate the new session. A certificate-verified,
+read-only database witness confirms credential version 1, no live version-0
+refresh sessions, and the password-reset audit entry. Only the generated isolated
+account's password changed and was saved privately. Evidence is in
+`frontend/.public-recovery-report.local` and
+`backend/.public-recovery-database-report.local`.
+
+Automatic Free Render idle sleep was observed during an uninterrupted **17.7-minute**
+window. The owner closed public-service tabs and all check browsers were closed.
+Only Render control-plane reads were used during the idle period. A complete,
+five-page audit of 458 application logs confirms no user requests or new WebSocket
+connections. The worker and API shut down cleanly at 17:22 UTC, followed by stopped
+logs and memory samples, with no failure, deployment, or manual suspension event.
+
+All **12 public wake checks** then passed. The retained normal-login cookie restored
+the session and rotated securely; authenticated realtime returned to `Live`.
+PostgreSQL and Redis were ready, the closed ticket and its public replies/private
+note survived, and both Supabase attachments downloaded with unchanged bytes.
+The real browser download passed, knowledge stayed disabled, and no JavaScript or
+CSP errors occurred. Browser readiness took **80.5 seconds** during this cold start.
+Evidence is in `frontend/.public-idle-evidence.local`,
+`frontend/.public-idle-traffic-report.local`, and `frontend/.public-wake-report.local`.
 
 A consistent, certificate-verified, read-only PostgreSQL snapshot was exported at
 15:49 UTC and restored into an isolated temporary database. All 16 table counts
@@ -693,23 +723,20 @@ the controlled demo workload and leave little memory room at the authentication
 peak. The source database is about 9.3 MiB; Neon account reads confirm the Free
 plan. The three generated tickets are closed and their history/files retained.
 
-## Next required work
+## Public v1 verification complete
 
 Brevo setup is complete. The owner confirmed actual Gmail arrival, explicit
-verification, successful sign-in, and a `Live` dashboard. Preserve the verified
+verification, successful sign-in, a `Live` dashboard, and SLA warning/breach
+delivery. Public emailed password recovery also passes. Preserve the verified
 sender, port 2525/STARTTLS, authorized Render outgoing ranges, JWT secret, and
 other saved connections in `.env.render.local`.
 
-Remaining public checks:
-
-1. Complete recovery through the real emailed link for the isolated test
-   administrator; verify refresh replay refusal, earlier-session revocation,
-   new-password login, and harmless retries of pre-reset cookies.
-2. Confirm actual SLA warning and breach inbox arrival. SMTP acceptance for all
-   eight manager/agent notification rows is already verified.
-3. Observe automatic idle sleep, then verify session, ticket, and file survival
-   on wake-up. Close all browser tabs for the public service during this period.
-   A redeploy alone does not establish idle sleep/wake.
+The public v1 checks are complete, including actual email verification and recovery,
+four-role workflows, tenant privacy, file storage, Groq generation, automatic SLA
+alerts with confirmed inbox delivery, backup restore, and genuine idle sleep/wake.
+The deployed application remains commit `a89d5d0`; documentation-only updates need
+no service redeployment. The three generated tickets are closed, with accounts,
+messages, and attachments retained for inspection.
 
 Operator reports, generated check credentials, saved browser sessions, mailbox
 links, and backup archives remain gitignored and excluded from Docker builds.

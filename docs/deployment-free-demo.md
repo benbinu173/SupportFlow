@@ -14,8 +14,10 @@ A read-only launch database check confirms the account is verified. The signed-i
 dashboard reports `Live`. All 14 automated public workflow groups now pass,
 including secure sessions, ticket lifecycle, realtime recovery, role/tenant
 privacy, and actual Supabase browser upload/download. Public Groq generation,
-automatic SLA warnings/breaches, and an isolated PostgreSQL backup restore also
-pass. Password recovery, SLA inbox confirmation, and idle sleep/wake remain.
+automatic SLA warnings/breaches, emailed password recovery, and an isolated
+PostgreSQL backup restore also pass. The owner confirmed SLA inbox delivery.
+Genuine automatic idle sleep and all 12 public wake checks also pass, completing
+public v1 deployment verification.
 Deployment `dep-dbtirirl550s73dddnu0` serves commit `a89d5d0` after
 [successful CI](https://github.com/benbinu173/SupportFlow/actions/runs/43905152466).
 See
@@ -116,9 +118,26 @@ are deployed with port 2525/STARTTLS. The SMTP-only update preserved the other
 explicit verification, and public sign-in; a read-only launch check confirms the
 registration is verified. Five additional check accounts were verified normally
 through their emailed links. Eight automatic SLA notification rows have successful
-SMTP submission timestamps; actual SLA inbox confirmation remains separate.
+SMTP submission timestamps, and the owner confirmed warning and breach emails
+arrived for both manager and agent accounts. Public recovery through a fresh
+emailed link passed all 16 checks, including earlier-session revocation, single-use
+links, normal new-password login, and harmless old-cookie retries. A read-only
+database witness confirms the password-reset audit and no live pre-reset sessions.
 Sanitized evidence is in gitignored `backend/.public-email-current-report.local`
-and `backend/.public-sla-database-report.local`.
+and `backend/.public-sla-database-report.local`, with recovery evidence in
+`frontend/.public-recovery-report.local` and
+`backend/.public-recovery-database-report.local`.
+
+Automatic Render idle sleep was observed over 17.7 minutes with public-service tabs
+and check browsers closed. A complete application-log audit confirms no user
+requests or new WebSocket connections during that window. The API and worker shut
+down cleanly without a deployment, manual suspension, or failure event. All 12 wake
+checks passed: the saved login cookie restored and rotated, realtime returned to
+`Live`, PostgreSQL/Redis were ready, and the closed ticket, messages, and Supabase
+files survived. API and browser downloads matched the original bytes. Knowledge
+remained disabled. Browser readiness took 80.5 seconds on this cold start. Evidence
+is in gitignored `frontend/.public-idle-evidence.local`,
+`frontend/.public-idle-traffic-report.local`, and `frontend/.public-wake-report.local`.
 
 Render documents [512 MB and 0.1 CPU for free web services](https://render.com/docs/compute-plans).
 It [sleeps after 15 idle minutes](https://render.com/docs/free), suspending the bundled
